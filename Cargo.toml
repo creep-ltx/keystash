@@ -11,11 +11,9 @@ chacha20poly1305 = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 rand = "0.8"
 zeroize = { version = "1.7", features = ["derive"] }
-copypasta = "0.10"
 chrono = "0.4"
 tokio = { version = "1.35", features = ["full"] }
 rpassword = "7.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
 

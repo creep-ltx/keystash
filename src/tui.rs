@@ -15,11 +15,11 @@ use zeroize::Zeroize;
 use std::cell::RefCell;
 use rusqlite::Connection;
 use std::{
-    io,
+    io::{self, Write},
     time::{Duration, Instant},
     collections::HashSet,
+    process::{Command, Stdio},
 };
-use copypasta::{ClipboardContext, ClipboardProvider};
 
 use crate::db::{self, SecretRecord};
 
@@ -45,6 +45,7 @@ enum Screen {
     EditSecret,
     ErrorDialog,
     ConfirmationDialog(ConfirmAction),
+    HelpDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -180,10 +181,57 @@ impl TuiApp {
     }
 
     fn copy_to_clipboard(&mut self, text: String, label: &str) {
-        if let Ok(mut ctx) = ClipboardContext::new() {
-            if ctx.set_contents(text).is_ok() {
+        if text.trim().is_empty() {
+            self.copied_message = Some((
+                format!("Cannot copy: {} is empty!", label),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        // Try wl-copy (Wayland native)
+        let mut child = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        // Fallback to xclip (X11) if wl-copy is not available/fails
+        if child.is_err() {
+            child = Command::new("xclip")
+                .arg("-selection")
+                .arg("clipboard")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        // Fallback to xsel if xclip fails too
+        if child.is_err() {
+            child = Command::new("xsel")
+                .arg("--clipboard")
+                .arg("--input")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        match child {
+            Ok(mut child_proc) => {
+                if let Some(mut stdin) = child_proc.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child_proc.wait();
                 self.copied_message = Some((
                     format!("Copied {} to clipboard! Will clear in 10s.", label),
+                    Instant::now(),
+                ));
+            }
+            Err(_) => {
+                self.copied_message = Some((
+                    "Failed to copy: No clipboard utility found (wl-copy, xclip, xsel).".to_string(),
                     Instant::now(),
                 ));
             }
@@ -193,9 +241,24 @@ impl TuiApp {
     fn clear_clipboard_if_expired(&mut self) {
         if let Some((_, instant)) = &self.copied_message {
             if instant.elapsed() >= Duration::from_secs(10) {
-                if let Ok(mut ctx) = ClipboardContext::new() {
-                    let _ = ctx.set_contents("".to_string());
+                // Clear clipboard using wl-copy clear if available, or piping empty string
+                let _ = Command::new("wl-copy").arg("-c").spawn();
+                
+                // Fallback piping empty string to xclip
+                if let Ok(mut child) = Command::new("xclip")
+                    .arg("-selection")
+                    .arg("clipboard")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(b"");
+                    }
+                    let _ = child.wait();
                 }
+
                 self.copied_message = None;
             }
         }
@@ -256,6 +319,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         }
                         Screen::AddSecret | Screen::EditSecret => handle_form_input(app, key.code),
                         Screen::ConfirmationDialog(action) => handle_confirmation_input(app, key.code, action),
+                        Screen::HelpDialog => handle_help_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -468,6 +532,16 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                 ActiveBlock::Details => ActiveBlock::Categories,
             };
         }
+        KeyCode::BackTab => {
+            app.active_block = match app.active_block {
+                ActiveBlock::Categories => ActiveBlock::Details,
+                ActiveBlock::Secrets => ActiveBlock::Categories,
+                ActiveBlock::Details => ActiveBlock::Secrets,
+            };
+        }
+        KeyCode::Char('h') | KeyCode::Char('?') => {
+            app.screen = Screen::HelpDialog;
+        }
         KeyCode::Up => match app.active_block {
             ActiveBlock::Categories => {
                 if app.selected_category_idx > 0 {
@@ -635,6 +709,15 @@ fn handle_confirmation_input(app: &mut TuiApp, code: KeyCode, action: ConfirmAct
     }
 }
 
+fn handle_help_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Char(' ') => {
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
 fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
     match app.screen {
         Screen::Lock => draw_lock_screen(f, app),
@@ -642,6 +725,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::Dashboard => draw_dashboard(f, app),
         Screen::AddSecret | Screen::EditSecret => draw_form(f, app),
         Screen::ConfirmationDialog(_) => draw_confirmation_dialog(f, app),
+        Screen::HelpDialog => draw_help_dialog(f, app),
         Screen::ErrorDialog => draw_error_dialog(f, app),
     }
 }
@@ -904,13 +988,12 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(Span::styled(msg, Style::default().fg(Color::Green)))
     } else {
         Line::from(vec![
-            Span::styled("[Tab] Navigate panels | ", Style::default().fg(Color::White)),
-            Span::styled("[Space] Mark/Unmark | ", Style::default().fg(Color::Yellow)),
             Span::styled("[a] Add | ", Style::default().fg(Color::Green)),
             Span::styled("[e] Edit | ", Style::default().fg(Color::Yellow)),
-            Span::styled("[d] Delete | ", Style::default().fg(Color::Red)),
-            Span::styled("[v] Toggle View PW | ", Style::default().fg(Color::Magenta)),
-            Span::styled("[c] Copy User | [p] Copy PW | [u] Copy URL | ", Style::default().fg(Color::Cyan)),
+            Span::styled("[v] View PW | ", Style::default().fg(Color::Magenta)),
+            Span::styled("[c] Copy User | ", Style::default().fg(Color::Cyan)),
+            Span::styled("[p] Copy PW | ", Style::default().fg(Color::Cyan)),
+            Span::styled("[h] Help | ", Style::default().fg(Color::Green)),
             Span::styled("[Esc] Exit", Style::default().fg(Color::White)),
         ])
     };
@@ -1030,6 +1113,85 @@ fn draw_confirmation_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         .alignment(ratatui::layout::Alignment::Center);
 
     f.render_widget(confirm_p, area);
+}
+
+fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Help & Keybindings")
+        .border_style(Style::default().fg(Color::Green));
+
+    let area = centered_rect(70, 75, size);
+    f.render_widget(Clear, area);
+
+    let help_text = vec![
+        Line::from(Span::styled("Navigation & Selection:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  [Tab]         ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cycle panels forward (Categories -> Secrets -> Details)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [Shift+Tab]   ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cycle panels backward", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [↑] / [↓]     ", Style::default().fg(Color::Yellow)),
+            Span::styled("Scroll lists item-by-item", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [PgUp]/[PgDn] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Scroll lists page-by-page (10 items / 5 items)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [Space]       ", Style::default().fg(Color::Yellow)),
+            Span::styled("Mark/Unmark selected item for mass actions", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [/]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Filter credentials by text search query", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Vault Operations:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  [a]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Add a new credential", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [e]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Edit the selected credential", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [d]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Delete selected credential (or marked items if any)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [v]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Toggle password visibility in Detail Pane", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  [c]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Copy Username to clipboard", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [p]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Copy Password to clipboard", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [u]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Copy website URL to clipboard", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Press [Esc] / [Enter] / [h] to close help dialog", Style::default().fg(Color::DarkGray))),
+    ];
+
+    let help_p = Paragraph::new(help_text)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(help_p, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
