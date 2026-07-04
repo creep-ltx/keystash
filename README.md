@@ -132,7 +132,9 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging:
 
 ### 1. One-time Setup
-To enable syncing on a device, initialize your config folder as a Git repository linked to your private remote:
+
+#### **Device A (Your First/Existing Vault Device)**
+To upload your existing vault database to GitHub for the first time:
 ```bash
 cd ~/.config/keystash
 git init
@@ -150,6 +152,29 @@ git add .
 git commit -m "Initial vault backup"
 git push -u origin main
 ```
+
+#### **Device B (Adding a New/Secondary Device)**
+> [!WARNING]
+> **DO NOT run `keystash init` on a secondary device.** If you do, it will generate a new database salt and your master password keys will not match, causing decryption errors.
+> 
+> Instead, clone the existing database file from GitHub directly:
+
+```bash
+# Create and enter the config folder
+mkdir -p ~/.config/keystash
+cd ~/.config/keystash
+
+# Initialize Git and link origin
+git init
+echo "*" > .gitignore
+echo "!vault.db" >> .gitignore
+git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
+git branch -M main
+
+# Pull down the existing database (clones the salt/key structure)
+git pull origin main
+```
+You can now run `keystash` on Device B, enter your existing Master Password, and sync. Both machines will sync and decrypt seamlessly!
 
 ### 2. How it operates
 * **TUI Startup Sync:** When you run `keystash` in TUI mode, it fetches and logically merges any remote changes before showing you the Master Password lock screen.
