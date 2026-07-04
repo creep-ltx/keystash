@@ -46,6 +46,7 @@ fn print_help() {
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
+    println!("  keystash change-password                  Change Master Password and rotate keys");
     println!("  keystash help                             Show this help message");
 }
 
@@ -301,6 +302,50 @@ fn main() {
                 }
             } else {
                 println!("Reset cancelled.");
+            }
+        }
+        "change-password" => {
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let old_pass = prompt_password("Enter Current Master Password: ");
+            let old_key = match db::unlock_vault(&conn, &old_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+
+            let new_pass = prompt_password("Enter New Master Password: ");
+            if new_pass.trim().is_empty() {
+                eprintln!("Password cannot be empty!");
+                return;
+            }
+            let confirm_pass = prompt_password("Confirm New Master Password: ");
+            if new_pass != confirm_pass {
+                eprintln!("Passwords do not match!");
+                return;
+            }
+
+            println!("Rotating encryption keys and re-encrypting vault records...");
+            match db::change_master_password(&conn, &old_key, &new_pass) {
+                Ok(_) => {
+                    println!("Success: Master Password changed and vault records re-encrypted!");
+                    if sync::is_git_configured(&db_path) {
+                        println!("Syncing updates to Git remote...");
+                        let _ = sync::git_sync_vault(&db_path);
+                    }
+                }
+                Err(e) => eprintln!("Failed to change Master Password: {}", e),
             }
         }
         "sync" => {

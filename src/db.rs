@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result, OptionalExtension};
 use std::path::Path;
 use crate::crypto::{self, KEY_LEN, SALT_LEN};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct SecretRecord {
@@ -16,6 +17,10 @@ pub struct SecretRecord {
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    
+    // Enable WAL mode and normal synchronization for better concurrency
+    let _ = conn.execute("PRAGMA journal_mode=WAL", []);
+    let _ = conn.execute("PRAGMA synchronous=NORMAL", []);
     
     // Create metadata table
     conn.execute(
@@ -85,7 +90,7 @@ pub fn is_first_run(conn: &Connection) -> Result<bool> {
 }
 
 /// Sets up the vault for the first time by generating a salt and saving the verification token.
-pub fn setup_vault(conn: &Connection, master_password: &str) -> Result<[u8; KEY_LEN], String> {
+pub fn setup_vault(conn: &Connection, master_password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let salt = crypto::generate_salt();
     let key = crypto::derive_key(master_password, &salt)?;
 
@@ -110,7 +115,7 @@ pub fn setup_vault(conn: &Connection, master_password: &str) -> Result<[u8; KEY_
 }
 
 /// Attempts to unlock the vault. Returns the derived key if successful, or an error message.
-pub fn unlock_vault(conn: &Connection, master_password: &str) -> Result<[u8; KEY_LEN], String> {
+pub fn unlock_vault(conn: &Connection, master_password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     // Get salt
     let salt: Vec<u8> = conn
         .query_row(
@@ -253,3 +258,75 @@ pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+pub fn change_master_password(
+    conn: &Connection,
+    old_key: &[u8; KEY_LEN],
+    new_password: &str,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+    // 1. Generate new salt and derive new key
+    let new_salt = crypto::generate_salt();
+    let new_key = crypto::derive_key(new_password, &new_salt)?;
+
+    // 2. Fetch all secrets
+    let secrets = get_secrets(conn)?;
+
+    // 3. Decrypt and re-encrypt all secrets in memory first to verify success
+    let mut re_encrypted_secrets = Vec::with_capacity(secrets.len());
+    for r in &secrets {
+        let plaintext_pass = crypto::decrypt(&r.encrypted_password, old_key)?;
+        let encrypted_pass = crypto::encrypt(&plaintext_pass, &new_key)?;
+
+        let encrypted_notes = match &r.encrypted_notes {
+            Some(notes_blob) => {
+                let plaintext_notes = crypto::decrypt(notes_blob, old_key)?;
+                Some(crypto::encrypt(&plaintext_notes, &new_key)?)
+            }
+            None => None,
+        };
+
+        re_encrypted_secrets.push((r.id, encrypted_pass, encrypted_notes));
+    }
+
+    // 4. Encrypt verification token with the new key
+    let new_verification = crypto::encrypt(b"keystash-verification-token", &new_key)?;
+
+    // 5. Update SQLite records in a transaction
+    conn.execute("BEGIN TRANSACTION", [])
+        .map_err(|e| format!("Failed to start key rotation transaction: {}", e))?;
+
+    // Update salt
+    if let Err(e) = conn.execute(
+        "UPDATE metadata SET value = ?1 WHERE key = 'salt'",
+        params![new_salt.to_vec()],
+    ) {
+        let _ = conn.execute("ROLLBACK", []);
+        return Err(e.to_string());
+    }
+
+    // Update verification token
+    if let Err(e) = conn.execute(
+        "UPDATE metadata SET value = ?1 WHERE key = 'verification'",
+        params![new_verification],
+    ) {
+        let _ = conn.execute("ROLLBACK", []);
+        return Err(e.to_string());
+    }
+
+    // Update each secret
+    for (id, enc_pass, enc_notes) in re_encrypted_secrets {
+        if let Err(e) = conn.execute(
+            "UPDATE secrets SET encrypted_password = ?1, encrypted_notes = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            params![enc_pass, enc_notes, id],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e.to_string());
+        }
+    }
+
+    conn.execute("COMMIT", [])
+        .map_err(|e| format!("Failed to commit key rotation: {}", e))?;
+
+    Ok(new_key)
+}
+

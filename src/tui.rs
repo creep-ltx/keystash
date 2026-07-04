@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use std::cell::RefCell;
 use rusqlite::Connection;
 use std::{
@@ -46,6 +46,7 @@ enum Screen {
     ErrorDialog,
     ConfirmationDialog(ConfirmAction),
     HelpDialog,
+    ChangePassword,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,7 +61,7 @@ enum FormField {
 
 pub struct TuiApp {
     conn: Connection,
-    key: Option<[u8; 32]>,
+    key: Option<Zeroizing<[u8; 32]>>,
     screen: Screen,
     
     // Auth State
@@ -97,6 +98,9 @@ pub struct TuiApp {
     // Stateful widget controls
     pub category_list_state: RefCell<ListState>,
     pub secrets_list_state: RefCell<ListState>,
+
+    // Key rotation form state
+    pub change_pass_field: usize,
 }
 
 impl TuiApp {
@@ -133,6 +137,7 @@ impl TuiApp {
             confirmation_message: String::new(),
             category_list_state: RefCell::new(ListState::default()),
             secrets_list_state: RefCell::new(ListState::default()),
+            change_pass_field: 0,
         }
     }
 
@@ -327,6 +332,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::AddSecret | Screen::EditSecret => handle_form_input(app, key.code),
                         Screen::ConfirmationDialog(action) => handle_confirmation_input(app, key.code, action),
                         Screen::HelpDialog => handle_help_input(app, key.code),
+                        Screen::ChangePassword => handle_change_password_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -515,6 +521,14 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
                 app.copy_to_clipboard(record.username.clone(), "username");
             }
+        }
+        KeyCode::Char('m') => {
+            app.password_input.clear();
+            app.password_confirm_input.clear();
+            app.form_password.clear();
+            app.change_pass_field = 0;
+            app.error_message.clear();
+            app.screen = Screen::ChangePassword;
         }
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
@@ -718,6 +732,87 @@ fn handle_confirmation_input(app: &mut TuiApp, code: KeyCode, action: ConfirmAct
     }
 }
 
+fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Tab => {
+            app.change_pass_field = (app.change_pass_field + 1) % 3;
+        }
+        KeyCode::BackTab => {
+            app.change_pass_field = if app.change_pass_field == 0 { 2 } else { app.change_pass_field - 1 };
+        }
+        KeyCode::Char(c) => {
+            match app.change_pass_field {
+                0 => app.password_input.push(c),
+                1 => app.password_confirm_input.push(c),
+                _ => app.form_password.push(c),
+            }
+        }
+        KeyCode::Backspace => {
+            match app.change_pass_field {
+                0 => { app.password_input.pop(); }
+                1 => { app.password_confirm_input.pop(); }
+                _ => { app.form_password.pop(); }
+            }
+        }
+        KeyCode::Enter => {
+            if app.password_input.is_empty() || app.password_confirm_input.is_empty() || app.form_password.is_empty() {
+                app.error_message = "All fields are required!".to_string();
+                return;
+            }
+            if app.password_confirm_input != app.form_password {
+                app.error_message = "New passwords do not match!".to_string();
+                return;
+            }
+
+            // Verify old key
+            let old_key = match &app.key {
+                Some(k) => k,
+                None => {
+                    app.error_message = "Vault is locked!".to_string();
+                    return;
+                }
+            };
+
+            // Check if old password matches current active key
+            if db::unlock_vault(&app.conn, &app.password_input).is_err() {
+                app.error_message = "Incorrect current password!".to_string();
+                return;
+            }
+
+            // Rotate keys
+            match db::change_master_password(&app.conn, old_key, &app.password_confirm_input) {
+                Ok(new_key) => {
+                    app.key = Some(new_key);
+                    app.password_input.zeroize();
+                    app.password_confirm_input.zeroize();
+                    app.form_password.zeroize();
+                    app.password_input = String::new();
+                    app.password_confirm_input = String::new();
+                    app.form_password = String::new();
+                    app.error_message = String::new();
+                    app.screen = Screen::Dashboard;
+                    app.refresh_secrets();
+                    app.trigger_background_sync();
+                }
+                Err(err) => {
+                    app.error_message = err;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.password_input.zeroize();
+            app.password_confirm_input.zeroize();
+            app.form_password.zeroize();
+            app.password_input = String::new();
+            app.password_confirm_input = String::new();
+            app.form_password = String::new();
+            app.error_message = String::new();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
 fn handle_help_input(app: &mut TuiApp, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Char(' ') => {
@@ -735,6 +830,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::AddSecret | Screen::EditSecret => draw_form(f, app),
         Screen::ConfirmationDialog(_) => draw_confirmation_dialog(f, app),
         Screen::HelpDialog => draw_help_dialog(f, app),
+        Screen::ChangePassword => draw_change_password_screen(f, app),
         Screen::ErrorDialog => draw_error_dialog(f, app),
     }
 }
@@ -1002,6 +1098,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::styled("[v] View PW | ", Style::default().fg(Color::Magenta)),
             Span::styled("[c] Copy User | ", Style::default().fg(Color::Cyan)),
             Span::styled("[p] Copy PW | ", Style::default().fg(Color::Cyan)),
+            Span::styled("[m] Change PW | ", Style::default().fg(Color::Magenta)),
             Span::styled("[h] Help | ", Style::default().fg(Color::Green)),
             Span::styled("[Esc] Exit", Style::default().fg(Color::White)),
         ])
@@ -1178,6 +1275,10 @@ fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
             Span::styled("  [v]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Toggle password visibility in Detail Pane", Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("  [m]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Change Master Password and rotate encryption keys", Style::default().fg(Color::White)),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
@@ -1231,5 +1332,73 @@ impl Drop for TuiApp {
         self.password_input.zeroize();
         self.password_confirm_input.zeroize();
         self.form_password.zeroize();
+    }
+}
+
+fn draw_change_password_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Change Master Password")
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let area = centered_rect(60, 70, size);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let field_0_focused = app.change_pass_field == 0;
+    let field_1_focused = app.change_pass_field == 1;
+    let field_2_focused = app.change_pass_field == 2;
+
+    let mask_current = "*".repeat(app.password_input.len());
+    let current_box = Paragraph::new(mask_current)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Current Master Password")
+                .border_style(if field_0_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(current_box, chunks[0]);
+
+    let mask_new = "*".repeat(app.password_confirm_input.len());
+    let new_box = Paragraph::new(mask_new)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("New Master Password")
+                .border_style(if field_1_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(new_box, chunks[1]);
+
+    let mask_confirm = "*".repeat(app.form_password.len());
+    let confirm_box = Paragraph::new(mask_confirm)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm New Master Password")
+                .border_style(if field_2_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(confirm_box, chunks[2]);
+
+    if !app.error_message.is_empty() {
+        let err = Paragraph::new(&*app.error_message)
+            .style(Style::default().fg(Color::Red));
+        f.render_widget(err, chunks[3]);
+    } else {
+        let hints = Paragraph::new("Use [Tab] / [Shift+Tab] to switch fields | Press [Enter] to Save | [Esc] to Cancel")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hints, chunks[3]);
     }
 }

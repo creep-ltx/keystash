@@ -6,6 +6,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
+use zeroize::Zeroizing;
 
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
@@ -20,7 +21,7 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
 }
 
 /// Derives a 256-bit key from the master password and a salt using Argon2id.
-pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
+pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let mut derived_key = [0u8; KEY_LEN];
     let params = Params::new(15360, 2, 1, Some(KEY_LEN)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(
@@ -33,7 +34,7 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> 
         .hash_password_into(password.as_bytes(), salt, &mut derived_key)
         .map_err(|e| e.to_string())?;
 
-    Ok(derived_key)
+    Ok(Zeroizing::new(derived_key))
 }
 
 /// Encrypts plaintext using XChaCha20-Poly1305 with the derived key.
