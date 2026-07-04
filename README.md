@@ -49,38 +49,63 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 
 ---
 
+## 📥 Installation
+
+To run `KeyStash` globally from anywhere on your system, build and install the binary using Cargo:
+
+```bash
+# Clone the repository and navigate inside
+cd KeyStash
+
+# Install the binary to ~/.cargo/bin
+cargo install --path .
+```
+
+*Note: Ensure `~/.cargo/bin` is in your system's `$PATH` environment variable.*
+
+Alternatively, you can manually symlink the release binary to your local bin path:
+```bash
+# Build the release profile
+cargo build --release
+
+# Symlink it as lowercase 'keystash'
+ln -s $(pwd)/target/release/KeyStash ~/.local/bin/keystash
+```
+
+---
+
 ## 💻 CLI Subcommand Reference
 
-By default, executing `KeyStash` with no arguments starts the TUI. The following subcommands can be passed:
+By default, executing `keystash` with no arguments starts the TUI. The following subcommands can be passed:
 
 * **TUI Dashboard (Default):**
   ```bash
-  cargo run --release
+  keystash
   ```
 * **Initialize Vault:**
   ```bash
-  cargo run --release -- init
+  keystash init
   ```
 * **List Decrypted Credentials:**
   ```bash
-  cargo run --release -- list
+  keystash list
   ```
 * **Search Vault:**
   ```bash
-  cargo run --release -- search <query>
+  keystash search <query>
   ```
 * **Insert a Secret:**
   ```bash
-  cargo run --release -- add <Title> <Category> <Username> [URL]
+  keystash add <Title> <Category> <Username> [URL]
   ```
   *(Prompt will safely hide your password keystrokes during entry)*
 * **Import from Bitwarden:**
   ```bash
-  cargo run --release -- import-bitwarden <path/to/bitwarden_export.json>
+  keystash import-bitwarden <path/to/bitwarden_export.json>
   ```
 * **Delete a Secret:**
   ```bash
-  cargo run --release -- delete <ID>
+  keystash delete <ID>
   ```
 
 ---
