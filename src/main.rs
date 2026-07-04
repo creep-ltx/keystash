@@ -1,0 +1,302 @@
+pub mod crypto;
+pub mod db;
+pub mod tui;
+pub mod import;
+
+use std::env;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use rpassword::read_password;
+
+fn get_db_path() -> PathBuf {
+    let mut path = if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(".")
+    };
+    path.push(".config");
+    path.push("keystash");
+    let _ = fs::create_dir_all(&path);
+    path.push("vault.db");
+    path
+}
+
+fn prompt_password(prompt: &str) -> String {
+    print!("{}", prompt);
+    let _ = io::stdout().flush();
+    read_password().unwrap_or_default()
+}
+
+fn print_help() {
+    println!("KeyStash 🔑 - Secure Offline Password Manager");
+    println!();
+    println!("Usage:");
+    println!("  keystash [tui]                            Start the interactive TUI (default)");
+    println!("  keystash init                             Initialize the password vault");
+    println!("  keystash add <title> <category> <user> [url] Add a new secret to the database");
+    println!("  keystash list                             List all stored credentials");
+    println!("  keystash search <query>                   Search stored credentials");
+    println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
+    println!("  keystash delete <id>                      Delete a credential by its ID");
+    println!("  keystash help                             Show this help message");
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let db_path = get_db_path();
+    
+    // Ensure parent directory of db_path exists
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if args.len() < 2 {
+        start_tui(&db_path);
+        return;
+    }
+
+    match args[1].as_str() {
+        "tui" => {
+            start_tui(&db_path);
+        }
+        "init" => {
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to initialize database: {}", e);
+                    return;
+                }
+            };
+            if !db::is_first_run(&conn).unwrap_or(true) {
+                println!("Vault is already initialized at {:?}", db_path);
+                return;
+            }
+            let pass = prompt_password("Set Master Password: ");
+            let confirm = prompt_password("Confirm Master Password: ");
+            if pass != confirm {
+                eprintln!("Passwords do not match.");
+                return;
+            }
+            match db::setup_vault(&conn, &pass) {
+                Ok(_) => println!("Vault successfully initialized at {:?}", db_path),
+                Err(e) => eprintln!("Initialization failed: {}", e),
+            }
+        }
+        "add" => {
+            if args.len() < 5 {
+                eprintln!("Usage: keystash add <title> <category> <username> [url]");
+                return;
+            }
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            let pass = prompt_password("Enter Secret Password: ");
+            print!("Enter Notes (optional): ");
+            let _ = io::stdout().flush();
+            let mut notes = String::new();
+            let _ = io::stdin().read_line(&mut notes);
+            let notes_clean = notes.trim();
+
+            let url = if args.len() >= 6 { &args[5] } else { "" };
+
+            match db::add_secret(
+                &conn,
+                &args[2],
+                &args[3],
+                &args[4],
+                url,
+                &pass,
+                if notes_clean.is_empty() { None } else { Some(notes_clean) },
+                &key,
+            ) {
+                Ok(_) => println!("Secret successfully saved!"),
+                Err(e) => eprintln!("Error saving secret: {}", e),
+            }
+        }
+        "list" => {
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            match db::get_secrets(&conn) {
+                Ok(records) => {
+                    println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | Password", "ID", "Title", "Category", "Username", "URL");
+                    println!("{}", "-".repeat(100));
+                    for r in records {
+                        let decrypted_pass = crypto::decrypt(&r.encrypted_password, &key)
+                            .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                            .unwrap_or_else(|_| "<Error>".to_string());
+                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
+                    }
+                }
+                Err(e) => eprintln!("Error fetching secrets: {}", e),
+            }
+        }
+        "search" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash search <query>");
+                return;
+            }
+            let query = args[2].to_lowercase();
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            match db::get_secrets(&conn) {
+                Ok(records) => {
+                    let filtered: Vec<db::SecretRecord> = records
+                        .into_iter()
+                        .filter(|r| {
+                            r.title.to_lowercase().contains(&query)
+                                || r.category.to_lowercase().contains(&query)
+                                || r.username.to_lowercase().contains(&query)
+                                || r.url.to_lowercase().contains(&query)
+                        })
+                        .collect();
+
+                    if filtered.is_empty() {
+                        println!("No credentials matching '{}' found.", query);
+                    } else {
+                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | Password", "ID", "Title", "Category", "Username", "URL");
+                        println!("{}", "-".repeat(100));
+                        for r in filtered {
+                            let decrypted_pass = crypto::decrypt(&r.encrypted_password, &key)
+                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                .unwrap_or_else(|_| "<Error>".to_string());
+                            println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error searching secrets: {}", e),
+            }
+        }
+        "delete" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash delete <id>");
+                return;
+            }
+            let id: i64 = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("Invalid ID: {}", args[2]);
+                    return;
+                }
+            };
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            let master_pass = prompt_password("Enter Master Password: ");
+            if let Err(e) = db::unlock_vault(&conn, &master_pass) {
+                eprintln!("Unlock failed: {}", e);
+                return;
+            }
+            match db::delete_secret(&conn, id) {
+                Ok(_) => println!("Secret successfully deleted."),
+                Err(e) => eprintln!("Error deleting secret: {}", e),
+            }
+        }
+        "import-bitwarden" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash import-bitwarden <file_path>");
+                return;
+            }
+            let file_path = &args[2];
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+
+            match import::import_bitwarden_json(&conn, file_path, &key) {
+                Ok(count) => println!("Success: Imported {} items from Bitwarden JSON export!", count),
+                Err(e) => eprintln!("Import failed: {}", e),
+            }
+        }
+        "help" | "-h" | "--help" => {
+            print_help();
+        }
+        cmd => {
+            eprintln!("Unknown command: {}", cmd);
+            print_help();
+        }
+    }
+}
+
+fn start_tui(db_path: &Path) {
+    let conn = match db::init_db(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to open vault database: {}", e);
+            return;
+        }
+    };
+    let app = tui::TuiApp::new(conn);
+    if let Err(e) = tui::run_tui(app) {
+        eprintln!("Terminal application crashed: {}", e);
+    }
+}
