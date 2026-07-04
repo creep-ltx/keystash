@@ -131,6 +131,16 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
         // Detach database
         let _ = conn.execute("DETACH DATABASE remote_db", []);
         let _ = fs::remove_file(&remote_db_path);
+
+        // Align local branch history with the remote before committing (preserves merged vault.db)
+        Command::new("git")
+            .arg("reset")
+            .arg("origin/main")
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("git reset failed: {}", e))?;
     }
 
     // 3. Stage changes, commit, and push local updates to remote repository
