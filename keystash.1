@@ -83,6 +83,36 @@ Toggle the Help & Keybindings modal popup.
 .TP
 .B Esc
 Cancel dialogs, close forms, or exit the application.
+.SH SYNCHRONIZATION & MULTI-MACHINE SETUP
+If the config folder (~/.config/keystash) is initialized as a Git repository, keystash will automatically synchronize and merge database updates across your machines.
+.PP
+.B First-time Setup (Device A):
+.nf
+  cd ~/.config/keystash
+  git init
+  echo "*" > .gitignore
+  echo "!vault.db" >> .gitignore
+  git remote add origin <private-git-repo-url>
+  git branch -M main
+  git add .
+  git commit -m "Initial vault backup"
+  git push -u origin main
+.fi
+.PP
+.B Adding a New Device (Device B):
+.IP
+.B WARNING:
+DO NOT run "keystash init" on a secondary device. This will generate a different database salt and result in decryption errors. Instead, pull the existing database directly from origin:
+.nf
+  mkdir -p ~/.config/keystash
+  cd ~/.config/keystash
+  git init
+  echo "*" > .gitignore
+  echo "!vault.db" >> .gitignore
+  git remote add origin <private-git-repo-url>
+  git branch -M main
+  git pull origin main
+.fi
 .SH FILES
 .TP
 .I ~/.config/keystash/vault.db
