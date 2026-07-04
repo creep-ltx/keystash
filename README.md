@@ -128,6 +128,6 @@ KeyStash relies exclusively on safe and audited pure-Rust libraries:
 - `ratatui` & `crossterm` for drawing interactive terminal screens.
 - `rusqlite` (with bundled features) for local SQLite database integrations.
 - `chacha20poly1305` & `argon2` for modern cryptography.
-- `copypasta` for cross-platform clipboard access.
+- System clipboard utilities (`wl-copy`, `xclip`, `xsel`) for native Wayland and X11 clipboard integration.
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.
