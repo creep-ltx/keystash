@@ -1222,3 +1222,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        if let Some(mut k) = self.key.take() {
+            k.zeroize();
+        }
+        self.password_input.zeroize();
+        self.password_confirm_input.zeroize();
+        self.form_password.zeroize();
+    }
+}

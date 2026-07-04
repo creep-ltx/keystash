@@ -53,6 +53,12 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Create lookup index for faster search/merging
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_secrets_lookup ON secrets (title, category, username)",
+        [],
+    )?;
+
     // Migration: Add 'url' column if database existed before this field was added
     let has_url: bool = conn
         .query_row(
