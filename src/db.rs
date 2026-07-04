@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, Result, OptionalExtension};
 use std::path::Path;
 use crate::crypto::{self, KEY_LEN, SALT_LEN};
 
@@ -37,6 +37,18 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             encrypted_password BLOB NOT NULL,
             encrypted_notes BLOB,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    // Create tombstone table for deletions tracking
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS deleted_secrets (
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            username TEXT NOT NULL,
+            deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (title, category, username)
         )",
         [],
     )?;
@@ -210,6 +222,27 @@ pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
 }
 
 pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
+    // 1. Fetch details for tombstone
+    let record: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT title, category, username FROM secrets WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    if let Some((title, category, username)) = record {
+        // 2. Insert into deleted_secrets tombstone table
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_secrets (title, category, username, deleted_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+            params![title, category, username],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // 3. Delete the actual secret
     conn.execute("DELETE FROM secrets WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())

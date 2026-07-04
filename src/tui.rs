@@ -263,6 +263,13 @@ impl TuiApp {
             }
         }
     }
+
+    fn trigger_background_sync(&self) {
+        let db_path = crate::get_db_path();
+        std::thread::spawn(move || {
+            let _ = crate::sync::git_sync_vault(db_path);
+        });
+    }
 }
 
 pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
@@ -669,6 +676,7 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode) {
                     Ok(_) => {
                         app.screen = Screen::Dashboard;
                         app.refresh_secrets();
+                        app.trigger_background_sync();
                     }
                     Err(err) => {
                         app.error_message = err;
@@ -701,6 +709,7 @@ fn handle_confirmation_input(app: &mut TuiApp, code: KeyCode, action: ConfirmAct
             }
             app.screen = Screen::Dashboard;
             app.refresh_secrets();
+            app.trigger_background_sync();
         }
         KeyCode::Char('n') | KeyCode::Esc => {
             app.screen = Screen::Dashboard;

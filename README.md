@@ -119,6 +119,44 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash reset
   ```
   *(Deletes the `vault.db` file completely after a verification prompt)*
+* **Manual Git Sync:**
+  ```bash
+  keystash sync
+  ```
+  *(Triggers a manual logical merge and push to origin/main)*
+
+---
+
+## 🔄 Git Synchronization & Logical Merging
+
+If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging:
+
+### 1. One-time Setup
+To enable syncing on a device, initialize your config folder as a Git repository linked to your private remote:
+```bash
+cd ~/.config/keystash
+git init
+
+# Track only the encrypted database
+echo "*" > .gitignore
+echo "!vault.db" >> .gitignore
+
+# Link your private remote (e.g. GitHub)
+git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
+git branch -M main
+
+# Stage and push the initial version
+git add .
+git commit -m "Initial vault backup"
+git push -u origin main
+```
+
+### 2. How it operates
+* **TUI Startup Sync:** When you run `keystash` in TUI mode, it fetches and logically merges any remote changes before showing you the Master Password lock screen.
+* **Background Change Sync:** Adding, editing, or deleting a credential triggers a non-blocking background thread to merge and push changes instantly to GitHub.
+* **TUI Exit Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote.
+* **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
+* **Logical Database Merge:** Compares records using natural keys (`Title + Category + Username`). If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept.
 
 ---
 

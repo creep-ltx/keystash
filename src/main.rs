@@ -2,14 +2,16 @@ pub mod crypto;
 pub mod db;
 pub mod tui;
 pub mod import;
+pub mod sync;
 
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use rpassword::read_password;
 
-fn get_db_path() -> PathBuf {
+pub fn get_db_path() -> PathBuf {
     let mut path = if let Ok(home) = env::var("HOME") {
         PathBuf::from(home)
     } else {
@@ -43,6 +45,7 @@ fn print_help() {
     println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
+    println!("  keystash sync                             Force manual Git sync/merge");
     println!("  keystash help                             Show this help message");
 }
 
@@ -300,6 +303,13 @@ fn main() {
                 println!("Reset cancelled.");
             }
         }
+        "sync" => {
+            println!("Syncing vault with Git remote...");
+            match sync::git_sync_vault(&db_path) {
+                Ok(msg) => println!("{}", msg),
+                Err(err) => eprintln!("Sync Error: {}", err),
+            }
+        }
         "help" | "-h" | "--help" => {
             print_help();
         }
@@ -318,8 +328,28 @@ fn start_tui(db_path: &Path) {
             return;
         }
     };
+
+    // Auto-sync at startup if Git is configured
+    if sync::is_git_configured(db_path) {
+        println!("Syncing vault with Git remote...");
+        match sync::git_sync_vault(db_path) {
+            Ok(msg) => println!("{}", msg),
+            Err(err) => eprintln!("Sync Warning: {}", err),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
     let app = tui::TuiApp::new(conn);
     if let Err(e) = tui::run_tui(app) {
         eprintln!("Terminal application crashed: {}", e);
+    }
+
+    // Auto-sync updates on exit if Git is configured
+    if sync::is_git_configured(db_path) {
+        println!("Syncing vault updates on exit...");
+        match sync::git_sync_vault(db_path) {
+            Ok(msg) => println!("{}", msg),
+            Err(err) => eprintln!("Sync Warning: {}", err),
+        }
     }
 }
