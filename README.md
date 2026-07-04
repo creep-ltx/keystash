@@ -4,6 +4,13 @@
 
 ---
 
+## 📂 Vault Database Storage Path
+
+Your credentials database is stored offline inside your user config folder:
+* **Linux/macOS:** `~/.config/keystash/vault.db`
+
+---
+
 ## 🛠️ Features
 
 ### 🖥️ Interactive TUI Dashboard
@@ -107,6 +114,11 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash delete <ID>
   ```
+* **Nuke/Reset Vault:**
+  ```bash
+  keystash reset
+  ```
+  *(Deletes the `vault.db` file completely after a verification prompt)*
 
 ---
 

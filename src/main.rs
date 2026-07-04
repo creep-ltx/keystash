@@ -31,6 +31,9 @@ fn prompt_password(prompt: &str) -> String {
 fn print_help() {
     println!("KeyStash 🔑 - Secure Offline Password Manager");
     println!();
+    println!("Storage Location:");
+    println!("  ~/.config/keystash/vault.db");
+    println!();
     println!("Usage:");
     println!("  keystash [tui]                            Start the interactive TUI (default)");
     println!("  keystash init                             Initialize the password vault");
@@ -39,6 +42,7 @@ fn print_help() {
     println!("  keystash search <query>                   Search stored credentials");
     println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
     println!("  keystash delete <id>                      Delete a credential by its ID");
+    println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash help                             Show this help message");
 }
 
@@ -275,6 +279,25 @@ fn main() {
             match import::import_bitwarden_json(&conn, file_path, &key) {
                 Ok(count) => println!("Success: Imported {} items from Bitwarden JSON export!", count),
                 Err(e) => eprintln!("Import failed: {}", e),
+            }
+        }
+        "reset" => {
+            println!("WARNING: This will permanently delete your database file at {:?}", db_path);
+            print!("Are you sure you want to completely reset and delete your vault? (y/N): ");
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            let _ = io::stdin().read_line(&mut answer);
+            if answer.trim().to_lowercase() == "y" {
+                if db_path.exists() {
+                    match fs::remove_file(&db_path) {
+                        Ok(_) => println!("Vault database successfully deleted. You can run `keystash init` to create a new one."),
+                        Err(e) => eprintln!("Failed to delete vault file: {}", e),
+                    }
+                } else {
+                    println!("No database file existed at {:?}", db_path);
+                }
+            } else {
+                println!("Reset cancelled.");
             }
         }
         "help" | "-h" | "--help" => {
