@@ -149,6 +149,8 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
             .arg("add")
             .arg("vault.db")
             .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("git add failed: {}", e))?;
 
@@ -158,6 +160,8 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
             .arg("-m")
             .arg("sync: auto-merge vault updates")
             .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("git commit failed: {}", e))?;
     }
