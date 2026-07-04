@@ -68,15 +68,11 @@ cd keystash
 cargo install --path .
 ```
 
-*Note: Ensure `~/.cargo/bin` is in your system's `$PATH` environment variable.*
-
-Alternatively, you can manually symlink the release binary to your local bin path:
+To install the manual page (`man keystash`), copy it to your local man pages directory:
 ```bash
-# Build the release profile
-cargo build --release
-
-# Symlink it as lowercase 'keystash'
-ln -s $(pwd)/target/release/keystash ~/.local/bin/keystash
+# Install the man page to your local user directory
+mkdir -p ~/.local/share/man/man1
+cp keystash.1 ~/.local/share/man/man1/
 ```
 
 ---
