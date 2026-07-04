@@ -120,6 +120,11 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash sync
   ```
   *(Triggers a manual logical merge and push to origin/main)*
+* **Change Master Password (Key Rotation):**
+  ```bash
+  keystash change-password
+  ```
+  *(Decrypts all vault items using your old password and re-encrypts them with a newly derived key and salt)*
 
 ---
 

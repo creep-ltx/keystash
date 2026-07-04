@@ -37,6 +37,9 @@ Nuke the local database file after confirming via a verification prompt.
 .B sync
 Force a manual logical merge and synchronization with your configured Git remote.
 .TP
+.B change-password
+Change Master Password and re-encrypt all stored vault secrets using a newly derived key.
+.TP
 .B help, -h, --help
 Show the standard command-line help block.
 .SH TUI KEYBINDINGS
@@ -77,6 +80,9 @@ Copy decrypted password to clipboard (clears automatically in 10s).
 .TP
 .B u
 Copy website URL to clipboard (clears automatically in 10s).
+.TP
+.B m
+Open the Change Master Password form overlay.
 .TP
 .B h / ?
 Toggle the Help & Keybindings modal popup.
