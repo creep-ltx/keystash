@@ -58,11 +58,11 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 
 ## 📥 Installation
 
-To run `KeyStash` globally from anywhere on your system, build and install the binary using Cargo:
+To run `keystash` globally from anywhere on your system, build and install the binary using Cargo:
 
 ```bash
 # Clone the repository and navigate inside
-cd KeyStash
+cd keystash
 
 # Install the binary to ~/.cargo/bin
 cargo install --path .
@@ -76,7 +76,7 @@ Alternatively, you can manually symlink the release binary to your local bin pat
 cargo build --release
 
 # Symlink it as lowercase 'keystash'
-ln -s $(pwd)/target/release/KeyStash ~/.local/bin/keystash
+ln -s $(pwd)/target/release/keystash ~/.local/bin/keystash
 ```
 
 ---

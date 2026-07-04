@@ -239,8 +239,16 @@ fn run_loop<B: ratatui::backend::Backend>(
             if let Event::Key(key) = event::read()? {
                 if key.kind == event::KeyEventKind::Press {
                     match app.screen {
-                        Screen::Lock => handle_lock_input(app, key.code),
-                        Screen::Setup => handle_setup_input(app, key.code),
+                        Screen::Lock => {
+                            if handle_lock_input(app, key.code) {
+                                return Ok(());
+                            }
+                        }
+                        Screen::Setup => {
+                            if handle_setup_input(app, key.code) {
+                                return Ok(());
+                            }
+                        }
                         Screen::Dashboard => {
                             if handle_dashboard_input(app, key.code, key.modifiers) {
                                 return Ok(());
@@ -260,7 +268,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     }
 }
 
-fn handle_lock_input(app: &mut TuiApp, code: KeyCode) {
+fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
     match code {
         KeyCode::Char(c) => app.password_input.push(c),
         KeyCode::Backspace => {
@@ -283,13 +291,14 @@ fn handle_lock_input(app: &mut TuiApp, code: KeyCode) {
             }
         }
         KeyCode::Esc => {
-            std::process::exit(0);
+            return true;
         }
         _ => {}
     }
+    false
 }
 
-fn handle_setup_input(app: &mut TuiApp, code: KeyCode) {
+fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
     match code {
         KeyCode::Tab => {
             app.active_form_field = match app.active_form_field {
@@ -312,11 +321,11 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) {
         KeyCode::Enter => {
             if app.password_input.is_empty() {
                 app.error_message = "Password cannot be empty!".to_string();
-                return;
+                return false;
             }
             if app.password_input != app.password_confirm_input {
                 app.error_message = "Passwords do not match!".to_string();
-                return;
+                return false;
             }
             match db::setup_vault(&app.conn, &app.password_input) {
                 Ok(derived_key) => {
@@ -335,10 +344,11 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) {
             }
         }
         KeyCode::Esc => {
-            std::process::exit(0);
+            return true;
         }
         _ => {}
     }
+    false
 }
 
 fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) -> bool {
