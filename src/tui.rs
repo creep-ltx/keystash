@@ -47,6 +47,9 @@ enum Screen {
     ConfirmationDialog(ConfirmAction),
     HelpDialog,
     ChangePassword,
+    ImportDialog,
+    ExportTypeDialog,
+    ExportDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +105,9 @@ pub struct TuiApp {
     // Key rotation form state
     pub change_pass_field: usize,
     pub no_sync: bool,
+    pub import_path_input: String,
+    pub export_path_input: String,
+    pub export_only_marked: bool,
 }
 
 impl TuiApp {
@@ -140,6 +146,9 @@ impl TuiApp {
             secrets_list_state: RefCell::new(ListState::default()),
             change_pass_field: 0,
             no_sync,
+            import_path_input: String::new(),
+            export_path_input: String::new(),
+            export_only_marked: false,
         }
     }
 
@@ -338,6 +347,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::ConfirmationDialog(action) => handle_confirmation_input(app, key.code, action),
                         Screen::HelpDialog => handle_help_input(app, key.code),
                         Screen::ChangePassword => handle_change_password_input(app, key.code),
+                        Screen::ImportDialog => handle_import_input(app, key.code),
+                        Screen::ExportTypeDialog => handle_export_type_input(app, key.code),
+                        Screen::ExportDialog => handle_export_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -534,6 +546,14 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.change_pass_field = 0;
             app.error_message.clear();
             app.screen = Screen::ChangePassword;
+        }
+        KeyCode::Char('i') => {
+            app.import_path_input.clear();
+            app.screen = Screen::ImportDialog;
+        }
+        KeyCode::Char('x') => {
+            app.export_path_input.clear();
+            app.screen = Screen::ExportTypeDialog;
         }
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
@@ -828,6 +848,139 @@ fn handle_help_input(app: &mut TuiApp, code: KeyCode) {
     }
 }
 
+fn handle_import_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Char(c) => {
+            app.import_path_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.import_path_input.pop();
+        }
+        KeyCode::Esc => {
+            app.import_path_input.clear();
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Enter => {
+            let file_path = app.import_path_input.trim();
+            if file_path.is_empty() {
+                return;
+            }
+            
+            let detected_format = match crate::import::detect_format(file_path) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    app.error_message = format!("Import detection failed: {}", e);
+                    app.screen = Screen::ErrorDialog;
+                    return;
+                }
+            };
+
+            let key_ref = match &app.key {
+                Some(k) => k,
+                None => {
+                    app.error_message = "Vault key not found in memory. Please unlock again.".to_string();
+                    app.screen = Screen::ErrorDialog;
+                    return;
+                }
+            };
+
+            let import_result = match detected_format {
+                crate::import::ImportFormat::BitwardenJson => crate::import::import_bitwarden_json(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::BraveChromeCsv => crate::import::import_brave_chrome_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::FirefoxCsv => crate::import::import_firefox_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::LastPassCsv => crate::import::import_lastpass_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::KeePassXcCsv => crate::import::import_keepassxc_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::OnePasswordCsv => crate::import::import_onepassword_csv(&app.conn, file_path, key_ref),
+            };
+
+            match import_result {
+                Ok(count) => {
+                    app.copied_message = Some((format!("Success: Imported {} items from {}!", count, detected_format.name()), Instant::now()));
+                    app.import_path_input.clear();
+                    app.refresh_secrets();
+                    app.trigger_background_sync();
+                    app.screen = Screen::Dashboard;
+                }
+                Err(e) => {
+                    app.error_message = format!("Import failed: {}", e);
+                    app.screen = Screen::ErrorDialog;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_export_type_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            app.export_only_marked = false;
+            app.export_path_input.clear();
+            app.screen = Screen::ExportDialog;
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if !app.marked_secrets.is_empty() {
+                app.export_only_marked = true;
+                app.export_path_input.clear();
+                app.screen = Screen::ExportDialog;
+            }
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
+fn handle_export_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Char(c) => {
+            app.export_path_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.export_path_input.pop();
+        }
+        KeyCode::Esc => {
+            app.export_path_input.clear();
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Enter => {
+            let file_path = app.export_path_input.trim();
+            if file_path.is_empty() {
+                return;
+            }
+
+            let key_ref = match &app.key {
+                Some(k) => k,
+                None => {
+                    app.error_message = "Vault key not found in memory. Please unlock again.".to_string();
+                    app.screen = Screen::ErrorDialog;
+                    return;
+                }
+            };
+
+            let filter_set = if app.export_only_marked {
+                Some(&app.marked_secrets)
+            } else {
+                None
+            };
+
+            match crate::import::export_vault_csv(&app.conn, file_path, key_ref, filter_set) {
+                Ok(count) => {
+                    app.copied_message = Some((format!("Success: Exported {} secrets to CSV!", count), Instant::now()));
+                    app.export_path_input.clear();
+                    app.screen = Screen::Dashboard;
+                }
+                Err(e) => {
+                    app.error_message = format!("Export failed: {}", e);
+                    app.screen = Screen::ErrorDialog;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
     match app.screen {
         Screen::Lock => draw_lock_screen(f, app),
@@ -838,6 +991,9 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::HelpDialog => draw_help_dialog(f, app),
         Screen::ChangePassword => draw_change_password_screen(f, app),
         Screen::ErrorDialog => draw_error_dialog(f, app),
+        Screen::ImportDialog => draw_import_dialog(f, app),
+        Screen::ExportTypeDialog => draw_export_type_dialog(f, app),
+        Screen::ExportDialog => draw_export_dialog(f, app),
     }
 }
 
@@ -1285,6 +1441,14 @@ fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
             Span::styled("  [m]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Change Master Password and rotate encryption keys", Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("  [i]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Import unencrypted credentials from backups", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [x]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Export credentials (all or selected) to CSV", Style::default().fg(Color::White)),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
@@ -1408,3 +1572,149 @@ fn draw_change_password_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         f.render_widget(hints, chunks[3]);
     }
 }
+
+fn draw_import_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Import Credentials")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let area = centered_rect(60, 35, size);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(1), // Intro
+            Constraint::Length(3), // Input box
+            Constraint::Min(0),    // Footnote/hints
+        ])
+        .split(area);
+
+    let intro = Paragraph::new("Enter the absolute file path of the unencrypted export file:")
+        .style(Style::default().fg(Color::White));
+    f.render_widget(intro, chunks[0]);
+
+    let input_box = Paragraph::new(app.import_path_input.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Backup File Path")
+                .border_style(Style::default().fg(Color::Yellow))
+        );
+    f.render_widget(input_box, chunks[1]);
+
+    let footnote = Paragraph::new(vec![
+        Line::from(Span::styled("Supports: Bitwarden JSON, Brave/Chrome/Firefox/LastPass/KeePassXC/1Password CSV", Style::default().fg(Color::DarkGray))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("to Import  |  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("to Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(footnote, chunks[2]);
+}
+
+fn draw_export_type_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Export Vault")
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let area = centered_rect(50, 30, size);
+    f.render_widget(Clear, area);
+
+    let has_marked = !app.marked_secrets.is_empty();
+    
+    let mut options = vec![
+        Line::from(vec![
+            Span::styled("  [a] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Export All Vault Credentials", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    if has_marked {
+        options.push(Line::from(vec![
+            Span::styled("  [s] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("Export Selected ({} Marked) Credentials", app.marked_secrets.len()), Style::default().fg(Color::White)),
+        ]));
+    } else {
+        options.push(Line::from(vec![
+            Span::styled("  [s] ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Export Selected (No items marked | Use [Space] to mark)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    options.push(Line::from(""));
+    options.push(Line::from(vec![
+        Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled("to Cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let p = Paragraph::new(options)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(p, area);
+}
+
+fn draw_export_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if app.export_only_marked { "Export Selected Credentials" } else { "Export All Credentials" })
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let area = centered_rect(60, 40, size);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(1), // Intro
+            Constraint::Length(3), // Input box
+            Constraint::Min(0),    // Warnings/hints
+        ])
+        .split(area);
+
+    let intro = Paragraph::new("Enter the destination path to write the unencrypted CSV file:")
+        .style(Style::default().fg(Color::White));
+    f.render_widget(intro, chunks[0]);
+
+    let input_box = Paragraph::new(app.export_path_input.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Destination File Path (.csv)")
+                .border_style(Style::default().fg(Color::Yellow))
+        );
+    f.render_widget(input_box, chunks[1]);
+
+    let warnings = Paragraph::new(vec![
+        Line::from(Span::styled("WARNING: Plaintext credentials will be written.", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Unix file permissions will be restricted to 0600 (owner read-write only).", Style::default().fg(Color::DarkGray))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("to Export  |  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("to Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(warnings, chunks[2]);
+}
+

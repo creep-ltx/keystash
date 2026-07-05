@@ -445,7 +445,7 @@ fn main() {
             };
 
             println!("Decrypting and exporting vault records to CSV...");
-            match import::export_vault_csv(&conn, output_path, &key) {
+            match import::export_vault_csv(&conn, output_path, &key, None) {
                 Ok(count) => {
                     println!("Success: Exported {} secrets to '{}'!", count, output_path);
                     println!("Please delete this file securely as soon as you are done using it.");

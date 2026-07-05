@@ -52,6 +52,8 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 | `[a]` | Add new credential |
 | `[e]` | Edit selected credential |
 | `[d]` | Delete credential (opens verification modal) |
+| `[i]` | Import unencrypted credentials from backups |
+| `[x]` | Export credentials (all or selected) to CSV |
 | `[Esc]` | Cancel form, exit modal, or close the application |
 
 ---

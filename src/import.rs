@@ -533,11 +533,12 @@ fn escape_csv_cell(val: &str) -> String {
     }
 }
 
-/// Exports all decrypted vault secrets to an unencrypted CSV file.
+/// Exports decrypted vault secrets to an unencrypted CSV file (optionally filtered by a set of record IDs).
 pub fn export_vault_csv(
     conn: &Connection,
     output_path: &str,
     key: &[u8; 32],
+    filter_ids: Option<&std::collections::HashSet<i64>>,
 ) -> Result<usize, String> {
     use std::io::Write;
     let mut file = File::create(output_path).map_err(|e| format!("Could not create file: {}", e))?;
@@ -555,6 +556,12 @@ pub fn export_vault_csv(
     writeln!(file, "title,url,username,password,notes,category").map_err(|e| e.to_string())?;
     
     for r in secrets {
+        if let Some(ids) = filter_ids {
+            if !ids.contains(&r.id) {
+                continue;
+            }
+        }
+        
         let decrypted_pass = crate::crypto::decrypt(&r.encrypted_password, key)
             .map(|dec| String::from_utf8_lossy(&dec).to_string())
             .unwrap_or_else(|_| String::new());
