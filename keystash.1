@@ -1,9 +1,9 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.1.1" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.2.0" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
 .B keystash
-[\-\-no\-sync] [tui|init|add|list|search|show|copy|import|export|delete|reset|sync|help]
+[\-\-no\-sync] [tui|init|add|list|search|show|copy|generate|import|export|delete|reset|sync|help]
 .SH DESCRIPTION
 .B keystash
 is a lightweight, secure, and completely offline password manager. It features an interactive Terminal User Interface (TUI) built on Ratatui, secure Argon2id key derivation, column-level XChaCha20-Poly1305 AEAD encryption, unencrypted Bitwarden JSON importing, and two-way logical git database synchronization.
@@ -34,6 +34,9 @@ Show a detailed view of a secret (including notes). Passwords and notes are mask
 .TP
 .B copy \fIid\fR [\fIusername\fR|\fIpassword\fR|\fIurl\fR]
 Copy the target secret field to the system clipboard (automatically clearing it after 10 seconds). Defaults to copying the password.
+.TP
+.B generate [\-l \fIlength\fR] [\-\-no\-uppercase] [\-\-no\-numbers] [\-\-no\-symbols] [\-\-uppercase] [\-\-numbers] [\-\-symbols]
+Generate a random secure password and print it, excluding ambiguous characters. Your options are saved as your new defaults.
 .TP
 .B import \fIpath/to/backup_file\fR
 Import login credentials from unencrypted files (supports Bitwarden JSON, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV).
@@ -103,7 +106,10 @@ Open the Import modal popup to import credentials from unencrypted backups.
 .B x
 Open the Export modal popup to export credentials (all or selected) to an unencrypted CSV.
 .TP
-.B h / ?
+.B h
+Check the selected password (or marked passwords if any exist) on HaveIBeenPwned.
+.TP
+.B ?
 Toggle the Help & Keybindings modal popup.
 .TP
 .B Esc

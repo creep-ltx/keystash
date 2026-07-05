@@ -52,6 +52,15 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Create hibp_checks table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hibp_checks (
+            password_hash TEXT PRIMARY KEY,
+            hibp_count INTEGER
+        )",
+        [],
+    )?;
+
     // Create tombstone table for deletions tracking
     conn.execute(
         "CREATE TABLE IF NOT EXISTS deleted_secrets (
@@ -246,6 +255,25 @@ pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
     Ok(secrets)
 }
 
+pub fn get_secret_by_id(conn: &Connection, id: i64) -> Result<Option<SecretRecord>, String> {
+    conn.query_row(
+        "SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at FROM secrets WHERE id = ?1",
+        params![id],
+        |row| Ok(SecretRecord {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            category: row.get(2)?,
+            username: row.get(3)?,
+            url: row.get(4)?,
+            encrypted_password: row.get(5)?,
+            encrypted_notes: row.get(6)?,
+            updated_at: row.get(7)?,
+        }),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
     // 1. Fetch details for tombstone
     let record: Option<(String, String, String)> = conn
@@ -342,5 +370,33 @@ pub fn change_master_password(
         .map_err(|e| format!("Failed to commit key rotation: {}", e))?;
 
     Ok(new_key)
+}
+
+pub fn save_hibp_check(conn: &Connection, password_hash: &str, count: Option<u64>) -> Result<(), String> {
+    let count_val = count.map(|c| c as i64);
+    conn.execute(
+        "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
+        params![password_hash, count_val],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+pub fn get_all_hibp_checks(conn: &Connection) -> Result<std::collections::HashMap<String, Option<u64>>, String> {
+    let mut stmt = conn.prepare("SELECT password_hash, hibp_count FROM hibp_checks")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        let hash: String = row.get(0)?;
+        let count_val: Option<i64> = row.get(1)?;
+        Ok((hash, count_val.map(|c| c as u64)))
+    }).map_err(|e| e.to_string())?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        if let Ok((hash, count)) = row {
+            map.insert(hash, count);
+        }
+    }
+    Ok(map)
 }
 

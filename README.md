@@ -56,7 +56,7 @@ Your credentials database is stored offline inside your user config folder:
 
 | Key | Action |
 | :--- | :--- |
-| **`[Tab]`** | Toggle focus between panels (Categories ➔ Credentials ➔ Details) |
+| **`[Tab]`** / **`[Shift+Tab]`** | Toggle focus between panels (Categories ➔ Credentials ➔ Details) forward/backward |
 | **`[↑]` / `[↓]`** | Scroll up/down through lists |
 | **`[PgUp]` / `[PgDn]`** | Page up/down (moves selection by 10 items in secrets, 5 items in categories) |
 | **`[Space]`** | Mark / Unmark selected credential |
@@ -68,8 +68,10 @@ Your credentials database is stored offline inside your user config folder:
 | **`[a]`** | Add new credential |
 | **`[e]`** | Edit selected credential |
 | **`[d]`** | Delete credential (opens verification modal) |
+| **`[h]`** | Check selected (or marked) password on HaveIBeenPwned |
 | **`[i]`** | Import unencrypted credentials from backups |
 | **`[x]`** | Export credentials (all or selected) to CSV |
+| **`[?]`** | Open Help dialog |
 | **`[Esc]`** | Cancel form, exit modal, or close the application |
 
 ---
@@ -104,6 +106,11 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash show <ID> [--reveal]
   ```
   *(Shows detailed fields of a secret; passwords and notes are masked by default unless `--reveal` or `-r` is provided)*
+* **Generate Password:**
+  ```bash
+  keystash generate [-l <length>] [--no-uppercase] [--no-numbers] [--no-symbols] [--uppercase] [--numbers] [--symbols]
+  ```
+  *(Generates a random secure password, avoiding visually ambiguous characters. Saves choices as your new defaults)*
 * **Copy Secret Field to Clipboard:**
   ```bash
   keystash copy <ID> [username|password|url]
@@ -214,9 +221,8 @@ git pull origin main
 You can now run `keystash` on Device B, enter your existing Master Password, and sync. Both machines will sync and decrypt seamlessly!
 
 ### 2. How it operates
-* **TUI Startup Sync:** When you run `keystash` in TUI mode, it fetches and logically merges any remote changes before showing you the Master Password lock screen.
-* **Background Change Sync:** Adding, editing, or deleting a credential triggers a non-blocking background thread to merge and push changes instantly to GitHub.
-* **TUI Exit Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote.
+* **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to pull and logically merge any remote changes concurrent with displaying the Master Password lock screen.
+* **Background Change Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote. Runs automatically after bulk CSV imports. Single changes inside the TUI are queued locally until exit to avoid redundant network calls.
 * **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
 * **Logical Database Merge:** Compares records using natural keys (`Title + Category + Username`). If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept.
 

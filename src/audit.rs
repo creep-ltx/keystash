@@ -32,6 +32,8 @@ pub struct AuditEntry {
     pub issues: Vec<String>,
     /// 0–5 composite strength score (higher = stronger).
     pub score: u8,
+    /// None = not checked, Some(0) = not pwned, Some(n) = found in n breaches.
+    pub hibp_count: Option<u64>,
 }
 
 pub struct AuditReport {
@@ -120,6 +122,7 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>) -> A
                 severity,
                 issues,
                 score,
+                hibp_count: None,
             }
         })
         .collect();
@@ -226,7 +229,7 @@ fn is_sequential(s: &str) -> bool {
 //  if available, otherwise inline pure-Rust)
 // ─────────────────────────────────────────────
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub fn sha256(data: &[u8]) -> [u8; 32] {
     use std::num::Wrapping;
 
     // Pure-Rust SHA-256 (RFC 6234)
@@ -287,6 +290,116 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, v) in h.iter().enumerate() {
         out[i*4..i*4+4].copy_from_slice(&v.0.to_be_bytes());
+    }
+    out
+}
+
+// ─────────────────────────────────────────────
+//  HaveIBeenPwned k-anonymity check
+// ─────────────────────────────────────────────
+
+/// Check a password against the HaveIBeenPwned Passwords API using k-anonymity.
+///
+/// Only the first 5 hex characters of the SHA-1 hash are sent to the server.
+/// Returns `Ok(0)` if not found, `Ok(n)` if found in `n` breach records,
+/// or `Err(msg)` on network/parse failure.
+pub fn check_hibp(password: &str) -> Result<u64, String> {
+    let hash_bytes = sha1(password.as_bytes());
+    let hash_hex: String = hash_bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect();
+
+    let prefix = &hash_hex[..5];
+    let suffix = &hash_hex[5..];
+
+    let url = format!("https://api.pwnedpasswords.com/range/{}", prefix);
+
+    let response = ureq::get(&url)
+        .set("User-Agent", "keystash-password-manager")
+        .call()
+        .map_err(|e| format!("HIBP request failed: {}", e))?;
+
+    let body = response
+        .into_string()
+        .map_err(|e| format!("HIBP response read error: {}", e))?;
+
+    for line in body.lines() {
+        // Each line: "HASH_SUFFIX:COUNT"
+        if let Some((line_suffix, count_str)) = line.split_once(':') {
+            if line_suffix.eq_ignore_ascii_case(suffix) {
+                return Ok(count_str.trim().parse().unwrap_or(1));
+            }
+        }
+    }
+
+    Ok(0) // not in breach list
+}
+
+// ─────────────────────────────────────────────
+//  Pure-Rust SHA-1 (RFC 3174) — required by HIBP API
+// ─────────────────────────────────────────────
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    use std::num::Wrapping;
+
+    let mut h: [Wrapping<u32>; 5] = [
+        Wrapping(0x67452301u32),
+        Wrapping(0xEFCDAB89u32),
+        Wrapping(0x98BADCFEu32),
+        Wrapping(0x10325476u32),
+        Wrapping(0xC3D2E1F0u32),
+    ];
+
+    // Pre-processing: pad to 512-bit boundary
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    // Process each 512-bit (64-byte) chunk
+    for chunk in msg.chunks(64) {
+        let mut w = [Wrapping(0u32); 80];
+        for i in 0..16 {
+            w[i] = Wrapping(u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]));
+        }
+        for i in 16..80 {
+            let val = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).0;
+            w[i] = Wrapping(val.rotate_left(1));
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19  => ((b & c) | (!b & d), Wrapping(0x5A827999u32)),
+                20..=39 => (b ^ c ^ d,           Wrapping(0x6ED9EBA1u32)),
+                40..=59 => ((b & c) | (b & d) | (c & d), Wrapping(0x8F1BBCDCu32)),
+                _       => (b ^ c ^ d,           Wrapping(0xCA62C1D6u32)),
+            };
+            let temp = Wrapping(a.0.rotate_left(5))
+                + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = Wrapping(b.0.rotate_left(30));
+            b = a;
+            a = temp;
+        }
+
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.0.to_be_bytes());
     }
     out
 }

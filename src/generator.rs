@@ -1,13 +1,36 @@
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-#[derive(Clone, Debug)]
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GeneratorOptions {
     pub length: usize,
     pub use_lowercase: bool,
     pub use_uppercase: bool,
     pub use_numbers: bool,
     pub use_symbols: bool,
+}
+
+impl GeneratorOptions {
+    pub fn load() -> Self {
+        let path = crate::get_config_path();
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(opts) = serde_json::from_str::<Self>(&content) {
+                    return opts;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = crate::get_config_path();
+        let content = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 impl Default for GeneratorOptions {
@@ -32,22 +55,22 @@ pub fn generate_password(options: &GeneratorOptions) -> Result<String, String> {
     let mut rng = rand::thread_rng();
 
     if options.use_lowercase {
-        let chars = b"abcdefghijklmnopqrstuvwxyz";
+        let chars = b"abcdefghijkmnopqrstuvwxyz";
         char_pool.extend_from_slice(chars);
         guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
     }
     if options.use_uppercase {
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let chars = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
         char_pool.extend_from_slice(chars);
         guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
     }
     if options.use_numbers {
-        let chars = b"0123456789";
+        let chars = b"23456789";
         char_pool.extend_from_slice(chars);
         guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
     }
     if options.use_symbols {
-        let chars = b"!@#$%^&*()_+-=[]{}|;:,.<>?";
+        let chars = b"!@#$%^&*()_+-=[]{};:,.<>?";
         char_pool.extend_from_slice(chars);
         guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
     }

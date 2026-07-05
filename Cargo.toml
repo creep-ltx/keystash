@@ -1,6 +1,6 @@
 [package]
 name = "keystash"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A secure offline TUI and CLI password manager featuring logical Git sync"
 license = "MIT"
@@ -22,6 +22,7 @@ tokio = { version = "1.35", features = ["full"] }
 rpassword = "7.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+ureq = "2"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

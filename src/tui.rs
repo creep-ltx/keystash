@@ -122,6 +122,9 @@ pub struct TuiApp {
     pub audit_report: Option<crate::audit::AuditReport>,
     pub audit_scroll: usize,
     pub audit_selected: usize,
+
+    // HIBP cache to persist checked counts across edits/refreshes. Map: id -> (password_sha256_hex, Option<u64>)
+    pub hibp_cache: std::collections::HashMap<i64, (String, Option<u64>)>,
 }
 
 impl TuiApp {
@@ -129,7 +132,7 @@ impl TuiApp {
         let is_first = db::is_first_run(&conn).unwrap_or(true);
         let screen = if is_first { Screen::Setup } else { Screen::Lock };
 
-        Self {
+        let app = Self {
             conn,
             key: None,
             screen,
@@ -163,17 +166,20 @@ impl TuiApp {
             import_path_input: String::new(),
             export_path_input: String::new(),
             export_only_marked: false,
-            gen_options: crate::generator::GeneratorOptions::default(),
+            gen_options: crate::generator::GeneratorOptions::load(),
             gen_password: String::new(),
             help_scroll: 0,
             audit_report: None,
             audit_scroll: 0,
             audit_selected: 0,
-        }
+            hibp_cache: std::collections::HashMap::new(),
+        };
+        app.trigger_background_sync();
+        app
     }
 
     fn refresh_secrets(&mut self) {
-        if self.key.is_some() {
+        if let Some(key) = self.key.clone() {
             if let Ok(records) = db::get_secrets(&self.conn) {
                 self.secrets = records;
                 
@@ -189,6 +195,41 @@ impl TuiApp {
                 self.categories.extend(sorted_cats);
                 
                 self.apply_filter();
+
+                // Run security audit on decrypted passwords
+                let mut plaintext: Vec<(i64, String, String, String, String)> = self.secrets
+                    .iter()
+                    .filter_map(|r| {
+                        crate::crypto::decrypt(&r.encrypted_password, &key)
+                            .ok()
+                            .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                            .map(|pw| (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw))
+                    })
+                    .collect();
+
+                let mut report = crate::audit::audit_passwords(&mut plaintext);
+
+                // Restore HIBP status from database if password hasn't changed.
+                // We recreate plaintext list to compute SHA-256 (since audit_passwords zeroized plaintext)
+                if let Ok(db_checks) = db::get_all_hibp_checks(&self.conn) {
+                    if let Ok(records) = db::get_secrets(&self.conn) {
+                        for r in &records {
+                            if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, &key) {
+                                if let Ok(pw) = String::from_utf8(dec.to_vec()) {
+                                    let hash_bytes = crate::audit::sha256(pw.as_bytes());
+                                    let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+                                    if let Some(cached_count) = db_checks.get(&hash_hex) {
+                                        if let Some(entry) = report.entries.iter_mut().find(|e| e.id == r.id) {
+                                            entry.hibp_count = *cached_count;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                self.audit_report = Some(report);
             }
         }
     }
@@ -331,7 +372,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 return Ok(());
                             }
                         }
-                        Screen::AddSecret | Screen::EditSecret => handle_form_input(app, key.code),
+                        Screen::AddSecret | Screen::EditSecret => handle_form_input(app, key.code, key.modifiers),
                         Screen::ConfirmationDialog(action) => handle_confirmation_input(app, key.code, action),
                         Screen::HelpDialog => handle_help_input(app, key.code),
                         Screen::ChangePassword => handle_change_password_input(app, key.code),
@@ -384,7 +425,7 @@ fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
 
 fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
     match code {
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             app.active_form_field = match app.active_form_field {
                 FormField::Title => FormField::Password,
                 _ => FormField::Title, // Setup uses Title for Confirm password field toggling metaphorically
@@ -546,7 +587,7 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.screen = Screen::ExportTypeDialog;
         }
         KeyCode::Char('g') => {
-            app.gen_options = crate::generator::GeneratorOptions::default();
+            app.gen_options = crate::generator::GeneratorOptions::load();
             if let Ok(pass) = crate::generator::generate_password(&app.gen_options) {
                 app.gen_password = pass;
             }
@@ -604,8 +645,52 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                 ActiveBlock::Details => ActiveBlock::Secrets,
             };
         }
-        KeyCode::Char('h') | KeyCode::Char('?') => {
+        KeyCode::Char('?') => {
             app.screen = Screen::HelpDialog;
+        }
+        KeyCode::Char('h') => {
+            if let Some(key) = &app.key {
+                let mut ids_to_check = Vec::new();
+                if !app.marked_secrets.is_empty() {
+                    ids_to_check.extend(app.marked_secrets.iter().copied());
+                } else if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
+                    ids_to_check.push(record.id);
+                }
+
+                let total_checks = ids_to_check.len();
+                for (i, entry_id) in ids_to_check.iter().copied().enumerate() {
+                    if let Ok(Some(record)) = crate::db::get_secret_by_id(&app.conn, entry_id) {
+                        if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
+                            if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                                let result = crate::audit::check_hibp(&pw);
+                                // Hash the password to store in the cache
+                                let hash_bytes = crate::audit::sha256(pw.as_bytes());
+                                let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+                                pw.zeroize();
+
+                                let count = match result {
+                                    Ok(n) => Some(n),
+                                    Err(_) => None,
+                                };
+                                // Save to database
+                                let _ = crate::db::save_hibp_check(&app.conn, &hash_hex, count);
+                                
+                                // Update audit_report entry in-place
+                                if let Some(report) = &mut app.audit_report {
+                                    if let Some(entry) = report.entries.iter_mut().find(|e| e.id == entry_id) {
+                                        entry.hibp_count = count;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    app.marked_secrets.remove(&entry_id);
+                    // Sleep between checks if auditing multiple entries to respect API rate limits
+                    if total_checks > 1 && i + 1 < total_checks {
+                        std::thread::sleep(Duration::from_millis(700));
+                    }
+                }
+            }
         }
         KeyCode::Up => match app.active_block {
             ActiveBlock::Categories => {
@@ -666,7 +751,15 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
     false
 }
 
-fn handle_form_input(app: &mut TuiApp, code: KeyCode) {
+fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
+    if modifiers.contains(KeyModifiers::CONTROL) && (code == KeyCode::Char('g') || code == KeyCode::Char('G')) {
+        let opts = crate::generator::GeneratorOptions::load();
+        if let Ok(pw) = crate::generator::generate_password(&opts) {
+            app.form_password = pw;
+        }
+        return;
+    }
+
     match code {
         KeyCode::Tab => {
             app.active_form_field = match app.active_form_field {
@@ -678,13 +771,27 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode) {
                 FormField::Notes => FormField::Title,
             };
         }
-        KeyCode::Char(c) => match app.active_form_field {
-            FormField::Title => app.form_title.push(c),
-            FormField::Category => app.form_category.push(c),
-            FormField::Username => app.form_username.push(c),
-            FormField::Url => app.form_url.push(c),
-            FormField::Password => app.form_password.push(c),
-            FormField::Notes => app.form_notes.push(c),
+        KeyCode::BackTab => {
+            app.active_form_field = match app.active_form_field {
+                FormField::Title => FormField::Notes,
+                FormField::Category => FormField::Title,
+                FormField::Username => FormField::Category,
+                FormField::Url => FormField::Username,
+                FormField::Password => FormField::Url,
+                FormField::Notes => FormField::Password,
+            };
+        }
+        KeyCode::Char(c) => {
+            if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+                match app.active_form_field {
+                    FormField::Title => app.form_title.push(c),
+                    FormField::Category => app.form_category.push(c),
+                    FormField::Username => app.form_username.push(c),
+                    FormField::Url => app.form_url.push(c),
+                    FormField::Password => app.form_password.push(c),
+                    FormField::Notes => app.form_notes.push(c),
+                }
+            }
         },
         KeyCode::Backspace => match app.active_form_field {
             FormField::Title => { app.form_title.pop(); }
@@ -734,7 +841,6 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode) {
                     Ok(_) => {
                         app.screen = Screen::Dashboard;
                         app.refresh_secrets();
-                        app.trigger_background_sync();
                     }
                     Err(err) => {
                         app.error_message = err;
@@ -767,7 +873,6 @@ fn handle_confirmation_input(app: &mut TuiApp, code: KeyCode, action: ConfirmAct
             }
             app.screen = Screen::Dashboard;
             app.refresh_secrets();
-            app.trigger_background_sync();
         }
         KeyCode::Char('n') | KeyCode::Esc => {
             app.screen = Screen::Dashboard;
@@ -836,7 +941,6 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                     app.error_message = String::new();
                     app.screen = Screen::Dashboard;
                     app.refresh_secrets();
-                    app.trigger_background_sync();
                 }
                 Err(err) => {
                     app.error_message = err;
@@ -1275,6 +1379,53 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
             ]),
         ];
 
+        let mut details_text = details_text;
+
+        if let Some(report) = &app.audit_report {
+            if let Some(entry) = report.entries.iter().find(|e| e.id == record.id) {
+                let (sev_color, sev_label) = match entry.severity {
+                    crate::audit::Severity::Critical => (Color::Red, "CRITICAL"),
+                    crate::audit::Severity::Weak => (Color::Yellow, "WEAK"),
+                    crate::audit::Severity::Good => (Color::Green, "GOOD"),
+                };
+                let score_bar = {
+                    let filled = entry.score as usize;
+                    let empty = 5usize.saturating_sub(filled);
+                    format!("Score: {}/5  [{}{}]", entry.score, "█".repeat(filled), "░".repeat(empty))
+                };
+                details_text.push(Line::from(""));
+                details_text.push(Line::from(Span::styled("Security Audit:", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))));
+                details_text.push(Line::from(vec![
+                    Span::styled("  Severity: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(sev_label, Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
+                ]));
+                details_text.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(score_bar, Style::default().fg(sev_color)),
+                ]));
+                
+                // HaveIBeenPwned status
+                details_text.push(Line::from(vec![
+                    Span::styled("  HIBP:     ", Style::default().fg(Color::DarkGray)),
+                    match entry.hibp_count {
+                        None => Span::styled("Not checked (Press [h] to check online)", Style::default().fg(Color::DarkGray)),
+                        Some(0) => Span::styled("✓ Clean (not found in breaches)", Style::default().fg(Color::Green)),
+                        Some(n) => Span::styled(format!("✗ PWNED (found in {} breaches)", n), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    }
+                ]));
+
+                if !entry.issues.is_empty() {
+                    details_text.push(Line::from("  Issues found:"));
+                    for issue in &entry.issues {
+                        details_text.push(Line::from(vec![
+                            Span::styled("    • ", Style::default().fg(Color::Yellow)),
+                            Span::styled(issue.clone(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+            }
+        }
+
         let details_paragraph = Paragraph::new(details_text)
             .block(details_block)
             .wrap(Wrap { trim: true });
@@ -1296,8 +1447,8 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::styled("[v] View PW | ", Style::default().fg(Color::Magenta)),
             Span::styled("[c] Copy User | ", Style::default().fg(Color::Cyan)),
             Span::styled("[p] Copy PW | ", Style::default().fg(Color::Cyan)),
-            Span::styled("[m] Change PW | ", Style::default().fg(Color::Magenta)),
-            Span::styled("[h] Help | ", Style::default().fg(Color::Green)),
+            Span::styled("[h] Check HIBP | ", Style::default().fg(Color::Green)),
+            Span::styled("[?] Help | ", Style::default().fg(Color::Cyan)),
             Span::styled("[Esc] Exit", Style::default().fg(Color::White)),
         ])
     };
@@ -1360,8 +1511,13 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
     );
     f.render_widget(url_box, form_layout[3]);
 
+    let password_title = if app.active_form_field == FormField::Password {
+        "Password* (Press Ctrl+G to generate)"
+    } else {
+        "Password*"
+    };
     let password_box = Paragraph::new(app.form_password.as_str()).block(
-        Block::default().borders(Borders::ALL).title("Password*").border_style(get_border_style(FormField::Password))
+        Block::default().borders(Borders::ALL).title(password_title).border_style(get_border_style(FormField::Password))
     );
     f.render_widget(password_box, form_layout[4]);
 
@@ -1485,8 +1641,8 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::styled("Open password generator (tweak & copy new passwords)", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  [Shift+A]     ", Style::default().fg(Color::Yellow)),
-            Span::styled("Run security audit (strength + duplicate detection)", Style::default().fg(Color::White)),
+            Span::styled("  [h]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Check the selected password on HaveIBeenPwned", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
@@ -1511,7 +1667,7 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(""),
         Line::from(Span::styled("Other:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
-            Span::styled("  [?] / [h]     ", Style::default().fg(Color::Yellow)),
+            Span::styled("  [?]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Open this help screen", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
@@ -1842,26 +1998,31 @@ fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
         // Toggle options
         KeyCode::Char('1') => {
             app.gen_options.use_uppercase = !app.gen_options.use_uppercase;
+            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         KeyCode::Char('2') => {
             app.gen_options.use_numbers = !app.gen_options.use_numbers;
+            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         KeyCode::Char('3') => {
             app.gen_options.use_symbols = !app.gen_options.use_symbols;
+            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         // Adjust length
         KeyCode::Left => {
             if app.gen_options.length > 4 {
                 app.gen_options.length -= 1;
+                let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }
         KeyCode::Right => {
             if app.gen_options.length < 128 {
                 app.gen_options.length += 1;
+                let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }
@@ -2035,6 +2196,33 @@ fn handle_audit_input(app: &mut TuiApp, key: KeyCode) {
         KeyCode::End => {
             app.audit_selected = entry_count.saturating_sub(1);
         }
+        KeyCode::Char('h') => {
+            // HIBP check for the currently selected entry
+            if let Some(report) = &app.audit_report {
+                if let Some(entry) = report.entries.get(app.audit_selected) {
+                    let entry_id = entry.id;
+                    // Re-decrypt this entry's password from DB
+                    if let Some(key) = &app.key {
+                        if let Ok(Some(record)) = crate::db::get_secret_by_id(&app.conn, entry_id) {
+                            if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
+                                if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                                    let result = crate::audit::check_hibp(&pw);
+                                    pw.zeroize();
+                                    if let Some(report) = &mut app.audit_report {
+                                        if let Some(entry) = report.entries.iter_mut().find(|e| e.id == entry_id) {
+                                            match result {
+                                                Ok(n) => entry.hibp_count = Some(n),
+                                                Err(_) => entry.hibp_count = None,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2186,6 +2374,14 @@ fn draw_audit_screen(f: &mut ratatui::Frame, app: &TuiApp) {
                 Span::styled("  ", Style::default()),
                 Span::styled(score_bar, Style::default().fg(sev_color)),
             ]),
+            Line::from(vec![
+                Span::styled("  HIBP:     ", Style::default().fg(Color::DarkGray)),
+                match entry.hibp_count {
+                    None => Span::styled("Not checked (Press [h] to check online)", Style::default().fg(Color::DarkGray)),
+                    Some(0) => Span::styled("✓ Clean (not found in breaches)", Style::default().fg(Color::Green)),
+                    Some(n) => Span::styled(format!("✗ PWNED (found in {} breaches)", n), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                }
+            ]),
             Line::from(""),
         ];
 
@@ -2239,6 +2435,8 @@ fn draw_audit_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         Span::styled("fast  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Home/End ", Style::default().fg(Color::Cyan)),
         Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" h ", Style::default().fg(Color::Cyan)),
+        Span::styled("check HIBP  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc/q ", Style::default().fg(Color::Red)),
         Span::styled("back to dashboard", Style::default().fg(Color::DarkGray)),
     ]));

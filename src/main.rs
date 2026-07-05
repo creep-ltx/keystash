@@ -69,6 +69,12 @@ pub fn get_db_path() -> PathBuf {
     path
 }
 
+pub fn get_config_path() -> PathBuf {
+    let mut path = get_db_path();
+    path.set_file_name("generator.json");
+    path
+}
+
 fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     print!("{}", prompt);
     let _ = io::stdout().flush();
@@ -95,7 +101,7 @@ fn print_help() {
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
-    println!("  keystash audit                            Audit vault for weak/reused passwords");
+    println!("  keystash audit [--hibp]                   Audit vault (optional HIBP check via --hibp)");
     println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols]");
     println!("                                            Generate a random password (default: 20 chars, all charsets)");
     println!("  keystash change-password                  Change Master Password and rotate keys");
@@ -522,12 +528,10 @@ fn main() {
             }
         }
         "audit" => {
+            let run_hibp = args.iter().any(|a| a == "--hibp");
             let conn = match db::init_db(&db_path) {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
+                Err(e) => { eprintln!("Database error: {}", e); return; }
             };
             if db::is_first_run(&conn).unwrap_or(true) {
                 eprintln!("Vault is not initialized. Run `keystash init` first.");
@@ -536,34 +540,59 @@ fn main() {
             let master_pass = prompt_password("Enter Master Password: ");
             let key = match db::unlock_vault(&conn, &master_pass) {
                 Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+                Err(e) => { eprintln!("Unlock failed: {}", e); return; }
             };
             let records = match db::get_secrets(&conn) {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Error fetching secrets: {}", e);
-                    return;
-                }
+                Err(e) => { eprintln!("Error fetching secrets: {}", e); return; }
             };
             if records.is_empty() {
                 println!("Vault is empty — nothing to audit.");
                 return;
             }
-            // Decrypt passwords into plaintext tuples
+
+            // Keep a copy of plaintext passwords for HIBP if needed
+            let mut plaintext_for_hibp: Vec<(i64, String)> = Vec::new();
             let mut plaintext_records: Vec<(i64, String, String, String, String)> = records
                 .iter()
                 .filter_map(|r| {
                     crypto::decrypt(&r.encrypted_password, &key)
                         .ok()
                         .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
-                        .map(|pw| (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw))
+                        .map(|pw| {
+                            if run_hibp {
+                                plaintext_for_hibp.push((r.id, pw.clone()));
+                            }
+                            (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw)
+                        })
                 })
                 .collect();
 
-            let report = audit::audit_passwords(&mut plaintext_records);
+            let mut report = audit::audit_passwords(&mut plaintext_records);
+
+            // ── Optional HIBP check ──
+            if run_hibp {
+                let total = plaintext_for_hibp.len();
+                println!("\n  Checking HaveIBeenPwned ({} entries)...", total);
+                println!("  Note: only the first 5 chars of each SHA-1 hash are sent.");
+                let mut pwned_count = 0u32;
+                for (i, (id, pw)) in plaintext_for_hibp.iter().enumerate() {
+                    print!("  [{}/{}]\r", i + 1, total);
+                    let _ = io::stdout().flush();
+                    match audit::check_hibp(pw) {
+                        Ok(n) => {
+                            if let Some(entry) = report.entries.iter_mut().find(|e| e.id == *id) {
+                                entry.hibp_count = Some(n);
+                                if n > 0 { pwned_count += 1; }
+                            }
+                        }
+                        Err(e) => eprintln!("\n  HIBP check failed for ID {}: {}", id, e),
+                    }
+                    // Rate limiting: HIBP allows ~1.5 req/s; stay safe
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                println!("  HIBP complete: {} password(s) found in known breaches.", pwned_count);
+            }
 
             // ── Print report ──
             println!();
@@ -577,11 +606,13 @@ fn main() {
                 println!("  ⚠ {} password reuse group(s) detected", report.duplicate_groups.len());
             }
             println!();
+
+            let hibp_col = if run_hibp { "  HIBP Breaches" } else { "" };
             println!(
-                "  {:<4}  {:<22}  {:<14}  {:<22}  {:<8}  Issues",
-                "ID", "Title", "Category", "Username", "Strength"
+                "  {:<4}  {:<22}  {:<14}  {:<22}  {:<10}  Issues{}",
+                "ID", "Title", "Category", "Username", "Strength", hibp_col
             );
-            println!("  {}", "-".repeat(100));
+            println!("  {}", "-".repeat(if run_hibp { 115 } else { 100 }));
 
             for entry in &report.entries {
                 let label = match entry.severity {
@@ -594,18 +625,29 @@ fn main() {
                 } else {
                     entry.issues.join("; ")
                 };
+                let hibp_str = if run_hibp {
+                    match entry.hibp_count {
+                        Some(0) => "  ✓ Clean".to_string(),
+                        Some(n) => format!("  ✗ PWNED ({n}x)"),
+                        None    => "  ? Error".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {:<4}  {:<22}  {:<14}  {:<22}  {}  {}",
+                    "  {:<4}  {:<22}  {:<14}  {:<22}  {}  {}{}",
                     entry.id,
                     &entry.title[..entry.title.len().min(22)],
                     &entry.category[..entry.category.len().min(14)],
                     &entry.username[..entry.username.len().min(22)],
                     label,
-                    issue_str
+                    issue_str,
+                    hibp_str
                 );
             }
             println!();
         }
+
         "show" | "view" => {
             if args.len() < 3 {
                 eprintln!("Usage: keystash show <id> [--reveal]");
@@ -738,7 +780,7 @@ fn main() {
             }
         }
         "generate" | "gen" => {
-            let mut options = generator::GeneratorOptions::default();
+            let mut options = generator::GeneratorOptions::load();
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -768,12 +810,26 @@ fn main() {
                         options.use_symbols = false;
                         i += 1;
                     }
+                    "--uppercase" => {
+                        options.use_uppercase = true;
+                        i += 1;
+                    }
+                    "--numbers" => {
+                        options.use_numbers = true;
+                        i += 1;
+                    }
+                    "--symbols" => {
+                        options.use_symbols = true;
+                        i += 1;
+                    }
                     other => {
                         eprintln!("Unknown option: {}", other);
                         return;
                     }
                 }
             }
+
+            let _ = options.save();
 
             match generator::generate_password(&options) {
                 Ok(mut pass) => {
@@ -796,17 +852,6 @@ fn main() {
 }
 
 fn start_tui(db_path: &Path, no_sync: bool) {
-    // Auto-sync at startup if Git is configured and sync is not disabled
-    // This must run before db::init_db so that a missing local vault can be restored in its entirety
-    if !no_sync && sync::is_git_configured(db_path) {
-        println!("Syncing vault with Git remote...");
-        match sync::git_sync_vault(db_path) {
-            Ok(msg) => println!("{}", msg),
-            Err(err) => eprintln!("Sync Warning: {}", err),
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
     let conn = match db::init_db(db_path) {
         Ok(c) => c,
         Err(e) => {
