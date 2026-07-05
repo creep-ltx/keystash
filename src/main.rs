@@ -90,10 +90,10 @@ pub fn get_db_path() -> PathBuf {
     path
 }
 
-fn prompt_password(prompt: &str) -> String {
+fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     print!("{}", prompt);
     let _ = io::stdout().flush();
-    read_password().unwrap_or_default()
+    zeroize::Zeroizing::new(read_password().unwrap_or_default())
 }
 
 fn print_help() {

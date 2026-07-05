@@ -32,7 +32,8 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 1. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit symmetric key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and saved in the database.
 2. **XChaCha20-Poly1305 AEAD:** Sensitive columns (`password` and `notes`) are encrypted individually before being stored. Every column write generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
 3. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
-4. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use.
+4. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
+5. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
 
 ---
 
@@ -158,6 +159,9 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 ---
 
 ## 🔄 Git Synchronization & Logical Merging
+
+> [!NOTE]
+> KeyStash automatically detects if your database configuration folder has a Git repository and remote configured. If no Git repository is present, KeyStash defaults to local-only offline mode without showing any warnings. The `--no-sync` flag is optional and can be used to temporarily disable Git network sync actions even if a remote is configured.
 
 If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging:
 

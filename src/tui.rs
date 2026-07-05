@@ -119,8 +119,8 @@ impl TuiApp {
             conn,
             key: None,
             screen,
-            password_input: String::new(),
-            password_confirm_input: String::new(),
+            password_input: String::with_capacity(128),
+            password_confirm_input: String::with_capacity(128),
             error_message: String::new(),
             secrets: Vec::new(),
             filtered_secrets: Vec::new(),
@@ -137,7 +137,7 @@ impl TuiApp {
             form_category: String::new(),
             form_username: String::new(),
             form_url: String::new(),
-            form_password: String::new(),
+            form_password: String::with_capacity(128),
             form_notes: String::new(),
             edit_id: None,
             marked_secrets: HashSet::new(),
@@ -365,13 +365,13 @@ fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
                     app.key = Some(derived_key);
                     app.screen = Screen::Dashboard;
                     app.password_input.zeroize();
-                    app.password_input = String::new();
+                    app.password_input.clear();
                     app.refresh_secrets();
                 }
                 Err(err) => {
                     app.error_message = err;
                     app.password_input.zeroize();
-                    app.password_input = String::new();
+                    app.password_input.clear();
                 }
             }
         }
@@ -418,8 +418,8 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
                     app.screen = Screen::Dashboard;
                     app.password_input.zeroize();
                     app.password_confirm_input.zeroize();
-                    app.password_input = String::new();
-                    app.password_confirm_input = String::new();
+                    app.password_input.clear();
+                    app.password_confirm_input.clear();
                     app.error_message = String::new();
                     app.refresh_secrets();
                 }
@@ -803,9 +803,9 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                     app.password_input.zeroize();
                     app.password_confirm_input.zeroize();
                     app.form_password.zeroize();
-                    app.password_input = String::new();
-                    app.password_confirm_input = String::new();
-                    app.form_password = String::new();
+                    app.password_input.clear();
+                    app.password_confirm_input.clear();
+                    app.form_password.clear();
                     app.error_message = String::new();
                     app.screen = Screen::Dashboard;
                     app.refresh_secrets();
@@ -820,9 +820,9 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
             app.password_input.zeroize();
             app.password_confirm_input.zeroize();
             app.form_password.zeroize();
-            app.password_input = String::new();
-            app.password_confirm_input = String::new();
-            app.form_password = String::new();
+            app.password_input.clear();
+            app.password_confirm_input.clear();
+            app.form_password.clear();
             app.error_message = String::new();
             app.screen = Screen::Dashboard;
         }
