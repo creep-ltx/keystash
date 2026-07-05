@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use rusqlite::Connection;
 
 use crate::db;
@@ -64,29 +64,27 @@ impl ImportFormat {
     }
 }
 
-/// Parses a simple CSV line into fields, handling optional quoting.
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
-    
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-            }
-            ',' if !in_quotes => {
-                fields.push(current.trim().to_string());
-                current.clear();
-            }
-            _ => {
-                current.push(c);
-            }
-        }
+/// Reads records from an RFC 4180 compliant CSV file using the csv crate.
+fn read_csv_records(file_path: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false) // Read raw headers manually to obtain index positions
+        .flexible(true)
+        .from_reader(file);
+
+    let mut records = Vec::new();
+    for result in rdr.records() {
+        let record = result.map_err(|e| format!("Failed to read CSV row: {}", e))?;
+        let row_fields = record.iter().map(|f| f.to_string()).collect::<Vec<String>>();
+        records.push(row_fields);
     }
-    fields.push(current.trim().to_string());
-    fields
+
+    if records.is_empty() {
+        return Err("Empty CSV file".to_string());
+    }
+
+    let headers = records.remove(0);
+    Ok((headers, records))
 }
 
 /// Extracts a clean domain or host name from a URL string.
@@ -117,11 +115,7 @@ pub fn detect_format(file_path: &str) -> Result<ImportFormat, String> {
         return Err("Unsupported JSON export format.".to_string());
     }
 
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let mut reader = BufReader::new(file);
-    let mut first_line = String::new();
-    if reader.read_line(&mut first_line).is_ok() && !first_line.is_empty() {
-        let headers = parse_csv_line(&first_line);
+    if let Ok((headers, _)) = read_csv_records(file_path) {
         let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
         
         if norm_headers.contains(&"name".to_string()) && norm_headers.contains(&"url".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) {
@@ -227,12 +221,7 @@ pub fn import_brave_chrome_csv(
     file_path: &str,
     key: &[u8; 32],
 ) -> Result<usize, String> {
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    let header_line = lines.next().ok_or("Empty CSV file")?.map_err(|e| e.to_string())?;
-    let headers = parse_csv_line(&header_line);
+    let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
     
     let name_idx = norm_headers.iter().position(|h| h == "name").ok_or("Missing 'name' column")?;
@@ -241,12 +230,7 @@ pub fn import_brave_chrome_csv(
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
     
     let mut count = 0;
-    for line_result in lines {
-        let line = line_result.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(&line);
+    for fields in records {
         if fields.len() <= std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx))) {
             continue;
         }
@@ -284,12 +268,7 @@ pub fn import_firefox_csv(
     file_path: &str,
     key: &[u8; 32],
 ) -> Result<usize, String> {
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    let header_line = lines.next().ok_or("Empty CSV file")?.map_err(|e| e.to_string())?;
-    let headers = parse_csv_line(&header_line);
+    let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
     
     let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
@@ -297,12 +276,7 @@ pub fn import_firefox_csv(
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
     
     let mut count = 0;
-    for line_result in lines {
-        let line = line_result.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(&line);
+    for fields in records {
         if fields.len() <= std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx)) {
             continue;
         }
@@ -339,12 +313,7 @@ pub fn import_lastpass_csv(
     file_path: &str,
     key: &[u8; 32],
 ) -> Result<usize, String> {
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    let header_line = lines.next().ok_or("Empty CSV file")?.map_err(|e| e.to_string())?;
-    let headers = parse_csv_line(&header_line);
+    let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
     
     let name_idx = norm_headers.iter().position(|h| h == "name").ok_or("Missing 'name' column")?;
@@ -355,12 +324,7 @@ pub fn import_lastpass_csv(
     let group_idx = norm_headers.iter().position(|h| h == "grouping").ok_or("Missing 'grouping' column")?;
     
     let mut count = 0;
-    for line_result in lines {
-        let line = line_result.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(&line);
+    for fields in records {
         let max_idx = std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(extra_idx, group_idx)))));
         if fields.len() <= max_idx {
             continue;
@@ -402,12 +366,7 @@ pub fn import_keepassxc_csv(
     file_path: &str,
     key: &[u8; 32],
 ) -> Result<usize, String> {
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    let header_line = lines.next().ok_or("Empty CSV file")?.map_err(|e| e.to_string())?;
-    let headers = parse_csv_line(&header_line);
+    let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
     
     let group_idx = norm_headers.iter().position(|h| h == "group").ok_or("Missing 'group' column")?;
@@ -418,12 +377,7 @@ pub fn import_keepassxc_csv(
     let notes_idx = norm_headers.iter().position(|h| h == "notes").ok_or("Missing 'notes' column")?;
     
     let mut count = 0;
-    for line_result in lines {
-        let line = line_result.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(&line);
+    for fields in records {
         let max_idx = std::cmp::max(group_idx, std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(url_idx, notes_idx)))));
         if fields.len() <= max_idx {
             continue;
@@ -465,12 +419,7 @@ pub fn import_onepassword_csv(
     file_path: &str,
     key: &[u8; 32],
 ) -> Result<usize, String> {
-    let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    let header_line = lines.next().ok_or("Empty CSV file")?.map_err(|e| e.to_string())?;
-    let headers = parse_csv_line(&header_line);
+    let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
     
     let title_idx = norm_headers.iter().position(|h| h == "title").ok_or("Missing 'title' column")?;
@@ -484,12 +433,7 @@ pub fn import_onepassword_csv(
         .ok_or("Missing URL / Website column")?;
     
     let mut count = 0;
-    for line_result in lines {
-        let line = line_result.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(&line);
+    for fields in records {
         let max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, url_idx))));
         if fields.len() <= max_idx {
             continue;
@@ -588,5 +532,43 @@ pub fn export_vault_csv(
     }
     
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rfc4180_csv_import() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_import.csv");
+        let file_path_str = file_path.to_str().unwrap();
+
+        let csv_content = "\
+url,username,password,httprealm
+\"https://example.com\",\"my_user\",\"super,\"\"secret\"\"\",\"realm1\"
+\"https://another.com\",\"user2\",\"pass\nwith\nnewlines\",\"realm2\"
+";
+        std::fs::write(&file_path, csv_content).unwrap();
+
+        let key = [0u8; 32];
+        let count = import_firefox_csv(&conn, file_path_str, &key).unwrap();
+        assert_eq!(count, 2);
+
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 2);
+
+        let s1 = secrets.iter().find(|s| s.username == "my_user").unwrap();
+        let dec1 = crate::crypto::decrypt(&s1.encrypted_password, &key).unwrap();
+        assert_eq!(String::from_utf8(dec1.to_vec()).unwrap(), "super,\"secret\"");
+
+        let s2 = secrets.iter().find(|s| s.username == "user2").unwrap();
+        let dec2 = crate::crypto::decrypt(&s2.encrypted_password, &key).unwrap();
+        assert_eq!(String::from_utf8(dec2.to_vec()).unwrap(), "pass\nwith\nnewlines");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
 }
 

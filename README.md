@@ -62,13 +62,16 @@ Your credentials database is stored offline inside your user config folder:
 | **`[Space]`** | Mark / Unmark selected credential |
 | **`[/]`** | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
 | **`[v]`** | Toggle password visibility in detail pane |
-| **`[c]`** | Copy username to clipboard (clears in 10s) |
-| **`[p]`** | Copy decrypted password to clipboard (clears in 10s) |
-| **`[u]`** | Copy website URL to clipboard (clears in 10s) |
+| **`[c]`** | Copy username to clipboard (clears in configured delay, default 10s) |
+| **`[p]`** | Copy decrypted password to clipboard (clears in configured delay, default 10s) |
+| **`[u]`** | Copy website URL to clipboard (clears in configured delay, default 10s) |
 | **`[a]`** | Add new credential |
 | **`[e]`** | Edit selected credential |
 | **`[d]`** | Delete credential (opens verification modal) |
 | **`[h]`** | Check selected (or marked) password on HaveIBeenPwned |
+| **`[H]`** | Check all credentials in vault on HaveIBeenPwned (runs in background) |
+| **`[D]`** | Open duplicate credential detector and interactive resolver |
+| **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
 | **`[i]`** | Import unencrypted credentials from backups |
 | **`[x]`** | Export credentials (all or selected) to CSV |
 | **`[?]`** | Open Help dialog |
@@ -232,8 +235,8 @@ You can now run `keystash` on Device B, enter your existing Master Password, and
 
 KeyStash relies exclusively on safe and audited Rust libraries:
 - `ratatui` & `crossterm` for drawing interactive terminal screens.
-- `rusqlite` (with bundled features) for local SQLite database integrations.
+- `rusqlite` for local SQLite database integrations.
 - `chacha20poly1305` & `argon2` for modern cryptography.
-- `arboard` for native Wayland and X11 clipboard integration (requires zero external system utilities).
+- `arboard` for native Wayland and X11 clipboard integration.
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.

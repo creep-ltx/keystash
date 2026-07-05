@@ -5,6 +5,7 @@ pub mod import;
 pub mod sync;
 pub mod generator;
 pub mod audit;
+pub mod config;
 
 use std::env;
 use std::fs;
@@ -30,10 +31,12 @@ fn copy_to_clipboard(text: String, label: &str) {
         return;
     }
 
+    let delay = crate::config::AppConfig::load().clipboard_clear_seconds;
+
     if let Ok(exe) = env::current_exe() {
         let child = Command::new(exe)
             .arg("__internal-clear-clipboard")
-            .arg("10")
+            .arg(delay.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -44,7 +47,7 @@ fn copy_to_clipboard(text: String, label: &str) {
                 if let Some(mut stdin) = child_proc.stdin.take() {
                     let _ = stdin.write_all(text.as_bytes());
                 }
-                println!("Copied {} to clipboard! Will clear in 10s.", label);
+                println!("Copied {} to clipboard! Will clear in {}s.", label, delay);
             }
             Err(_) => {
                 eprintln!("Failed to spawn clipboard manager process.");
@@ -840,6 +843,7 @@ fn main() {
             match generator::generate_password(&options) {
                 Ok(mut pass) => {
                     println!("{}", pass);
+                    copy_to_clipboard(pass.clone(), "generated password");
                     pass.zeroize();
                 }
                 Err(e) => {

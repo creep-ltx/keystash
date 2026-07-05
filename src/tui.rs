@@ -13,12 +13,15 @@ use ratatui::{
 };
 use zeroize::{Zeroize, Zeroizing};
 use std::cell::RefCell;
+
 use rusqlite::Connection;
 use std::{
     io,
     time::{Duration, Instant},
     collections::HashSet,
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::db::{self, SecretRecord};
@@ -36,6 +39,17 @@ pub enum ConfirmAction {
     DeleteSingle(i64),
 }
 
+
+
+#[derive(Clone)]
+pub struct DuplicateGroup {
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    pub records: Vec<SecretRecord>,
+    pub decrypted_passwords: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Lock,
@@ -51,7 +65,17 @@ enum Screen {
     ExportTypeDialog,
     ExportDialog,
     GeneratorDialog,
-    AuditScreen,
+    DeduplicateScreen,
+    SettingsScreen,
+    SyncConflictScreen,
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusType {
+    Normal,
+    Copied,
+    Cleared,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,7 +108,7 @@ pub struct TuiApp {
     search_query: String,
     searching: bool,
     reveal_password: bool,
-    copied_message: Option<(String, Instant)>,
+    copied_message: Option<(String, Instant, StatusType)>,
 
     // Form State
     active_form_field: FormField,
@@ -125,7 +149,37 @@ pub struct TuiApp {
 
     // HIBP cache to persist checked counts across edits/refreshes. Map: id -> (password_sha256_hex, Option<u64>)
     pub hibp_cache: std::collections::HashMap<i64, (String, Option<u64>)>,
+    pub last_activity: Instant,
+    pub config: crate::config::AppConfig,
+
+    // Deduplication screen state
+    pub duplicate_groups: Vec<DuplicateGroup>,
+    pub selected_dup_group_idx: usize,
+    pub selected_dup_item_idx: usize,
+
+    // Settings screen state
+    pub settings_idle_timeout: String,
+    pub settings_clipboard_clear: String,
+    pub settings_auto_sync: bool,
+    pub settings_gen_length: String,
+    pub settings_gen_lowercase: bool,
+    pub settings_gen_uppercase: bool,
+    pub settings_gen_numbers: bool,
+    pub settings_gen_symbols: bool,
+    pub active_settings_field: usize,
+
+    // HIBP background worker
+    pub hibp_progress: Arc<Mutex<Option<(usize, usize)>>>,
+    pub hibp_abort: Arc<AtomicBool>,
+    pub checked_hashes_this_session: Arc<Mutex<HashSet<String>>>,
+
+    // Sync conflict state
+    pub sync_conflicts: Vec<crate::sync::ConflictGroup>,
+    pub selected_conflict_idx: usize,
+    pub sync_conflicts_detected: Arc<Mutex<Option<Vec<crate::sync::ConflictGroup>>>>,
 }
+
+
 
 impl TuiApp {
     pub fn new(conn: Connection, no_sync: bool) -> Self {
@@ -173,12 +227,126 @@ impl TuiApp {
             audit_scroll: 0,
             audit_selected: 0,
             hibp_cache: std::collections::HashMap::new(),
+            last_activity: Instant::now(),
+            config: crate::config::AppConfig::load(),
+            duplicate_groups: Vec::new(),
+            selected_dup_group_idx: 0,
+            selected_dup_item_idx: 0,
+            settings_idle_timeout: String::new(),
+            settings_clipboard_clear: String::new(),
+            settings_auto_sync: true,
+            settings_gen_length: String::new(),
+            settings_gen_lowercase: true,
+            settings_gen_uppercase: true,
+            settings_gen_numbers: true,
+            settings_gen_symbols: true,
+            active_settings_field: 0,
+            hibp_progress: Arc::new(Mutex::new(None)),
+            hibp_abort: Arc::new(AtomicBool::new(false)),
+            checked_hashes_this_session: Arc::new(Mutex::new(HashSet::new())),
+            sync_conflicts: Vec::new(),
+            selected_conflict_idx: 0,
+            sync_conflicts_detected: Arc::new(Mutex::new(None)),
         };
         app.trigger_background_sync();
         app
     }
 
+    pub fn lock_vault(&mut self) {
+        if let Some(mut k) = self.key.take() {
+            k.zeroize();
+        }
+        self.password_input.zeroize();
+        self.password_input.clear();
+        self.password_confirm_input.zeroize();
+        self.password_confirm_input.clear();
+        self.form_password.zeroize();
+        self.form_password.clear();
+
+        // Reset form variables to prevent leaving secret text in memory
+        self.form_title.clear();
+        self.form_category.clear();
+        self.form_username.clear();
+        self.form_url.clear();
+        self.form_notes.clear();
+        self.edit_id = None;
+
+        // Clear cached secrets
+        self.secrets.clear();
+        self.filtered_secrets.clear();
+
+        // Clear active screen states and redirect to lock
+        self.screen = Screen::Lock;
+    }
+
+    pub fn reset_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    pub fn find_duplicate_groups(&mut self) {
+        let key = match &self.key {
+            Some(k) => k,
+            None => return,
+        };
+        
+        let mut groups: Vec<DuplicateGroup> = Vec::new();
+        let mut processed_ids = HashSet::new();
+
+        for i in 0..self.secrets.len() {
+            let r1 = &self.secrets[i];
+            if processed_ids.contains(&r1.id) {
+                continue;
+            }
+
+            let mut group_records = vec![r1.clone()];
+            let pw1 = crate::crypto::decrypt(&r1.encrypted_password, key)
+                .ok()
+                .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                .unwrap_or_default();
+            let mut group_pws = vec![pw1.clone()];
+
+            for j in (i + 1)..self.secrets.len() {
+                let r2 = &self.secrets[j];
+                if processed_ids.contains(&r2.id) {
+                    continue;
+                }
+
+                let match_username = !r1.username.is_empty() && r1.username.to_lowercase() == r2.username.to_lowercase();
+                let match_url = !r1.url.is_empty() && r1.url.to_lowercase() == r2.url.to_lowercase();
+                let match_title = !r1.title.is_empty() && r1.title.to_lowercase() == r2.title.to_lowercase();
+
+                if match_username && (match_url || match_title) {
+                    let pw2 = crate::crypto::decrypt(&r2.encrypted_password, key)
+                        .ok()
+                        .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                        .unwrap_or_default();
+                    group_records.push(r2.clone());
+                    group_pws.push(pw2);
+                }
+            }
+
+            if group_records.len() > 1 {
+                for r in &group_records {
+                    processed_ids.insert(r.id);
+                }
+                groups.push(DuplicateGroup {
+                    title: r1.title.clone(),
+                    username: r1.username.clone(),
+                    url: r1.url.clone(),
+                    records: group_records,
+                    decrypted_passwords: group_pws,
+                });
+            }
+        }
+        
+        self.duplicate_groups = groups;
+        self.selected_dup_group_idx = 0;
+        self.selected_dup_item_idx = 0;
+    }
+
+
     fn refresh_secrets(&mut self) {
+
         if let Some(key) = self.key.clone() {
             if let Ok(records) = db::get_secrets(&self.conn) {
                 self.secrets = records;
@@ -233,24 +401,80 @@ impl TuiApp {
             }
         }
     }
+    fn fuzzy_score(target: &str, query: &str) -> Option<isize> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let target_lower = target.to_lowercase();
+        let query_lower = query.to_lowercase();
+
+        if target_lower == query_lower {
+            return Some(100);
+        }
+        if let Some(idx) = target_lower.find(&query_lower) {
+            let score = if idx == 0 { 80 } else { 60 };
+            return Some(score);
+        }
+
+        let mut query_chars = query_lower.chars().peekable();
+        let mut match_indices = Vec::new();
+        for (i, c) in target_lower.chars().enumerate() {
+            if let Some(&qc) = query_chars.peek() {
+                if c == qc {
+                    query_chars.next();
+                    match_indices.push(i);
+                }
+            }
+        }
+
+        if query_chars.peek().is_none() {
+            let gap_penalty = if match_indices.len() > 1 {
+                let total_span = match_indices.last().unwrap() - match_indices.first().unwrap() + 1;
+                total_span as isize - query_lower.len() as isize
+            } else {
+                0
+            };
+            Some(std::cmp::max(10, 40 - gap_penalty))
+        } else {
+            None
+        }
+    }
 
     fn apply_filter(&mut self) {
         let current_cat = self.categories.get(self.selected_category_idx).cloned().unwrap_or("All".to_string());
         let query = self.search_query.to_lowercase();
 
-        self.filtered_secrets = self.secrets
-            .iter()
-            .filter(|r| {
-                let cat_match = current_cat == "All" || r.category == current_cat;
-                let search_match = query.is_empty() 
-                    || r.title.to_lowercase().contains(&query)
-                    || r.username.to_lowercase().contains(&query)
-                    || r.category.to_lowercase().contains(&query)
-                    || r.url.to_lowercase().contains(&query);
-                cat_match && search_match
-            })
-            .cloned()
-            .collect();
+        if query.is_empty() {
+            self.filtered_secrets = self.secrets
+                .iter()
+                .filter(|r| current_cat == "All" || r.category == current_cat)
+                .cloned()
+                .collect();
+        } else {
+            let mut scored_secrets = Vec::new();
+            for r in &self.secrets {
+                if current_cat != "All" && r.category != current_cat {
+                    continue;
+                }
+
+                let title_score = Self::fuzzy_score(&r.title, &query);
+                let user_score = Self::fuzzy_score(&r.username, &query);
+                let cat_score = Self::fuzzy_score(&r.category, &query);
+                let url_score = Self::fuzzy_score(&r.url, &query);
+
+                let max_score = [title_score, user_score, cat_score, url_score]
+                    .iter()
+                    .filter_map(|&s| s)
+                    .max();
+
+                if let Some(score) = max_score {
+                    scored_secrets.push((score, r.clone()));
+                }
+            }
+
+            scored_secrets.sort_by(|a, b| b.0.cmp(&a.0));
+            self.filtered_secrets = scored_secrets.into_iter().map(|(_, r)| r).collect();
+        }
 
         if self.selected_secret_idx >= self.filtered_secrets.len() {
             self.selected_secret_idx = if self.filtered_secrets.is_empty() { 0 } else { self.filtered_secrets.len() - 1 };
@@ -262,14 +486,17 @@ impl TuiApp {
             self.copied_message = Some((
                 format!("Cannot copy: {} is empty!", label),
                 Instant::now(),
+                StatusType::Normal,
             ));
             return;
         }
 
+        let delay = self.config.clipboard_clear_seconds;
+
         if let Ok(exe) = std::env::current_exe() {
             let child = Command::new(exe)
                 .arg("__internal-clear-clipboard")
-                .arg("10")
+                .arg(delay.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -282,14 +509,16 @@ impl TuiApp {
                         let _ = stdin.write_all(text.as_bytes());
                     }
                     self.copied_message = Some((
-                        format!("Copied {} to clipboard! Will clear in 10s.", label),
+                        format!("Copied {} to clipboard! Will clear in {}s.", label, delay),
                         Instant::now(),
+                        StatusType::Copied,
                     ));
                 }
                 Err(_) => {
                     self.copied_message = Some((
                         "Failed to spawn clipboard manager process.".to_string(),
                         Instant::now(),
+                        StatusType::Normal,
                     ));
                 }
             }
@@ -297,14 +526,33 @@ impl TuiApp {
             self.copied_message = Some((
                 "Failed to locate KeyStash executable path.".to_string(),
                 Instant::now(),
+                StatusType::Normal,
             ));
         }
     }
 
     fn clear_clipboard_if_expired(&mut self) {
-        if let Some((_, instant)) = &self.copied_message {
-            if instant.elapsed() >= Duration::from_secs(10) {
-                self.copied_message = None;
+        if let Some((_, instant, status)) = &self.copied_message {
+            match status {
+                StatusType::Copied => {
+                    if instant.elapsed() >= Duration::from_secs(self.config.clipboard_clear_seconds) {
+                        self.copied_message = Some((
+                            "Clipboard cleared securely.".to_string(),
+                            Instant::now(),
+                            StatusType::Cleared,
+                        ));
+                    }
+                }
+                StatusType::Cleared => {
+                    if instant.elapsed() >= Duration::from_secs(3) {
+                        self.copied_message = None;
+                    }
+                }
+                StatusType::Normal => {
+                    if instant.elapsed() >= Duration::from_secs(5) {
+                        self.copied_message = None;
+                    }
+                }
             }
         }
     }
@@ -313,9 +561,79 @@ impl TuiApp {
         if self.no_sync {
             return;
         }
+        let key_opt = self.key.clone();
+        let db_path = crate::get_db_path();
+        let detected_clone = Arc::clone(&self.sync_conflicts_detected);
+        std::thread::spawn(move || {
+            if let Some(key) = key_opt {
+                let dir = db_path.parent().unwrap();
+                let _ = Command::new("git")
+                    .arg("-c")
+                    .arg("connection.timeout=5")
+                    .arg("fetch")
+                    .arg("origin")
+                    .arg("main")
+                    .current_dir(dir)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+
+                match crate::sync::detect_sync_conflicts(&db_path, &key) {
+                    Ok(conflicts) => {
+                        if !conflicts.is_empty() {
+                            *detected_clone.lock().unwrap() = Some(conflicts);
+                            return;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            let _ = crate::sync::git_sync_vault(db_path);
+        });
+    }
+
+    fn trigger_background_sync_completion(&self) {
+        if self.no_sync {
+            return;
+        }
         let db_path = crate::get_db_path();
         std::thread::spawn(move || {
-            let _ = crate::sync::git_sync_vault(db_path);
+            let dir = db_path.parent().unwrap();
+            let _ = Command::new("git")
+                .arg("reset")
+                .arg("origin/main")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let _ = Command::new("git")
+                .arg("add")
+                .arg("vault.db")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let _ = Command::new("git")
+                .arg("commit")
+                .arg("-m")
+                .arg("sync: auto-merge resolved conflicts")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let _ = Command::new("git")
+                .arg("-c")
+                .arg("connection.timeout=5")
+                .arg("push")
+                .arg("origin")
+                .arg("main")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         });
     }
 }
@@ -356,15 +674,40 @@ fn run_loop<B: ratatui::backend::Backend>(
     app: &mut TuiApp,
 ) -> io::Result<()> {
     loop {
+        if let Ok(mut detected_lock) = app.sync_conflicts_detected.lock() {
+            if let Some(conflicts) = detected_lock.take() {
+                app.sync_conflicts = conflicts;
+                app.selected_conflict_idx = 0;
+                app.screen = Screen::SyncConflictScreen;
+            }
+        }
+
         app.clear_clipboard_if_expired();
+        
+        // Check for idle timeout auto-lock
+        if app.key.is_some() && app.screen != Screen::Lock && app.screen != Screen::Setup {
+            if app.last_activity.elapsed() >= Duration::from_secs(app.config.idle_timeout_seconds) {
+                app.lock_vault();
+            }
+        }
         
         terminal.draw(|f| draw_ui(f, app))?;
 
-        // Poll for inputs, checking clipboard expiration every 250ms
+        // Poll for inputs, checking clipboard expiration and idle timeout every 250ms
         if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            app.reset_activity();
+            if let Event::Key(key) = ev {
                 if key.kind == event::KeyEventKind::Press {
+                    let checking_active = app.hibp_progress.lock().map(|p| p.is_some()).unwrap_or(false);
+                    if checking_active {
+                        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+                            app.hibp_abort.store(true, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
                     match app.screen {
+
                         Screen::Lock => {
                             if handle_lock_input(app, key.code) {
                                 return Ok(());
@@ -388,7 +731,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::ExportTypeDialog => handle_export_type_input(app, key.code),
                         Screen::ExportDialog => handle_export_input(app, key.code),
                         Screen::GeneratorDialog => handle_generator_input(app, key.code),
-                        Screen::AuditScreen => handle_audit_input(app, key.code),
+                        Screen::DeduplicateScreen => handle_deduplicate_input(app, key.code),
+                        Screen::SettingsScreen => handle_settings_input(app, key.code),
+                        Screen::SyncConflictScreen => handle_sync_conflict_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -601,27 +946,29 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             }
             app.screen = Screen::GeneratorDialog;
         }
-        KeyCode::Char('A') => {
-            // Run audit — requires decrypted passwords
-            if let Some(key) = &app.key {
-                if let Ok(records) = crate::db::get_secrets(&app.conn) {
-                    let mut plaintext: Vec<(i64, String, String, String, String)> = records
-                        .iter()
-                        .filter_map(|r| {
-                            crate::crypto::decrypt(&r.encrypted_password, key)
-                                .ok()
-                                .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
-                                .map(|pw| (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw))
-                        })
-                        .collect();
-                    let report = crate::audit::audit_passwords(&mut plaintext);
-                    app.audit_scroll = 0;
-                    app.audit_selected = 0;
-                    app.audit_report = Some(report);
-                    app.screen = Screen::AuditScreen;
-                }
+        KeyCode::Char(',') => {
+            app.settings_idle_timeout = app.config.idle_timeout_seconds.to_string();
+            app.settings_clipboard_clear = app.config.clipboard_clear_seconds.to_string();
+            app.settings_auto_sync = app.config.auto_sync;
+            app.settings_gen_length = app.config.generator.length.to_string();
+            app.settings_gen_lowercase = app.config.generator.use_lowercase;
+            app.settings_gen_uppercase = app.config.generator.use_uppercase;
+            app.settings_gen_numbers = app.config.generator.use_numbers;
+            app.settings_gen_symbols = app.config.generator.use_symbols;
+            app.active_settings_field = 0;
+            app.screen = Screen::SettingsScreen;
+        }
+
+        KeyCode::Char('D') => {
+            app.find_duplicate_groups();
+            if app.duplicate_groups.is_empty() {
+                app.error_message = "No duplicates found based on matching username and title/URL!".to_string();
+                app.screen = Screen::ErrorDialog;
+            } else {
+                app.screen = Screen::DeduplicateScreen;
             }
         }
+
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
                 app.copy_to_clipboard(record.url.clone(), "URL");
@@ -671,7 +1018,6 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                         if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
                             if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
                                 let result = crate::audit::check_hibp(&pw);
-                                // Hash the password to store in the cache
                                 let hash_bytes = crate::audit::sha256(pw.as_bytes());
                                 let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
                                 pw.zeroize();
@@ -680,26 +1026,107 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                                     Ok(n) => Some(n),
                                     Err(_) => None,
                                 };
-                                // Save to database
                                 let _ = crate::db::save_hibp_check(&app.conn, &hash_hex, count);
-                                
-                                // Update audit_report entry in-place
-                                if let Some(report) = &mut app.audit_report {
-                                    if let Some(entry) = report.entries.iter_mut().find(|e| e.id == entry_id) {
-                                        entry.hibp_count = count;
-                                    }
-                                }
                             }
                         }
                     }
                     app.marked_secrets.remove(&entry_id);
-                    // Sleep between checks if auditing multiple entries to respect API rate limits
                     if total_checks > 1 && i + 1 < total_checks {
                         std::thread::sleep(Duration::from_millis(700));
                     }
                 }
+                app.refresh_secrets();
             }
         }
+        KeyCode::Char('H') => {
+            if let Some(key) = &app.key {
+                let already_running = app.hibp_progress.lock().map(|p| p.is_some()).unwrap_or(false);
+                if !already_running {
+                    if let Ok(records) = crate::db::get_secrets(&app.conn) {
+                        let total_checks = records.len();
+                        if total_checks > 0 {
+                            *app.hibp_progress.lock().unwrap() = Some((0, total_checks));
+                            app.hibp_abort.store(false, Ordering::SeqCst);
+
+                            let progress_clone = Arc::clone(&app.hibp_progress);
+                            let abort_clone = Arc::clone(&app.hibp_abort);
+                            let key_clone = key.clone();
+                            let checked_hashes_clone = Arc::clone(&app.checked_hashes_this_session);
+
+                            std::thread::spawn(move || {
+                                if let Ok(conn) = rusqlite::Connection::open(crate::get_db_path()) {
+                                    let cached_checks = crate::db::get_all_hibp_checks(&conn).unwrap_or_default();
+                                    for (i, record) in records.iter().enumerate() {
+                                        if abort_clone.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+
+                                        let mut checked_online = false;
+                                        if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone) {
+                                            if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                                                let hash_bytes = crate::audit::sha256(pw.as_bytes());
+                                                let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+
+                                                if let Ok(checked_lock) = checked_hashes_clone.lock() {
+                                                    if checked_lock.contains(&hash_hex) {
+                                                        pw.zeroize();
+                                                        if let Ok(mut progress_lock) = progress_clone.lock() {
+                                                            if let Some(p) = &mut *progress_lock {
+                                                                p.0 = i + 1;
+                                                            }
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+
+                                                if let Some(Some(count)) = cached_checks.get(&hash_hex) {
+                                                    if *count > 0 {
+                                                        pw.zeroize();
+                                                        if let Ok(mut progress_lock) = progress_clone.lock() {
+                                                            if let Some(p) = &mut *progress_lock {
+                                                                p.0 = i + 1;
+                                                            }
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+
+                                                let result = crate::audit::check_hibp(&pw);
+                                                pw.zeroize();
+                                                checked_online = true;
+
+                                                let count = match result {
+                                                    Ok(n) => {
+                                                        if let Ok(mut checked_lock) = checked_hashes_clone.lock() {
+                                                            checked_lock.insert(hash_hex.clone());
+                                                        }
+                                                        Some(n)
+                                                    }
+                                                    Err(_) => None,
+                                                };
+                                                let _ = crate::db::save_hibp_check(&conn, &hash_hex, count);
+                                            }
+                                        }
+
+                                        if let Ok(mut progress_lock) = progress_clone.lock() {
+                                            if let Some(p) = &mut *progress_lock {
+                                                p.0 = i + 1;
+                                            }
+                                        }
+
+                                        if checked_online && total_checks > 1 && i + 1 < total_checks {
+                                            std::thread::sleep(Duration::from_millis(700));
+                                        }
+                                    }
+                                }
+                                *progress_clone.lock().unwrap() = None;
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         KeyCode::Up => match app.active_block {
             ActiveBlock::Categories => {
                 if app.selected_category_idx > 0 {
@@ -1041,7 +1468,7 @@ fn handle_import_input(app: &mut TuiApp, code: KeyCode) {
 
             match import_result {
                 Ok(count) => {
-                    app.copied_message = Some((format!("Success: Imported {} items from {}!", count, detected_format.name()), Instant::now()));
+                    app.copied_message = Some((format!("Success: Imported {} items from {}!", count, detected_format.name()), Instant::now(), StatusType::Normal));
                     app.import_path_input.clear();
                     app.refresh_secrets();
                     app.trigger_background_sync();
@@ -1113,7 +1540,7 @@ fn handle_export_input(app: &mut TuiApp, code: KeyCode) {
 
             match crate::import::export_vault_csv(&app.conn, file_path, key_ref, filter_set) {
                 Ok(count) => {
-                    app.copied_message = Some((format!("Success: Exported {} secrets to CSV!", count), Instant::now()));
+                    app.copied_message = Some((format!("Success: Exported {} secrets to CSV!", count), Instant::now(), StatusType::Normal));
                     app.export_path_input.clear();
                     app.screen = Screen::Dashboard;
                 }
@@ -1141,7 +1568,15 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::ExportTypeDialog => draw_export_type_dialog(f, app),
         Screen::ExportDialog => draw_export_dialog(f, app),
         Screen::GeneratorDialog => draw_generator_dialog(f, app),
-        Screen::AuditScreen => draw_audit_screen(f, app),
+        Screen::DeduplicateScreen => draw_deduplicate_screen(f, app),
+        Screen::SettingsScreen => draw_settings_screen(f, app),
+        Screen::SyncConflictScreen => draw_sync_conflict_screen(f, app),
+    }
+
+    if let Ok(progress_lock) = app.hibp_progress.lock() {
+        if let Some((checked, total)) = *progress_lock {
+            draw_hibp_progress_dialog(f, checked, total);
+        }
     }
 }
 
@@ -1446,8 +1881,12 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
     }
 
     // Render Status / Help Bar
-    let status_text = if let Some((msg, _)) = &app.copied_message {
-        Line::from(Span::styled(msg, Style::default().fg(Color::Green)))
+    let status_text = if let Some((msg, _, status_type)) = &app.copied_message {
+        match status_type {
+            StatusType::Copied => Line::from(Span::styled(msg, Style::default().fg(Color::Cyan))),
+            StatusType::Cleared => Line::from(Span::styled(msg, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+            StatusType::Normal => Line::from(Span::styled(msg, Style::default().fg(Color::Green))),
+        }
     } else {
         Line::from(vec![
             Span::styled("[a] Add | ", Style::default().fg(Color::Green)),
@@ -1464,6 +1903,59 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
     let status_bar = Paragraph::new(status_text)
         .block(Block::default().borders(Borders::ALL).title("Actions"));
     f.render_widget(status_bar, main_layout[1]);
+}
+
+fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
+    if password.is_empty() {
+        return (
+            Span::styled(" [░░░░░░░░░░]", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Empty", Style::default().fg(Color::DarkGray))
+        );
+    }
+    
+    let mut score = 0;
+    let len = password.len();
+    
+    if len >= 8 { score += 1; }
+    if len >= 12 { score += 1; }
+    if len >= 16 { score += 1; }
+    
+    let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    let has_special = password.chars().any(|c| !c.is_ascii_alphanumeric());
+    
+    if has_lower { score += 1; }
+    if has_upper { score += 1; }
+    if has_digit { score += 1; }
+    if has_special { score += 1; }
+    
+    let (bar, label, color) = match score {
+        0..=2 => (" [██░░░░░░░░]", " Weak", Color::Red),
+        3 => (" [████░░░░░░]", " Weak", Color::Red),
+        4 => (" [██████░░░░]", " Medium", Color::Yellow),
+        5 => (" [████████░░]", " Medium", Color::Yellow),
+        6 => (" [█████████░]", " Strong", Color::Green),
+        _ => (" [██████████]", " Very Strong", Color::Green),
+    };
+    
+    (
+        Span::styled(bar, Style::default().fg(color)),
+        Span::styled(label, Style::default().fg(color))
+    )
+}
+
+fn check_local_hibp(conn: &rusqlite::Connection, password: &str) -> Option<u64> {
+    if password.is_empty() {
+        return None;
+    }
+    let hash_bytes = crate::audit::sha256(password.as_bytes());
+    let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+    conn.query_row(
+        "SELECT hibp_count FROM hibp_checks WHERE password_hash = ?1",
+        [hash_hex],
+        |row| row.get::<_, Option<u64>>(0)
+    ).ok().flatten()
 }
 
 fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
@@ -1485,7 +1977,9 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
             Constraint::Length(3), // Username
             Constraint::Length(3), // URL
             Constraint::Length(3), // Password
-            Constraint::Min(3),    // Notes
+            Constraint::Length(1), // Password Strength Indicator
+            Constraint::Length(2), // Audit Warnings (reused/breached)
+            Constraint::Min(2),    // Notes
         ])
         .split(area);
 
@@ -1529,11 +2023,81 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
     );
     f.render_widget(password_box, form_layout[4]);
 
+    // Password strength indicator
+    let (bar_span, label_span) = get_strength_bar(&app.form_password);
+    let strength_paragraph = Paragraph::new(Line::from(vec![
+        Span::styled("Password Strength:", Style::default().fg(Color::Gray)),
+        bar_span,
+        label_span,
+    ])).wrap(Wrap { trim: true });
+    f.render_widget(strength_paragraph, form_layout[5]);
+
+    // Check reuse
+    let mut reuse_count = 0;
+    if !app.form_password.is_empty() {
+        if let Some(ref key) = app.key {
+            for r in &app.secrets {
+                if let Some(edit_id) = app.edit_id {
+                    if r.id == edit_id {
+                        continue;
+                    }
+                }
+                if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, key) {
+                    if let Ok(pw) = String::from_utf8(dec.to_vec()) {
+                        if pw == app.form_password {
+                            reuse_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build Audit Warnings line
+    let mut warning_spans = vec![
+        Span::styled("Audit Warnings:   ", Style::default().fg(Color::Gray))
+    ];
+    let mut has_warnings = false;
+
+    if reuse_count > 0 {
+        warning_spans.push(Span::styled(
+            format!("⚠ Reused in {} other entry(ies)", reuse_count),
+            Style::default().fg(Color::LightRed)
+        ));
+        has_warnings = true;
+    }
+
+    if let Some(hibp_count) = check_local_hibp(&app.conn, &app.form_password) {
+        if hibp_count > 0 {
+            if has_warnings {
+                warning_spans.push(Span::raw(" | "));
+            }
+            warning_spans.push(Span::styled(
+                format!("⚠ Breached ({} times in HIBP database)", hibp_count),
+                Style::default().fg(Color::LightRed)
+            ));
+            has_warnings = true;
+        }
+    }
+
+    if !has_warnings {
+        if app.form_password.is_empty() {
+            warning_spans.push(Span::styled("None", Style::default().fg(Color::DarkGray)));
+        } else {
+            warning_spans.push(Span::styled("✓ Unique & not known pwned (in local cache)", Style::default().fg(Color::Green)));
+        }
+    }
+
+    let warnings_paragraph = Paragraph::new(Line::from(warning_spans)).wrap(Wrap { trim: true });
+    f.render_widget(warnings_paragraph, form_layout[6]);
+
     let notes_box = Paragraph::new(app.form_notes.as_str()).block(
         Block::default().borders(Borders::ALL).title("Notes").border_style(get_border_style(FormField::Notes))
     );
-    f.render_widget(notes_box, form_layout[5]);
+    f.render_widget(notes_box, form_layout[7]);
 }
+
+
 
 fn draw_error_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     let size = f.size();
@@ -1652,6 +2216,15 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::styled("  [h]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Check the selected password on HaveIBeenPwned", Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("  [H]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Check HIBP for all entries in the vault", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [D]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Scan for duplicate entries and resolve/merge them", Style::default().fg(Color::White)),
+        ]),
+
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
@@ -1677,6 +2250,10 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(vec![
             Span::styled("  [?]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Open this help screen", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [,]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Open interactive settings config screen", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  [q] / [Esc]   ", Style::default().fg(Color::Yellow)),
@@ -2159,294 +2736,752 @@ fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(hints, chunks[7]);
 }
 
+
+
 // ─────────────────────────────────────────────
-//  Audit Screen
+//  Deduplication Screen
 // ─────────────────────────────────────────────
 
-fn handle_audit_input(app: &mut TuiApp, key: KeyCode) {
-    let entry_count = app
-        .audit_report
-        .as_ref()
-        .map(|r| r.entries.len())
-        .unwrap_or(0);
+fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
+    let group_count = app.duplicate_groups.len();
+    if group_count == 0 {
+        app.screen = Screen::Dashboard;
+        return;
+    }
+
+    let current_group = &app.duplicate_groups[app.selected_dup_group_idx];
+    let item_count = current_group.records.len();
 
     match key {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.screen = Screen::Dashboard;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.audit_selected > 0 {
-                app.audit_selected -= 1;
-                // Scroll up if needed
-                if app.audit_selected < app.audit_scroll {
-                    app.audit_scroll = app.audit_selected;
-                }
+            if app.selected_dup_item_idx > 0 {
+                app.selected_dup_item_idx -= 1;
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.audit_selected + 1 < entry_count {
-                app.audit_selected += 1;
+            if app.selected_dup_item_idx + 1 < item_count {
+                app.selected_dup_item_idx += 1;
             }
         }
-        KeyCode::PageUp => {
-            app.audit_selected = app.audit_selected.saturating_sub(10);
-            if app.audit_selected < app.audit_scroll {
-                app.audit_scroll = app.audit_selected;
+        KeyCode::Right | KeyCode::Char('n') => {
+            if app.selected_dup_group_idx + 1 < group_count {
+                app.selected_dup_group_idx += 1;
+                app.selected_dup_item_idx = 0;
             }
         }
-        KeyCode::PageDown => {
-            app.audit_selected = (app.audit_selected + 10).min(entry_count.saturating_sub(1));
+        KeyCode::Left | KeyCode::Char('p') => {
+            if app.selected_dup_group_idx > 0 {
+                app.selected_dup_group_idx -= 1;
+                app.selected_dup_item_idx = 0;
+            }
         }
-        KeyCode::Home => {
-            app.audit_selected = 0;
-            app.audit_scroll = 0;
+        KeyCode::Enter => {
+            let keep_id = current_group.records[app.selected_dup_item_idx].id;
+            let ids_to_delete: Vec<i64> = current_group.records.iter()
+                .filter(|r| r.id != keep_id)
+                .map(|r| r.id)
+                .collect();
+            
+            for id in ids_to_delete {
+                let _ = crate::db::delete_secret(&app.conn, id);
+            }
+            
+            app.refresh_secrets();
+            app.find_duplicate_groups();
+            
+            if app.duplicate_groups.is_empty() {
+                app.screen = Screen::Dashboard;
+            } else {
+                if app.selected_dup_group_idx >= app.duplicate_groups.len() {
+                    app.selected_dup_group_idx = app.duplicate_groups.len() - 1;
+                }
+                app.selected_dup_item_idx = 0;
+            }
         }
-        KeyCode::End => {
-            app.audit_selected = entry_count.saturating_sub(1);
-        }
-        KeyCode::Char('h') => {
-            // HIBP check for the currently selected entry
-            if let Some(report) = &app.audit_report {
-                if let Some(entry) = report.entries.get(app.audit_selected) {
-                    let entry_id = entry.id;
-                    // Re-decrypt this entry's password from DB
-                    if let Some(key) = &app.key {
-                        if let Ok(Some(record)) = crate::db::get_secret_by_id(&app.conn, entry_id) {
-                            if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
-                                if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
-                                    let result = crate::audit::check_hibp(&pw);
-                                    pw.zeroize();
-                                    if let Some(report) = &mut app.audit_report {
-                                        if let Some(entry) = report.entries.iter_mut().find(|e| e.id == entry_id) {
-                                            match result {
-                                                Ok(n) => entry.hibp_count = Some(n),
-                                                Err(_) => entry.hibp_count = None,
-                                            }
-                                        }
-                                    }
+        KeyCode::Char('m') => {
+            let keep_idx = app.selected_dup_item_idx;
+            let keep_record = &current_group.records[keep_idx];
+            let mut merged_notes = String::new();
+            
+            if let Some(key) = &app.key {
+                if let Some(enc_notes) = &keep_record.encrypted_notes {
+                    if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
+                        merged_notes = String::from_utf8_lossy(&dec_notes).to_string();
+                    }
+                }
+                
+                for (idx, r) in current_group.records.iter().enumerate() {
+                    if idx == keep_idx {
+                        continue;
+                    }
+                    if let Some(enc_notes) = &r.encrypted_notes {
+                        if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
+                            let other_note = String::from_utf8_lossy(&dec_notes).to_string();
+                            if !other_note.is_empty() {
+                                if !merged_notes.is_empty() {
+                                    merged_notes.push_str("\n---\n");
                                 }
+                                merged_notes.push_str(&format!("Merged from duplicate: {}", other_note));
                             }
                         }
                     }
                 }
+                
+                let key_bytes: &[u8; 32] = &**key;
+                let _ = crate::db::update_secret(
+                    &app.conn,
+                    keep_record.id,
+                    &keep_record.title,
+                    &keep_record.category,
+                    &keep_record.username,
+                    &keep_record.url,
+                    &current_group.decrypted_passwords[keep_idx],
+                    if merged_notes.is_empty() { None } else { Some(&merged_notes) },
+                    key_bytes,
+                );
+            }
+
+            let keep_id = keep_record.id;
+            let ids_to_delete: Vec<i64> = current_group.records.iter()
+                .filter(|r| r.id != keep_id)
+                .map(|r| r.id)
+                .collect();
+            
+            for id in ids_to_delete {
+                let _ = crate::db::delete_secret(&app.conn, id);
+            }
+            
+            app.refresh_secrets();
+            app.find_duplicate_groups();
+            
+            if app.duplicate_groups.is_empty() {
+                app.screen = Screen::Dashboard;
+            } else {
+                if app.selected_dup_group_idx >= app.duplicate_groups.len() {
+                    app.selected_dup_group_idx = app.duplicate_groups.len() - 1;
+                }
+                app.selected_dup_item_idx = 0;
             }
         }
         _ => {}
     }
 }
 
-fn draw_audit_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    use crate::audit::Severity;
-
+fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
     let size = f.size();
-
-    let report = match &app.audit_report {
-        Some(r) => r,
-        None => return,
-    };
-
-    // ── Outer layout: header + body ──
-    let outer = Layout::default()
+    
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Deduplication Review")
+        .border_style(Style::default().fg(Color::Magenta));
+        
+    f.render_widget(block, size);
+    
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
+        .margin(2)
         .constraints([
-            Constraint::Length(3), // summary header
-            Constraint::Min(0),    // list + detail
+            Constraint::Length(3), // Top header / stats
+            Constraint::Min(10),   // Split pane body
+            Constraint::Length(2), // Bottom hints
         ])
         .split(size);
-
-    // ── Summary header ──
-    let summary = Paragraph::new(Line::from(vec![
-        Span::styled("  🔍 Security Audit   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("  ✗ Critical: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{}  ", report.critical_count), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled("⚠ Weak: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{}  ", report.weak_count), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("✓ Good: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{}  ", report.good_count), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" ({} total checked)", report.entries.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+        
+    let group_count = app.duplicate_groups.len();
+    if group_count == 0 {
+        return;
+    }
+    
+    let current_group = &app.duplicate_groups[app.selected_dup_group_idx];
+    
+    let header_text = format!(
+        " Duplicate Group {} of {}  |  Key: {}  |  Username: {}",
+        app.selected_dup_group_idx + 1,
+        group_count,
+        if !current_group.url.is_empty() { &current_group.url } else { &current_group.title },
+        current_group.username
     );
-    f.render_widget(summary, outer[0]);
-
-    // ── Body: list (left) + detail panel (right) ──
-    let body = Layout::default()
+    let header_p = Paragraph::new(Line::from(vec![
+        Span::styled(header_text, Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(header_p, chunks[0]);
+    
+    let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
+            Constraint::Percentage(40), // Left: list of entries in group
+            Constraint::Percentage(60), // Right: details of highlighted entry
         ])
-        .split(outer[1]);
-
-    // ── Entry list ──
-    let visible_height = body[0].height.saturating_sub(2) as usize; // minus borders
-    // Update scroll to keep selected in view
-    let scroll = if app.audit_selected >= app.audit_scroll + visible_height {
-        app.audit_selected.saturating_sub(visible_height - 1)
-    } else {
-        app.audit_scroll
-    };
-
-    let items: Vec<ListItem> = report
-        .entries
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible_height)
-        .map(|(i, entry)| {
-            let selected = i == app.audit_selected;
-            let (icon, sev_color) = match entry.severity {
-                Severity::Critical => ("✗", Color::Red),
-                Severity::Weak     => ("⚠", Color::Yellow),
-                Severity::Good     => ("✓", Color::Green),
-            };
-            let title = if entry.title.len() > 24 {
-                format!("{}…", &entry.title[..23])
-            } else {
-                entry.title.clone()
-            };
-            let score_bar = {
-                let filled = entry.score as usize;
-                let empty  = 5usize.saturating_sub(filled);
-                format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
-            };
-            let line = Line::from(vec![
-                Span::styled(format!(" {} ", icon), Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{:<25}", title), Style::default().fg(if selected { Color::White } else { Color::Gray }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(score_bar, Style::default().fg(sev_color)),
-            ]);
-            if selected {
-                ListItem::new(line).style(Style::default().bg(Color::DarkGray))
-            } else {
-                ListItem::new(line)
-            }
-        })
-        .collect();
-
-    let list_title = format!(
-        " Entries [{}/{}] ",
-        app.audit_selected.saturating_add(1).min(report.entries.len()),
-        report.entries.len()
-    );
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .title(list_title)
-        .border_style(Style::default().fg(Color::Cyan));
-    let list_widget = List::new(items).block(list_block);
-    f.render_widget(list_widget, body[0]);
-
-    // ── Detail panel ──
-    let detail_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Issues & Details ")
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let detail_content: Vec<Line> = if let Some(entry) = report.entries.get(app.audit_selected) {
-        let (sev_color, sev_label) = match entry.severity {
-            Severity::Critical => (Color::Red,    "CRITICAL"),
-            Severity::Weak     => (Color::Yellow, "WEAK"),
-            Severity::Good     => (Color::Green,  "GOOD"),
-        };
-
-        let score_bar = {
-            let filled = entry.score as usize;
-            let empty  = 5usize.saturating_sub(filled);
-            format!("Score: {}/5  [{}{}]", entry.score, "█".repeat(filled), "░".repeat(empty))
-        };
-
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("  Title:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(entry.title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Category: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(entry.category.clone(), Style::default().fg(Color::White)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Username: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(entry.username.clone(), Style::default().fg(Color::White)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Severity: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(sev_label, Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(score_bar, Style::default().fg(sev_color)),
-            ]),
-            Line::from(vec![
-                Span::styled("  HIBP:     ", Style::default().fg(Color::DarkGray)),
-                match entry.hibp_count {
-                    None => Span::styled("Not checked (Press [h] to check online)", Style::default().fg(Color::DarkGray)),
-                    Some(0) => Span::styled("✓ Clean (not found in breaches)", Style::default().fg(Color::Green)),
-                    Some(n) => Span::styled(format!("✗ PWNED (found in {} breaches)", n), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                }
-            ]),
-            Line::from(""),
-        ];
-
-        if entry.issues.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  ✓ No issues detected",
-                Style::default().fg(Color::Green),
-            )));
+        .split(chunks[1]);
+        
+    let mut list_items = Vec::new();
+    for (idx, r) in current_group.records.iter().enumerate() {
+        let is_selected = idx == app.selected_dup_item_idx;
+        let prefix = if is_selected { "➔ " } else { "  " };
+        let item_style = if is_selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
-            lines.push(Line::from(Span::styled(
-                "  Issues found:",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )));
-            for issue in &entry.issues {
-                lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::default().fg(Color::Yellow)),
-                    Span::styled(issue.clone(), Style::default().fg(Color::White)),
-                ]));
+            Style::default().fg(Color::White)
+        };
+        
+        let label = format!(
+            "{}Entry #{} - [{}] (Modified: {})",
+            prefix,
+            idx + 1,
+            r.category,
+            r.updated_at
+        );
+        list_items.push(ListItem::new(label).style(item_style));
+    }
+    
+    let entries_list = List::new(list_items)
+        .block(Block::default().borders(Borders::ALL).title("Entries in Group").border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(entries_list, body_chunks[0]);
+    
+    if let Some(r) = current_group.records.get(app.selected_dup_item_idx) {
+        let pw = &current_group.decrypted_passwords[app.selected_dup_item_idx];
+        let notes = if let Some(key) = &app.key {
+            r.encrypted_notes.as_ref()
+                .and_then(|enc| crate::crypto::decrypt(enc, key).ok())
+                .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        
+        let mut detail_lines = vec![
+            Line::from(vec![
+                Span::styled("  Title:      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.title.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Category:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.category.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Username:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.username.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  URL:        ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.url.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Password:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(pw.clone(), Style::default().fg(Color::LightCyan)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Updated At: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.updated_at.clone(), Style::default().fg(Color::Magenta)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("  Notes:", Style::default().fg(Color::DarkGray))),
+        ];
+        
+        for line in notes.lines() {
+            detail_lines.push(Line::from(format!("    {}", line)));
+        }
+        
+        let details_p = Paragraph::new(detail_lines)
+            .block(Block::default().borders(Borders::ALL).title("Selected Entry Details").border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(details_p, body_chunks[1]);
+    }
+    
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Select entry  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ←/→ p/n ", Style::default().fg(Color::Cyan)),
+        Span::styled("Prev/Next Group  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Enter ", Style::default().fg(Color::Green)),
+        Span::styled("Keep Highlighted  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" m ", Style::default().fg(Color::Yellow)),
+        Span::styled("Merge Notes  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Esc/q ", Style::default().fg(Color::Red)),
+        Span::styled("Back to Dashboard", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(hints, chunks[2]);
+}
+
+
+// ─────────────────────────────────────────────
+//  Settings Screen
+// ─────────────────────────────────────────────
+
+fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            if app.active_settings_field > 0 {
+                app.active_settings_field -= 1;
+            } else {
+                app.active_settings_field = 7;
             }
         }
+        KeyCode::Down | KeyCode::Tab => {
+            if app.active_settings_field < 7 {
+                app.active_settings_field += 1;
+            } else {
+                app.active_settings_field = 0;
+            }
+        }
+        KeyCode::Char(c) => {
+            match app.active_settings_field {
+                0 => {
+                    if c.is_ascii_digit() {
+                        app.settings_idle_timeout.push(c);
+                    }
+                }
+                1 => {
+                    if c.is_ascii_digit() {
+                        app.settings_clipboard_clear.push(c);
+                    }
+                }
+                3 => {
+                    if c.is_ascii_digit() {
+                        app.settings_gen_length.push(c);
+                    }
+                }
+                2 | 4 | 5 | 6 | 7 => {
+                    if c == ' ' {
+                        match app.active_settings_field {
+                            2 => app.settings_auto_sync = !app.settings_auto_sync,
+                            4 => app.settings_gen_lowercase = !app.settings_gen_lowercase,
+                            5 => app.settings_gen_uppercase = !app.settings_gen_uppercase,
+                            6 => app.settings_gen_numbers = !app.settings_gen_numbers,
+                            7 => app.settings_gen_symbols = !app.settings_gen_symbols,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Backspace => {
+            match app.active_settings_field {
+                0 => { app.settings_idle_timeout.pop(); }
+                1 => { app.settings_clipboard_clear.pop(); }
+                3 => { app.settings_gen_length.pop(); }
+                _ => {}
+            }
+        }
+        KeyCode::Enter => {
+            let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300);
+            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(10);
+            let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20);
 
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Press [e] to edit this entry",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "  No entries in vault.",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    };
+            app.config.idle_timeout_seconds = timeout;
+            app.config.clipboard_clear_seconds = clip;
+            app.config.auto_sync = app.settings_auto_sync;
+            app.config.generator.length = gen_len;
+            app.config.generator.use_lowercase = app.settings_gen_lowercase;
+            app.config.generator.use_uppercase = app.settings_gen_uppercase;
+            app.config.generator.use_numbers = app.settings_gen_numbers;
+            app.config.generator.use_symbols = app.settings_gen_symbols;
 
-    let detail_p = Paragraph::new(detail_content)
-        .block(detail_block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(detail_p, body[1]);
-
-    // ── Bottom hint bar ──
-    let hint_area = ratatui::layout::Rect {
-        x: size.x,
-        y: size.y + size.height - 1,
-        width: size.width,
-        height: 1,
-    };
-    let hints = Paragraph::new(Line::from(vec![
-        Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::Cyan)),
-        Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("PgUp/PgDn ", Style::default().fg(Color::Cyan)),
-        Span::styled("fast  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Home/End ", Style::default().fg(Color::Cyan)),
-        Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(" h ", Style::default().fg(Color::Cyan)),
-        Span::styled("check HIBP  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc/q ", Style::default().fg(Color::Red)),
-        Span::styled("back to dashboard", Style::default().fg(Color::DarkGray)),
-    ]));
-    f.render_widget(hints, hint_area);
+            let _ = app.config.save();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
 }
+
+fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let area = centered_rect(70, 90, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" KeyStash Settings ")
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3), // Idle Timeout
+            Constraint::Length(3), // Clipboard delay
+            Constraint::Length(3), // Auto sync
+            Constraint::Length(3), // Default Generator Length
+            Constraint::Length(3), // Generator lowercase
+            Constraint::Length(3), // Generator uppercase
+            Constraint::Length(3), // Generator numbers
+            Constraint::Length(3), // Generator symbols
+            Constraint::Min(2),    // Hints
+        ])
+        .split(area);
+
+    let render_field = |_f_idx: usize, label: &str, value: &str, active: bool, frame: &mut ratatui::Frame, rect: ratatui::layout::Rect| {
+        let border_color = if active { Color::Green } else { Color::DarkGray };
+        let text_style = if active { Style::default().fg(Color::Green) } else { Style::default().fg(Color::White) };
+        let p = Paragraph::new(Span::styled(value, text_style))
+            .block(Block::default().borders(Borders::ALL).title(label).border_style(Style::default().fg(border_color)));
+        frame.render_widget(p, rect);
+    };
+
+    render_field(
+        0,
+        "1. Idle Timeout (seconds)",
+        &app.settings_idle_timeout,
+        app.active_settings_field == 0,
+        f,
+        chunks[0],
+    );
+
+    render_field(
+        1,
+        "2. Clipboard Clear Delay (seconds)",
+        &app.settings_clipboard_clear,
+        app.active_settings_field == 1,
+        f,
+        chunks[1],
+    );
+
+    render_field(
+        2,
+        "3. Auto Sync with Git Remote (Yes/No)",
+        if app.settings_auto_sync { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
+        app.active_settings_field == 2,
+        f,
+        chunks[2],
+    );
+
+    render_field(
+        3,
+        "4. Default Generator Password Length",
+        &app.settings_gen_length,
+        app.active_settings_field == 3,
+        f,
+        chunks[3],
+    );
+
+    render_field(
+        4,
+        "5. Password Gen: Use Lowercase (Yes/No)",
+        if app.settings_gen_lowercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
+        app.active_settings_field == 4,
+        f,
+        chunks[4],
+    );
+
+    render_field(
+        5,
+        "6. Password Gen: Use Uppercase (Yes/No)",
+        if app.settings_gen_uppercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
+        app.active_settings_field == 5,
+        f,
+        chunks[5],
+    );
+
+    render_field(
+        6,
+        "7. Password Gen: Use Numbers (Yes/No)",
+        if app.settings_gen_numbers { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
+        app.active_settings_field == 6,
+        f,
+        chunks[6],
+    );
+
+    render_field(
+        7,
+        "8. Password Gen: Use Symbols (Yes/No)",
+        if app.settings_gen_symbols { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
+        app.active_settings_field == 7,
+        f,
+        chunks[7],
+    );
+
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" Tab/Arrows ", Style::default().fg(Color::Cyan)),
+        Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Enter ", Style::default().fg(Color::Green)),
+        Span::styled("Save & Exit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Esc ", Style::default().fg(Color::Red)),
+        Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(hints, chunks[8]);
+}
+
+fn draw_hibp_progress_dialog(f: &mut ratatui::Frame, checked: usize, total: usize) {
+    let size = f.size();
+    let area = centered_rect(60, 25, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Checking HaveIBeenPwned Breach Status ")
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block.clone(), area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Progress Info / Bar
+            Constraint::Min(1),    // Cancel Hint
+        ])
+        .split(area);
+
+    let percentage = if total > 0 { (checked * 100) / total } else { 0 };
+    let width = chunks[1].width.saturating_sub(6) as usize; // account for margins
+    let filled_width = (width * percentage) / 100;
+    let empty_width = width.saturating_sub(filled_width);
+    let bar_text = format!("{}{}", "█".repeat(filled_width), "░".repeat(empty_width));
+
+    let progress_bar = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(format!("  Checked: {} / {}  ({}%)", checked, total, percentage), Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::styled(format!("  [{}]", bar_text), Style::default().fg(Color::Green))),
+    ]);
+    f.render_widget(progress_bar, chunks[1]);
+
+    let cancel_hint = Paragraph::new(Line::from(vec![
+        Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Red)),
+        Span::styled(" or ", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(Color::Red)),
+        Span::styled(" to abort check", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(cancel_hint, chunks[2]);
+}
+
+fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
+    if app.sync_conflicts.is_empty() {
+        app.screen = Screen::Dashboard;
+        return;
+    }
+
+    match code {
+        KeyCode::Up => {
+            if app.selected_conflict_idx > 0 {
+                app.selected_conflict_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.selected_conflict_idx + 1 < app.sync_conflicts.len() {
+                app.selected_conflict_idx += 1;
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Left => {
+            let _resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
+                app.selected_conflict_idx = app.sync_conflicts.len() - 1;
+            }
+            if app.sync_conflicts.is_empty() {
+                app.trigger_background_sync_completion();
+                app.screen = Screen::Dashboard;
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Right => {
+            let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            let _ = crate::db::update_secret_raw(
+                &app.conn,
+                resolved.local_secret.id,
+                &resolved.remote_secret.url,
+                &resolved.remote_secret.encrypted_password,
+                resolved.remote_secret.encrypted_notes.as_deref(),
+                &resolved.remote_secret.updated_at,
+            );
+            if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
+                app.selected_conflict_idx = app.sync_conflicts.len() - 1;
+            }
+            app.refresh_secrets();
+            if app.sync_conflicts.is_empty() {
+                app.trigger_background_sync_completion();
+                app.screen = Screen::Dashboard;
+            }
+        }
+        KeyCode::Char('m') => {
+            let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            if let Some(key) = &app.key {
+                let local_notes = crate::crypto::decrypt(&resolved.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let remote_notes = crate::crypto::decrypt(&resolved.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+
+                let merged = if local_notes.is_empty() {
+                    remote_notes
+                } else if remote_notes.is_empty() {
+                    local_notes
+                } else {
+                    format!("{}\n---\n{}", local_notes, remote_notes)
+                };
+
+                let enc_notes = if merged.is_empty() {
+                    None
+                } else {
+                    crate::crypto::encrypt(merged.as_bytes(), key).ok()
+                };
+
+                let _ = crate::db::update_secret_raw(
+                    &app.conn,
+                    resolved.local_secret.id,
+                    &resolved.local_secret.url,
+                    &resolved.local_secret.encrypted_password,
+                    enc_notes.as_deref(),
+                    &resolved.remote_secret.updated_at,
+                );
+            }
+            if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
+                app.selected_conflict_idx = app.sync_conflicts.len() - 1;
+            }
+            app.refresh_secrets();
+            if app.sync_conflicts.is_empty() {
+                app.trigger_background_sync_completion();
+                app.screen = Screen::Dashboard;
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.sync_conflicts.clear();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
+fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    f.render_widget(Clear, size);
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Sync Conflict Resolver (3-way Merge) ")
+        .border_style(Style::default().fg(Color::LightRed));
+    f.render_widget(main_block, size);
+
+    let inner_area = size.inner(&ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(70),
+        ])
+        .split(inner_area);
+
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Conflicting Credentials ");
+    let mut list_items = Vec::new();
+    for (i, c) in app.sync_conflicts.iter().enumerate() {
+        let style = if i == app.selected_conflict_idx {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        list_items.push(ListItem::new(format!("  {} > {} ({})", c.category, c.title, c.username)).style(style));
+    }
+    let list = List::new(list_items).block(left_block);
+    f.render_widget(list, main_layout[0]);
+
+    if app.sync_conflicts.is_empty() {
+        let empty_block = Block::default().borders(Borders::ALL).title(" Resolution details ");
+        f.render_widget(Paragraph::new("No conflicts remaining.").block(empty_block), main_layout[1]);
+        return;
+    }
+
+    let current_conflict = &app.sync_conflicts[app.selected_conflict_idx];
+
+    let right_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(main_layout[1]);
+
+    let key = app.key.as_ref().unwrap();
+    
+    let local_pw = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_password, key)
+        .map(|d| String::from_utf8_lossy(&d).into_owned())
+        .unwrap_or_default();
+    let local_notes = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
+        .map(|d| String::from_utf8_lossy(&d).into_owned())
+        .unwrap_or_default();
+
+    let remote_pw = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_password, key)
+        .map(|d| String::from_utf8_lossy(&d).into_owned())
+        .unwrap_or_default();
+    let remote_notes = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
+        .map(|d| String::from_utf8_lossy(&d).into_owned())
+        .unwrap_or_default();
+
+    let mut base_pw = String::new();
+    let mut base_notes = String::new();
+    let mut base_url = String::new();
+    if let Some(base_sec) = &current_conflict.base_secret {
+        base_pw = crate::crypto::decrypt(&base_sec.encrypted_password, key)
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .unwrap_or_default();
+        base_notes = crate::crypto::decrypt(&base_sec.encrypted_notes.clone().unwrap_or_default(), key)
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .unwrap_or_default();
+        base_url = base_sec.url.clone();
+    }
+
+    let local_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" [L] Local Version (Updated: {}) ", current_conflict.local_secret.updated_at))
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let local_text = vec![
+        Line::from(vec![
+            Span::styled("  URL:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.local_secret.url, if current_conflict.local_secret.url != base_url { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+        Line::from(vec![
+            Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&local_pw, if local_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+        Line::from(vec![
+            Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&local_notes, if local_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+    ];
+    let local_p = Paragraph::new(local_text).block(local_block);
+    f.render_widget(local_p, right_layout[0]);
+
+    let remote_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" [R] Remote Version (Updated: {}) ", current_conflict.remote_secret.updated_at))
+        .border_style(Style::default().fg(Color::Green));
+
+    let remote_text = vec![
+        Line::from(vec![
+            Span::styled("  URL:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.remote_secret.url, if current_conflict.remote_secret.url != base_url { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+        Line::from(vec![
+            Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&remote_pw, if remote_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+        Line::from(vec![
+            Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&remote_notes, if remote_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [l / Left] Keep Local  |  ", Style::default().fg(Color::Cyan)),
+            Span::styled(" [r / Right] Keep Remote  |  ", Style::default().fg(Color::Green)),
+            Span::styled(" [m] Merge Notes  |  ", Style::default().fg(Color::Yellow)),
+            Span::styled(" [Esc/q] Cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+    let remote_p = Paragraph::new(remote_text).block(remote_block);
+    f.render_widget(remote_p, right_layout[1]);
+}
+
+
+
+

@@ -1,4 +1,4 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.2.1" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.2.5" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
@@ -33,10 +33,10 @@ Search for matching credentials across titles, categories, usernames, or URLs. P
 Show a detailed view of a secret (including notes). Passwords and notes are masked by default unless \-r or \-\-reveal is supplied.
 .TP
 .B copy \fIid\fR [\fIusername\fR|\fIpassword\fR|\fIurl\fR]
-Copy the target secret field to the system clipboard (automatically clearing it after 10 seconds). Defaults to copying the password.
+Copy the target secret field to the system clipboard (automatically clearing it after the configured delay, default 10 seconds). Defaults to copying the password.
 .TP
 .B generate [\-l \fIlength\fR] [\-\-no\-uppercase] [\-\-no\-numbers] [\-\-no\-symbols] [\-\-uppercase] [\-\-numbers] [\-\-symbols]
-Generate a random secure password and print it, excluding ambiguous characters. Your options are saved as your new defaults.
+Generate a random secure password, print it (excluding ambiguous characters), and copy it to the clipboard for the configured delay. Your options are saved as your new defaults.
 .TP
 .B import \fIpath/to/backup_file\fR
 Import login credentials from unencrypted files (supports Bitwarden JSON, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV).
@@ -89,13 +89,13 @@ Delete the selected credential (or all marked credentials if any exist).
 Toggle password plaintext visibility in the Details pane.
 .TP
 .B c
-Copy username to clipboard (clears automatically in 10s).
+Copy username to clipboard (clears automatically in configured delay, default 10s).
 .TP
 .B p
-Copy decrypted password to clipboard (clears automatically in 10s).
+Copy decrypted password to clipboard (clears automatically in configured delay, default 10s).
 .TP
 .B u
-Copy website URL to clipboard (clears automatically in 10s).
+Copy website URL to clipboard (clears automatically in configured delay, default 10s).
 .TP
 .B m
 Open the Change Master Password form overlay.
@@ -108,6 +108,15 @@ Open the Export modal popup to export credentials (all or selected) to an unencr
 .TP
 .B h
 Check the selected password (or marked passwords if any exist) on HaveIBeenPwned.
+.TP
+.B H
+Check all passwords in the vault on HaveIBeenPwned asynchronously in a background thread.
+.TP
+.B D
+Open the duplicate credential detector and interactive resolver.
+.TP
+.B ,
+Open the KeyStash settings screen modal.
 .TP
 .B ?
 Toggle the Help & Keybindings modal popup.
@@ -151,7 +160,7 @@ To support logical merging and search across multiple devices, only sensitive fi
 .PP
 .B Clipboard Security
 .IP
-KeyStash automatically clears copied credentials from the system clipboard after 10 seconds. However, third-party clipboard history managers (like CopyQ or Klipper) can intercept and save copied text. You should configure these managers to ignore copy actions from the "keystash" binary.
+KeyStash automatically clears copied credentials from the system clipboard after the configured delay (default 10 seconds). However, third-party clipboard history managers (like CopyQ or Klipper) can intercept and save copied text. You should configure these managers to ignore copy actions from the "keystash" binary.
 .PP
 .B Memory Cleansing
 .IP

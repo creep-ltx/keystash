@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::crypto::{self, KEY_LEN, SALT_LEN};
 use zeroize::Zeroizing;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SecretRecord {
     pub id: i64,
     pub title: String,
@@ -225,6 +225,24 @@ pub fn update_secret(
     )
     .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+pub fn update_secret_raw(
+    conn: &Connection,
+    id: i64,
+    url: &str,
+    encrypted_password: &[u8],
+    encrypted_notes: Option<&[u8]>,
+    updated_at: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE secrets 
+         SET url = ?1, encrypted_password = ?2, encrypted_notes = ?3, updated_at = ?4
+         WHERE id = ?5",
+        rusqlite::params![url, encrypted_password, encrypted_notes, updated_at, id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -14,22 +14,13 @@ pub struct GeneratorOptions {
 
 impl GeneratorOptions {
     pub fn load() -> Self {
-        let path = crate::get_config_path();
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(opts) = serde_json::from_str::<Self>(&content) {
-                    return opts;
-                }
-            }
-        }
-        Self::default()
+        crate::config::AppConfig::load().generator
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = crate::get_config_path();
-        let content = serde_json::to_string(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, content).map_err(|e| e.to_string())?;
-        Ok(())
+        let mut config = crate::config::AppConfig::load();
+        config.generator = self.clone();
+        config.save()
     }
 }
 

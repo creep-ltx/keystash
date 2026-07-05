@@ -220,3 +220,177 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
         Ok("Sync complete: Vault is already up-to-date with remote.".to_string())
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct ConflictGroup {
+    pub title: String,
+    pub category: String,
+    pub username: String,
+    pub local_secret: crate::db::SecretRecord,
+    pub remote_secret: crate::db::SecretRecord,
+    pub base_secret: Option<crate::db::SecretRecord>,
+}
+
+pub fn detect_sync_conflicts(
+    db_path: &Path,
+    key: &[u8; 32],
+) -> Result<Vec<ConflictGroup>, String> {
+    let dir = db_path.parent().ok_or("Invalid database directory")?;
+    
+    let remote_db_path = dir.join(format!("vault_remote_detect_{}.db", std::process::id()));
+    let base_db_path = dir.join(format!("vault_base_detect_{}.db", std::process::id()));
+    
+    let _ = fs::remove_file(&remote_db_path);
+    let _ = fs::remove_file(&base_db_path);
+
+    let show_remote = Command::new("git")
+        .arg("show")
+        .arg("origin/main:vault.db")
+        .current_dir(dir)
+        .output();
+        
+    let mut has_remote = false;
+    if let Ok(output) = show_remote {
+        if output.status.success() && !output.stdout.is_empty() {
+            if fs::write(&remote_db_path, output.stdout).is_ok() {
+                has_remote = true;
+            }
+        }
+    }
+
+    if !has_remote {
+        return Ok(Vec::new());
+    }
+
+    let merge_base_output = Command::new("git")
+        .arg("merge-base")
+        .arg("HEAD")
+        .arg("origin/main")
+        .current_dir(dir)
+        .output();
+
+    let mut has_base = false;
+    if let Ok(output) = merge_base_output {
+        if output.status.success() {
+            let ancestor_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let show_base = Command::new("git")
+                .arg("show")
+                .arg(format!("{}:vault.db", ancestor_hash))
+                .current_dir(dir)
+                .output();
+
+            if let Ok(base_out) = show_base {
+                if base_out.status.success() && !base_out.stdout.is_empty() {
+                    if fs::write(&base_db_path, base_out.stdout).is_ok() {
+                        has_base = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let local_conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let remote_conn = Connection::open(&remote_db_path).map_err(|e| e.to_string())?;
+    
+    let local_secrets = crate::db::get_secrets(&local_conn).map_err(|e| e.to_string())?;
+    let remote_secrets = crate::db::get_secrets(&remote_conn).map_err(|e| e.to_string())?;
+    
+    let base_secrets = if has_base {
+        if let Ok(base_conn) = Connection::open(&base_db_path) {
+            crate::db::get_secrets(&base_conn).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let _ = fs::remove_file(&remote_db_path);
+    let _ = fs::remove_file(&base_db_path);
+
+    use std::collections::HashMap;
+    let mut local_map: HashMap<(String, String, String), crate::db::SecretRecord> = HashMap::new();
+    for s in local_secrets {
+        local_map.insert((s.title.clone(), s.category.clone(), s.username.clone()), s);
+    }
+
+    let mut remote_map: HashMap<(String, String, String), crate::db::SecretRecord> = HashMap::new();
+    for s in remote_secrets {
+        remote_map.insert((s.title.clone(), s.category.clone(), s.username.clone()), s);
+    }
+
+    let mut base_map: HashMap<(String, String, String), crate::db::SecretRecord> = HashMap::new();
+    for s in base_secrets {
+        base_map.insert((s.title.clone(), s.category.clone(), s.username.clone()), s);
+    }
+
+    let mut conflicts = Vec::new();
+
+    for (k, local_sec) in &local_map {
+        if let Some(remote_sec) = remote_map.get(k) {
+            let local_pw = crate::crypto::decrypt(&local_sec.encrypted_password, key)
+                .map(|d| String::from_utf8_lossy(&d).into_owned())
+                .unwrap_or_default();
+            let remote_pw = crate::crypto::decrypt(&remote_sec.encrypted_password, key)
+                .map(|d| String::from_utf8_lossy(&d).into_owned())
+                .unwrap_or_default();
+
+            let local_notes = if let Some(notes) = &local_sec.encrypted_notes {
+                crate::crypto::decrypt(notes, key)
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let remote_notes = if let Some(notes) = &remote_sec.encrypted_notes {
+                crate::crypto::decrypt(notes, key)
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let differs = local_pw != remote_pw || local_notes != remote_notes || local_sec.url != remote_sec.url;
+            if differs {
+                if let Some(base_sec) = base_map.get(k) {
+                    let base_pw = crate::crypto::decrypt(&base_sec.encrypted_password, key)
+                        .map(|d| String::from_utf8_lossy(&d).into_owned())
+                        .unwrap_or_default();
+                    let base_notes = if let Some(notes) = &base_sec.encrypted_notes {
+                        crate::crypto::decrypt(notes, key)
+                            .map(|d| String::from_utf8_lossy(&d).into_owned())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    let local_changed = local_pw != base_pw || local_notes != base_notes || local_sec.url != base_sec.url;
+                    let remote_changed = remote_pw != base_pw || remote_notes != base_notes || remote_sec.url != base_sec.url;
+
+                    if local_changed && remote_changed {
+                        conflicts.push(ConflictGroup {
+                            title: k.0.clone(),
+                            category: k.1.clone(),
+                            username: k.2.clone(),
+                            local_secret: local_sec.clone(),
+                            remote_secret: remote_sec.clone(),
+                            base_secret: Some(base_sec.clone()),
+                        });
+                    }
+                } else {
+                    conflicts.push(ConflictGroup {
+                        title: k.0.clone(),
+                        category: k.1.clone(),
+                        username: k.2.clone(),
+                        local_secret: local_sec.clone(),
+                        remote_secret: remote_sec.clone(),
+                        base_secret: None,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(conflicts)
+}
