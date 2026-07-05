@@ -16,7 +16,13 @@ pub struct SecretRecord {
 }
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    let conn = Connection::open(&path)?;
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     
     // Enable WAL mode and normal synchronization for better concurrency
     let _ = conn.execute("PRAGMA journal_mode=WAL", []);
@@ -41,7 +47,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             url TEXT NOT NULL DEFAULT '',
             encrypted_password BLOB NOT NULL,
             encrypted_notes BLOB,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            updated_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
         )",
         [],
     )?;
@@ -52,7 +58,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             title TEXT NOT NULL,
             category TEXT NOT NULL,
             username TEXT NOT NULL,
-            deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            deleted_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
             PRIMARY KEY (title, category, username)
         )",
         [],
@@ -177,7 +183,7 @@ pub fn add_secret(
 
     conn.execute(
         "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
         params![title, category, username, url, encrypted_password, encrypted_notes],
     )
     .map_err(|e| e.to_string())?;
@@ -204,7 +210,7 @@ pub fn update_secret(
 
     conn.execute(
         "UPDATE secrets 
-         SET title = ?1, category = ?2, username = ?3, url = ?4, encrypted_password = ?5, encrypted_notes = ?6, updated_at = CURRENT_TIMESTAMP
+         SET title = ?1, category = ?2, username = ?3, url = ?4, encrypted_password = ?5, encrypted_notes = ?6, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')
          WHERE id = ?7",
         params![title, category, username, url, encrypted_password, encrypted_notes, id],
     )
@@ -255,7 +261,7 @@ pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
         // 2. Insert into deleted_secrets tombstone table
         conn.execute(
             "INSERT OR REPLACE INTO deleted_secrets (title, category, username, deleted_at)
-             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+             VALUES (?1, ?2, ?3, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
             params![title, category, username],
         )
         .map_err(|e| e.to_string())?;
@@ -324,7 +330,7 @@ pub fn change_master_password(
     // Update each secret
     for (id, enc_pass, enc_notes) in re_encrypted_secrets {
         if let Err(e) = conn.execute(
-            "UPDATE secrets SET encrypted_password = ?1, encrypted_notes = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            "UPDATE secrets SET encrypted_password = ?1, encrypted_notes = ?2, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?3",
             params![enc_pass, enc_notes, id],
         ) {
             let _ = conn.execute("ROLLBACK", []);

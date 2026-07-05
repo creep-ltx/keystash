@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use rpassword::read_password;
 
+#[cfg(unix)]
+fn set_dir_permissions<P: AsRef<Path>>(path: P) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions<P: AsRef<Path>>(_path: P) {}
+
 pub fn get_db_path() -> PathBuf {
     let mut path = if let Ok(home) = env::var("HOME") {
         PathBuf::from(home)
@@ -20,6 +29,7 @@ pub fn get_db_path() -> PathBuf {
     path.push(".config");
     path.push("keystash");
     let _ = fs::create_dir_all(&path);
+    set_dir_permissions(&path);
     path.push("vault.db");
     path
 }
@@ -57,6 +67,7 @@ fn main() {
     // Ensure parent directory of db_path exists
     if let Some(parent) = db_path.parent() {
         let _ = fs::create_dir_all(parent);
+        set_dir_permissions(parent);
     }
 
     if args.len() < 2 {
