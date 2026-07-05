@@ -60,10 +60,17 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 
 ## 📥 Installation
 
-To run `keystash` globally from anywhere on your system, build and install the binary using Cargo:
+### 1. Install via Crates.io (Recommended)
+You can install the latest released binary directly from the official Rust package registry:
+```bash
+cargo install keystash
+```
 
+### 2. Install from Source
+If you prefer to compile the latest development version from the repository:
 ```bash
 # Clone the repository and navigate inside
+git clone https://github.com/creep-ltx/keystash.git
 cd keystash
 
 # Install the binary to ~/.cargo/bin
