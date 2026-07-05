@@ -129,8 +129,6 @@ pub fn unlock_vault(conn: &Connection, master_password: &str) -> Result<Zeroizin
         return Err("Invalid salt length in metadata.".to_string());
     }
 
-    let key = crypto::derive_key(master_password, &salt)?;
-
     // Get validation token
     let encrypted_token: Vec<u8> = conn
         .query_row(
@@ -140,15 +138,25 @@ pub fn unlock_vault(conn: &Connection, master_password: &str) -> Result<Zeroizin
         )
         .map_err(|_| "Verification token not found. Database might be corrupted.".to_string())?;
 
-    // Decrypt and check validation token
-    let decrypted = crypto::decrypt(&encrypted_token, &key)
-        .map_err(|_| "Incorrect master password.".to_string())?;
-
-    if *decrypted == b"keystash-verification-token" {
-        Ok(key)
-    } else {
-        Err("Incorrect master password.".to_string())
+    // 1. Try modern key derivation parameters
+    let key = crypto::derive_key(master_password, &salt)?;
+    if let Ok(decrypted) = crypto::decrypt(&encrypted_token, &key) {
+        if *decrypted == b"keystash-verification-token" {
+            return Ok(key);
+        }
     }
+
+    // 2. Try legacy parameters
+    let legacy_key = crypto::derive_key_legacy(master_password, &salt)?;
+    if let Ok(decrypted) = crypto::decrypt(&encrypted_token, &legacy_key) {
+        if *decrypted == b"keystash-verification-token" {
+            // Success! Let's auto-migrate/re-encrypt the database with modern parameters.
+            let new_key = change_master_password(conn, &legacy_key, master_password)?;
+            return Ok(new_key);
+        }
+    }
+
+    Err("Incorrect master password.".to_string())
 }
 
 pub fn add_secret(

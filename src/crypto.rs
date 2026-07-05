@@ -37,6 +37,23 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]
     Ok(Zeroizing::new(derived_key))
 }
 
+/// Derives a 256-bit key using the legacy weak Argon2id parameters (for migration).
+pub fn derive_key_legacy(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+    let mut derived_key = [0u8; KEY_LEN];
+    let params = Params::new(15360, 2, 1, Some(KEY_LEN)).map_err(|e| e.to_string())?;
+    let argon2 = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        Version::V0x13,
+        params,
+    );
+    
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut derived_key)
+        .map_err(|e| e.to_string())?;
+
+    Ok(Zeroizing::new(derived_key))
+}
+
 /// Encrypts plaintext using XChaCha20-Poly1305 with the derived key.
 /// Returns `nonce (24 bytes) + ciphertext`.
 pub fn encrypt(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String> {
