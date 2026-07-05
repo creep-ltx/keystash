@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 ## [0.2.5] - 2026-07-05
 - Feat: Auto-lock idle timeout for persistent TuiApp sessions
 - Feat: Real-time password strength meter in Add/Edit forms
