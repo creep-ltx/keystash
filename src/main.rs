@@ -110,7 +110,8 @@ fn print_help() {
     println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
     println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
     println!("  keystash copy <id> [username|password|url] Copy entry's field to clipboard (default: password)");
-    println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
+    println!("  keystash import <path>                    Import unencrypted logins (supports Bitwarden, Brave/Chrome, Firefox)");
+    println!("  keystash export <path>                    Export all vault credentials to an unencrypted CSV file");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
@@ -119,7 +120,9 @@ fn print_help() {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    let no_sync = raw_args.iter().any(|arg| arg == "--no-sync");
+    let args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--no-sync").collect();
     let db_path = get_db_path();
     
     // Ensure parent directory of db_path exists
@@ -129,13 +132,13 @@ fn main() {
     }
 
     if args.len() < 2 {
-        start_tui(&db_path);
+        start_tui(&db_path, no_sync);
         return;
     }
 
     match args[1].as_str() {
         "tui" => {
-            start_tui(&db_path);
+            start_tui(&db_path, no_sync);
         }
         "init" => {
             let conn = match db::init_db(&db_path) {
@@ -339,9 +342,9 @@ fn main() {
                 Err(e) => eprintln!("Error deleting secret: {}", e),
             }
         }
-        "import-bitwarden" => {
+        "import" => {
             if args.len() < 3 {
-                eprintln!("Usage: keystash import-bitwarden <file_path>");
+                eprintln!("Usage: keystash import <file_path>");
                 return;
             }
             let file_path = &args[2];
@@ -356,6 +359,25 @@ fn main() {
                 eprintln!("Vault is not initialized. Run `keystash init` first.");
                 return;
             }
+
+            // 1. Detect export format first before asking for master password
+            let detected_format = match import::detect_format(file_path) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    eprintln!("Import failed: {}", e);
+                    return;
+                }
+            };
+
+            print!("Detected {} export format. Do you want to continue importing? (y/N): ", detected_format.name());
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            let _ = io::stdin().read_line(&mut answer);
+            if answer.trim().to_lowercase() != "y" {
+                println!("Import cancelled.");
+                return;
+            }
+
             let master_pass = prompt_password("Enter Master Password: ");
             let key = match db::unlock_vault(&conn, &master_pass) {
                 Ok(k) => k,
@@ -365,9 +387,70 @@ fn main() {
                 }
             };
 
-            match import::import_bitwarden_json(&conn, file_path, &key) {
-                Ok(count) => println!("Success: Imported {} items from Bitwarden JSON export!", count),
+            let import_result = match detected_format {
+                import::ImportFormat::BitwardenJson => import::import_bitwarden_json(&conn, file_path, &key),
+                import::ImportFormat::BraveChromeCsv => import::import_brave_chrome_csv(&conn, file_path, &key),
+                import::ImportFormat::FirefoxCsv => import::import_firefox_csv(&conn, file_path, &key),
+                import::ImportFormat::LastPassCsv => import::import_lastpass_csv(&conn, file_path, &key),
+                import::ImportFormat::KeePassXcCsv => import::import_keepassxc_csv(&conn, file_path, &key),
+                import::ImportFormat::OnePasswordCsv => import::import_onepassword_csv(&conn, file_path, &key),
+            };
+
+            match import_result {
+                Ok(count) => {
+                    println!("Success: Imported {} items from {}!", count, detected_format.name());
+                    if sync::is_git_configured(&db_path) {
+                        println!("Syncing updates to Git remote...");
+                        let _ = sync::git_sync_vault(&db_path);
+                    }
+                }
                 Err(e) => eprintln!("Import failed: {}", e),
+            }
+        }
+        "export" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash export <output_file_path>");
+                return;
+            }
+            let output_path = &args[2];
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+
+            println!("WARNING: The exported CSV file will contain unencrypted plaintext passwords.");
+            print!("Are you sure you want to export your vault? (y/N): ");
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            let _ = io::stdin().read_line(&mut answer);
+            if answer.trim().to_lowercase() != "y" {
+                println!("Export cancelled.");
+                return;
+            }
+
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+
+            println!("Decrypting and exporting vault records to CSV...");
+            match import::export_vault_csv(&conn, output_path, &key) {
+                Ok(count) => {
+                    println!("Success: Exported {} secrets to '{}'!", count, output_path);
+                    println!("Please delete this file securely as soon as you are done using it.");
+                }
+                Err(e) => eprintln!("Export failed: {}", e),
             }
         }
         "reset" => {
@@ -581,17 +664,10 @@ fn main() {
     }
 }
 
-fn start_tui(db_path: &Path) {
-    let conn = match db::init_db(db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to open vault database: {}", e);
-            return;
-        }
-    };
-
-    // Auto-sync at startup if Git is configured
-    if sync::is_git_configured(db_path) {
+fn start_tui(db_path: &Path, no_sync: bool) {
+    // Auto-sync at startup if Git is configured and sync is not disabled
+    // This must run before db::init_db so that a missing local vault can be restored in its entirety
+    if !no_sync && sync::is_git_configured(db_path) {
         println!("Syncing vault with Git remote...");
         match sync::git_sync_vault(db_path) {
             Ok(msg) => println!("{}", msg),
@@ -600,13 +676,21 @@ fn start_tui(db_path: &Path) {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    let app = tui::TuiApp::new(conn);
+    let conn = match db::init_db(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to open vault database: {}", e);
+            return;
+        }
+    };
+
+    let app = tui::TuiApp::new(conn, no_sync);
     if let Err(e) = tui::run_tui(app) {
         eprintln!("Terminal application crashed: {}", e);
     }
 
-    // Auto-sync updates on exit if Git is configured
-    if sync::is_git_configured(db_path) {
+    // Auto-sync updates on exit if Git is configured and sync is not disabled
+    if !no_sync && sync::is_git_configured(db_path) {
         println!("Syncing vault updates on exit...");
         match sync::git_sync_vault(db_path) {
             Ok(msg) => println!("{}", msg),

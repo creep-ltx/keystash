@@ -101,10 +101,11 @@ pub struct TuiApp {
 
     // Key rotation form state
     pub change_pass_field: usize,
+    pub no_sync: bool,
 }
 
 impl TuiApp {
-    pub fn new(conn: Connection) -> Self {
+    pub fn new(conn: Connection, no_sync: bool) -> Self {
         let is_first = db::is_first_run(&conn).unwrap_or(true);
         let screen = if is_first { Screen::Setup } else { Screen::Lock };
 
@@ -138,6 +139,7 @@ impl TuiApp {
             category_list_state: RefCell::new(ListState::default()),
             secrets_list_state: RefCell::new(ListState::default()),
             change_pass_field: 0,
+            no_sync,
         }
     }
 
@@ -270,6 +272,9 @@ impl TuiApp {
     }
 
     fn trigger_background_sync(&self) {
+        if self.no_sync {
+            return;
+        }
         let db_path = crate::get_db_path();
         std::thread::spawn(move || {
             let _ = crate::sync::git_sync_vault(db_path);

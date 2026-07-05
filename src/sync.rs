@@ -72,6 +72,12 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
 
     // 2. Perform SQLite logical merge if remote database was successfully extracted
     if has_remote {
+        if !db_ref.exists() {
+            fs::copy(&remote_db_path, db_ref).map_err(|e| format!("Failed to restore vault.db from remote: {}", e))?;
+            let _ = fs::remove_file(&remote_db_path);
+            return Ok("Sync complete: Local vault restored from remote repository!".to_string());
+        }
+
         let conn = Connection::open(db_ref).map_err(|e| format!("Local database open error: {}", e))?;
         
         // Attach the remote database

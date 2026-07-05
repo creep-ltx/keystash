@@ -83,8 +83,9 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 
 * **TUI Dashboard (Default):**
   ```bash
-  keystash
+  keystash [--no-sync]
   ```
+  *(Pass `--no-sync` to start in offline mode and disable remote sync)*
 * **Initialize Vault:**
   ```bash
   keystash init
@@ -114,10 +115,16 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash add <Title> <Category> <Username> [URL]
   ```
   *(Prompt will safely hide your password keystrokes during entry)*
-* **Import from Bitwarden:**
+* **Import Credentials:**
   ```bash
-  keystash import-bitwarden <path/to/bitwarden_export.json>
+  keystash import <path/to/backup_file>
   ```
+  *(Detects and imports unencrypted formats: Bitwarden JSON, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV)*
+* **Export Credentials:**
+  ```bash
+  keystash export <path/to/output_file.csv>
+  ```
+  *(Decrypts and exports all vault entries to an unencrypted CSV file with restricted 0600 file permissions)*
 * **Delete a Secret:**
   ```bash
   keystash delete <ID>
@@ -131,12 +138,13 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash sync
   ```
-  *(Triggers a manual logical merge and push to origin/main)*
+  *(Triggers a manual logical merge and push to origin/main, or restores a missing local database)*
 * **Change Master Password (Key Rotation):**
   ```bash
   keystash change-password
   ```
   *(Decrypts all vault items using your old password and re-encrypts them with a newly derived key and salt)*
+
 
 ---
 
