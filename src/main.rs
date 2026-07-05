@@ -4,6 +4,7 @@ pub mod tui;
 pub mod import;
 pub mod sync;
 pub mod generator;
+pub mod audit;
 
 use std::env;
 use std::fs;
@@ -94,6 +95,7 @@ fn print_help() {
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
+    println!("  keystash audit                            Audit vault for weak/reused passwords");
     println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols]");
     println!("                                            Generate a random password (default: 20 chars, all charsets)");
     println!("  keystash change-password                  Change Master Password and rotate keys");
@@ -518,6 +520,91 @@ fn main() {
                 Ok(msg) => println!("{}", msg),
                 Err(err) => eprintln!("Sync Error: {}", err),
             }
+        }
+        "audit" => {
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            let records = match db::get_secrets(&conn) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error fetching secrets: {}", e);
+                    return;
+                }
+            };
+            if records.is_empty() {
+                println!("Vault is empty — nothing to audit.");
+                return;
+            }
+            // Decrypt passwords into plaintext tuples
+            let mut plaintext_records: Vec<(i64, String, String, String, String)> = records
+                .iter()
+                .filter_map(|r| {
+                    crypto::decrypt(&r.encrypted_password, &key)
+                        .ok()
+                        .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                        .map(|pw| (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw))
+                })
+                .collect();
+
+            let report = audit::audit_passwords(&mut plaintext_records);
+
+            // ── Print report ──
+            println!();
+            println!("  KeyStash Security Audit");
+            println!("  {} entries checked", report.critical_count + report.weak_count + report.good_count);
+            println!(
+                "  ✗ Critical: {}   ⚠ Weak: {}   ✓ Good: {}",
+                report.critical_count, report.weak_count, report.good_count
+            );
+            if !report.duplicate_groups.is_empty() {
+                println!("  ⚠ {} password reuse group(s) detected", report.duplicate_groups.len());
+            }
+            println!();
+            println!(
+                "  {:<4}  {:<22}  {:<14}  {:<22}  {:<8}  Issues",
+                "ID", "Title", "Category", "Username", "Strength"
+            );
+            println!("  {}", "-".repeat(100));
+
+            for entry in &report.entries {
+                let label = match entry.severity {
+                    audit::Severity::Critical => "[CRITICAL]",
+                    audit::Severity::Weak     => "[WEAK]    ",
+                    audit::Severity::Good     => "[GOOD]    ",
+                };
+                let issue_str = if entry.issues.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.issues.join("; ")
+                };
+                println!(
+                    "  {:<4}  {:<22}  {:<14}  {:<22}  {}  {}",
+                    entry.id,
+                    &entry.title[..entry.title.len().min(22)],
+                    &entry.category[..entry.category.len().min(14)],
+                    &entry.username[..entry.username.len().min(22)],
+                    label,
+                    issue_str
+                );
+            }
+            println!();
         }
         "show" | "view" => {
             if args.len() < 3 {

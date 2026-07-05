@@ -51,6 +51,7 @@ enum Screen {
     ExportTypeDialog,
     ExportDialog,
     GeneratorDialog,
+    AuditScreen,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,11 @@ pub struct TuiApp {
 
     // Help dialog scroll
     pub help_scroll: u16,
+
+    // Audit screen state
+    pub audit_report: Option<crate::audit::AuditReport>,
+    pub audit_scroll: usize,
+    pub audit_selected: usize,
 }
 
 impl TuiApp {
@@ -160,6 +166,9 @@ impl TuiApp {
             gen_options: crate::generator::GeneratorOptions::default(),
             gen_password: String::new(),
             help_scroll: 0,
+            audit_report: None,
+            audit_scroll: 0,
+            audit_selected: 0,
         }
     }
 
@@ -330,6 +339,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::ExportTypeDialog => handle_export_type_input(app, key.code),
                         Screen::ExportDialog => handle_export_input(app, key.code),
                         Screen::GeneratorDialog => handle_generator_input(app, key.code),
+                        Screen::AuditScreen => handle_audit_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -541,6 +551,27 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                 app.gen_password = pass;
             }
             app.screen = Screen::GeneratorDialog;
+        }
+        KeyCode::Char('A') => {
+            // Run audit — requires decrypted passwords
+            if let Some(key) = &app.key {
+                if let Ok(records) = crate::db::get_secrets(&app.conn) {
+                    let mut plaintext: Vec<(i64, String, String, String, String)> = records
+                        .iter()
+                        .filter_map(|r| {
+                            crate::crypto::decrypt(&r.encrypted_password, key)
+                                .ok()
+                                .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                                .map(|pw| (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw))
+                        })
+                        .collect();
+                    let report = crate::audit::audit_passwords(&mut plaintext);
+                    app.audit_scroll = 0;
+                    app.audit_selected = 0;
+                    app.audit_report = Some(report);
+                    app.screen = Screen::AuditScreen;
+                }
+            }
         }
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
@@ -998,6 +1029,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::ExportTypeDialog => draw_export_type_dialog(f, app),
         Screen::ExportDialog => draw_export_dialog(f, app),
         Screen::GeneratorDialog => draw_generator_dialog(f, app),
+        Screen::AuditScreen => draw_audit_screen(f, app),
     }
 }
 
@@ -1451,6 +1483,10 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(vec![
             Span::styled("  [g]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Open password generator (tweak & copy new passwords)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [Shift+A]     ", Style::default().fg(Color::Yellow)),
+            Span::styled("Run security audit (strength + duplicate detection)", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
@@ -1954,4 +1990,257 @@ fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(hints, chunks[7]);
 }
 
+// ─────────────────────────────────────────────
+//  Audit Screen
+// ─────────────────────────────────────────────
 
+fn handle_audit_input(app: &mut TuiApp, key: KeyCode) {
+    let entry_count = app
+        .audit_report
+        .as_ref()
+        .map(|r| r.entries.len())
+        .unwrap_or(0);
+
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.audit_selected > 0 {
+                app.audit_selected -= 1;
+                // Scroll up if needed
+                if app.audit_selected < app.audit_scroll {
+                    app.audit_scroll = app.audit_selected;
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.audit_selected + 1 < entry_count {
+                app.audit_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.audit_selected = app.audit_selected.saturating_sub(10);
+            if app.audit_selected < app.audit_scroll {
+                app.audit_scroll = app.audit_selected;
+            }
+        }
+        KeyCode::PageDown => {
+            app.audit_selected = (app.audit_selected + 10).min(entry_count.saturating_sub(1));
+        }
+        KeyCode::Home => {
+            app.audit_selected = 0;
+            app.audit_scroll = 0;
+        }
+        KeyCode::End => {
+            app.audit_selected = entry_count.saturating_sub(1);
+        }
+        _ => {}
+    }
+}
+
+fn draw_audit_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    use crate::audit::Severity;
+
+    let size = f.size();
+
+    let report = match &app.audit_report {
+        Some(r) => r,
+        None => return,
+    };
+
+    // ── Outer layout: header + body ──
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // summary header
+            Constraint::Min(0),    // list + detail
+        ])
+        .split(size);
+
+    // ── Summary header ──
+    let summary = Paragraph::new(Line::from(vec![
+        Span::styled("  🔍 Security Audit   ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("  ✗ Critical: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}  ", report.critical_count), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled("⚠ Weak: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}  ", report.weak_count), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("✓ Good: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}  ", report.good_count), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" ({} total checked)", report.entries.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(summary, outer[0]);
+
+    // ── Body: list (left) + detail panel (right) ──
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(55),
+            Constraint::Percentage(45),
+        ])
+        .split(outer[1]);
+
+    // ── Entry list ──
+    let visible_height = body[0].height.saturating_sub(2) as usize; // minus borders
+    // Update scroll to keep selected in view
+    let scroll = if app.audit_selected >= app.audit_scroll + visible_height {
+        app.audit_selected.saturating_sub(visible_height - 1)
+    } else {
+        app.audit_scroll
+    };
+
+    let items: Vec<ListItem> = report
+        .entries
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|(i, entry)| {
+            let selected = i == app.audit_selected;
+            let (icon, sev_color) = match entry.severity {
+                Severity::Critical => ("✗", Color::Red),
+                Severity::Weak     => ("⚠", Color::Yellow),
+                Severity::Good     => ("✓", Color::Green),
+            };
+            let title = if entry.title.len() > 24 {
+                format!("{}…", &entry.title[..23])
+            } else {
+                entry.title.clone()
+            };
+            let score_bar = {
+                let filled = entry.score as usize;
+                let empty  = 5usize.saturating_sub(filled);
+                format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", icon), Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<25}", title), Style::default().fg(if selected { Color::White } else { Color::Gray }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(score_bar, Style::default().fg(sev_color)),
+            ]);
+            if selected {
+                ListItem::new(line).style(Style::default().bg(Color::DarkGray))
+            } else {
+                ListItem::new(line)
+            }
+        })
+        .collect();
+
+    let list_title = format!(
+        " Entries [{}/{}] ",
+        app.audit_selected.saturating_add(1).min(report.entries.len()),
+        report.entries.len()
+    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .title(list_title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let list_widget = List::new(items).block(list_block);
+    f.render_widget(list_widget, body[0]);
+
+    // ── Detail panel ──
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Issues & Details ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let detail_content: Vec<Line> = if let Some(entry) = report.entries.get(app.audit_selected) {
+        let (sev_color, sev_label) = match entry.severity {
+            Severity::Critical => (Color::Red,    "CRITICAL"),
+            Severity::Weak     => (Color::Yellow, "WEAK"),
+            Severity::Good     => (Color::Green,  "GOOD"),
+        };
+
+        let score_bar = {
+            let filled = entry.score as usize;
+            let empty  = 5usize.saturating_sub(filled);
+            format!("Score: {}/5  [{}{}]", entry.score, "█".repeat(filled), "░".repeat(empty))
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  Title:    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(entry.title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Category: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(entry.category.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Username: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(entry.username.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Severity: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(sev_label, Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(score_bar, Style::default().fg(sev_color)),
+            ]),
+            Line::from(""),
+        ];
+
+        if entry.issues.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  ✓ No issues detected",
+                Style::default().fg(Color::Green),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Issues found:",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            for issue in &entry.issues {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", Style::default().fg(Color::Yellow)),
+                    Span::styled(issue.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Press [e] to edit this entry",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "  No entries in vault.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+
+    let detail_p = Paragraph::new(detail_content)
+        .block(detail_block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(detail_p, body[1]);
+
+    // ── Bottom hint bar ──
+    let hint_area = ratatui::layout::Rect {
+        x: size.x,
+        y: size.y + size.height - 1,
+        width: size.width,
+        height: 1,
+    };
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::Cyan)),
+        Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("PgUp/PgDn ", Style::default().fg(Color::Cyan)),
+        Span::styled("fast  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Home/End ", Style::default().fg(Color::Cyan)),
+        Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc/q ", Style::default().fg(Color::Red)),
+        Span::styled("back to dashboard", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(hints, hint_area);
+}
