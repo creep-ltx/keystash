@@ -3,6 +3,7 @@ pub mod db;
 pub mod tui;
 pub mod import;
 pub mod sync;
+pub mod generator;
 
 use std::env;
 use std::fs;
@@ -87,11 +88,14 @@ fn print_help() {
     println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
     println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
     println!("  keystash copy <id> [username|password|url] Copy entry's field to clipboard (default: password)");
+    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols] Generate a random password");
     println!("  keystash import <path>                    Import unencrypted logins (supports Bitwarden, Brave/Chrome, Firefox)");
     println!("  keystash export <path>                    Export all vault credentials to an unencrypted CSV file");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
+    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols]");
+    println!("                                            Generate a random password (default: 20 chars, all charsets)");
     println!("  keystash change-password                  Change Master Password and rotate keys");
     println!("  keystash help                             Show this help message");
 }
@@ -644,6 +648,54 @@ fn main() {
                     }
                 }
                 Err(e) => eprintln!("Error fetching secrets: {}", e),
+            }
+        }
+        "generate" | "gen" => {
+            let mut options = generator::GeneratorOptions::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-l" | "--length" => {
+                        if i + 1 < args.len() {
+                            if let Ok(l) = args[i + 1].parse::<usize>() {
+                                options.length = l;
+                            } else {
+                                eprintln!("Invalid length: {}", args[i + 1]);
+                                return;
+                            }
+                            i += 2;
+                        } else {
+                            eprintln!("Missing length value.");
+                            return;
+                        }
+                    }
+                    "--no-uppercase" => {
+                        options.use_uppercase = false;
+                        i += 1;
+                    }
+                    "--no-numbers" => {
+                        options.use_numbers = false;
+                        i += 1;
+                    }
+                    "--no-symbols" => {
+                        options.use_symbols = false;
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("Unknown option: {}", other);
+                        return;
+                    }
+                }
+            }
+
+            match generator::generate_password(&options) {
+                Ok(mut pass) => {
+                    println!("{}", pass);
+                    pass.zeroize();
+                }
+                Err(e) => {
+                    eprintln!("Error generating password: {}", e);
+                }
             }
         }
         "help" | "-h" | "--help" => {

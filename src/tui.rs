@@ -50,6 +50,7 @@ enum Screen {
     ImportDialog,
     ExportTypeDialog,
     ExportDialog,
+    GeneratorDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,10 @@ pub struct TuiApp {
     pub import_path_input: String,
     pub export_path_input: String,
     pub export_only_marked: bool,
+
+    // Password Generator State
+    pub gen_options: crate::generator::GeneratorOptions,
+    pub gen_password: String,
 }
 
 impl TuiApp {
@@ -149,6 +154,8 @@ impl TuiApp {
             import_path_input: String::new(),
             export_path_input: String::new(),
             export_only_marked: false,
+            gen_options: crate::generator::GeneratorOptions::default(),
+            gen_password: String::new(),
         }
     }
 
@@ -318,6 +325,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::ImportDialog => handle_import_input(app, key.code),
                         Screen::ExportTypeDialog => handle_export_type_input(app, key.code),
                         Screen::ExportDialog => handle_export_input(app, key.code),
+                        Screen::GeneratorDialog => handle_generator_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -522,6 +530,13 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
         KeyCode::Char('x') => {
             app.export_path_input.clear();
             app.screen = Screen::ExportTypeDialog;
+        }
+        KeyCode::Char('g') => {
+            app.gen_options = crate::generator::GeneratorOptions::default();
+            if let Ok(pass) = crate::generator::generate_password(&app.gen_options) {
+                app.gen_password = pass;
+            }
+            app.screen = Screen::GeneratorDialog;
         }
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
@@ -962,6 +977,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::ImportDialog => draw_import_dialog(f, app),
         Screen::ExportTypeDialog => draw_export_type_dialog(f, app),
         Screen::ExportDialog => draw_export_dialog(f, app),
+        Screen::GeneratorDialog => draw_generator_dialog(f, app),
     }
 }
 
@@ -1417,6 +1433,10 @@ fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
             Span::styled("  [x]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Export credentials (all or selected) to CSV", Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("  [g]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Open password generator (tweak & copy new passwords)", Style::default().fg(Color::White)),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
@@ -1685,4 +1705,166 @@ fn draw_export_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(warnings, chunks[2]);
 }
+
+// ─────────────────────────────────────────────
+//  Password Generator Dialog
+// ─────────────────────────────────────────────
+
+fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.gen_password.zeroize();
+            app.screen = Screen::Dashboard;
+        }
+        // Toggle options
+        KeyCode::Char('1') => {
+            app.gen_options.use_uppercase = !app.gen_options.use_uppercase;
+            regenerate_in_place(app);
+        }
+        KeyCode::Char('2') => {
+            app.gen_options.use_numbers = !app.gen_options.use_numbers;
+            regenerate_in_place(app);
+        }
+        KeyCode::Char('3') => {
+            app.gen_options.use_symbols = !app.gen_options.use_symbols;
+            regenerate_in_place(app);
+        }
+        // Adjust length
+        KeyCode::Left => {
+            if app.gen_options.length > 4 {
+                app.gen_options.length -= 1;
+                regenerate_in_place(app);
+            }
+        }
+        KeyCode::Right => {
+            if app.gen_options.length < 128 {
+                app.gen_options.length += 1;
+                regenerate_in_place(app);
+            }
+        }
+        // Regenerate with same options
+        KeyCode::Char('r') | KeyCode::Enter => {
+            regenerate_in_place(app);
+        }
+        // Copy to clipboard
+        KeyCode::Char('c') => {
+            let pass = app.gen_password.clone();
+            app.copy_to_clipboard(pass, "password");
+        }
+        // Fill current form field (if opened from form — future use)
+        _ => {}
+    }
+}
+
+fn regenerate_in_place(app: &mut TuiApp) {
+    // Ensure at least one charset is enabled
+    if !app.gen_options.use_uppercase
+        && !app.gen_options.use_numbers
+        && !app.gen_options.use_symbols
+        && app.gen_options.length > 0
+    {
+        // lowercase is always the baseline — never all-disabled
+    }
+    app.gen_password.zeroize();
+    match crate::generator::generate_password(&app.gen_options) {
+        Ok(pass) => app.gen_password = pass,
+        Err(e) => app.gen_password = format!("Error: {e}"),
+    }
+}
+
+fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let area = centered_rect(64, 50, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("  🎲 Password Generator  ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3), // Generated password display
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Length row
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Toggle: uppercase
+            Constraint::Length(1), // Toggle: numbers
+            Constraint::Length(1), // Toggle: symbols
+            Constraint::Min(0),    // Key hints
+        ])
+        .split(area);
+
+    // ── Password display ──
+    let pass_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let pass_widget = Paragraph::new(app.gen_password.as_str())
+        .style(pass_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(pass_widget, chunks[0]);
+
+    // ── Length row ──
+    let len_line = Line::from(vec![
+        Span::styled("  Length: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[←]", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {}  ", app.gen_options.length),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("[→]", Style::default().fg(Color::Cyan)),
+    ]);
+    f.render_widget(Paragraph::new(len_line), chunks[2]);
+
+    // ── Toggle rows ──
+    let toggle = |enabled: bool, label: &str, key: &str| -> Line {
+        let (icon, color) = if enabled {
+            ("✓ ON ", Color::Green)
+        } else {
+            ("✗ OFF", Color::Red)
+        };
+        Line::from(vec![
+            Span::styled(format!("  [{key}] "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{icon}"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
+        ])
+    };
+
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_uppercase, "Uppercase  (A-Z)", "1")),
+        chunks[4],
+    );
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_numbers, "Numbers    (0-9)", "2")),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_symbols, "Symbols    (!@#$…)", "3")),
+        chunks[6],
+    );
+
+    // ── Key hints ──
+    let hints = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[r/Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Regenerate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[c] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Copy  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("Close", Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(hints, chunks[7]);
+}
+
 
