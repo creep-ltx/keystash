@@ -327,6 +327,14 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = disable_raw_mode();
+        original_hook(panic_info);
+    }));
+
     let res = run_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;

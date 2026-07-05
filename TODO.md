@@ -32,3 +32,15 @@ This document outlines planned improvements, security enhancements, and user sug
 * **Implementation Plan**:
   * Support backup and restore using SFTP/SSH.
   * Add a configurable pre-exit/post-startup shell command hook (enabling easy `rclone` or custom backup script integration).
+
+### 5. 🗃️ RFC 4180 Compliant CSV Import Engine (Parser Update)
+* **Description**: Upgrade the CSV import engine to robustly handle complex records containing double-quotes and cell newlines.
+* **Implementation Plan**:
+  * Replace the manual line-by-line custom CSV parser in `import.rs` with the standard `csv` crate.
+  * Update logic to correctly parse fields containing double-quotes (`""`) and multi-line notes.
+
+### 6. 👥 Multi-User Vault Profiles
+* **Description**: Support maintaining multiple distinct vault databases (e.g. `work`, `personal`) within the configuration directory.
+* **Implementation Plan**:
+  * Add a `--profile <name>` CLI parameter to specify custom database filenames.
+  * Integrate an interactive profile manager screen/dropdown inside the TUI.

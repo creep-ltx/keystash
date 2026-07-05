@@ -45,7 +45,7 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
     }
 
     // Determine if we have remote commits we need to merge
-    let remote_db_path = dir.join("vault_remote.db");
+    let remote_db_path = dir.join(format!("vault_remote_{}.db", std::process::id()));
     
     // Cleanup any stale temporary files
     if remote_db_path.exists() {

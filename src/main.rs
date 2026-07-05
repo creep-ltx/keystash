@@ -115,13 +115,19 @@ fn main() {
         let secs: u64 = raw_args[2].parse().unwrap_or(10);
         let mut password = String::new();
         if std::io::stdin().read_to_string(&mut password).is_ok() {
-            let password_trimmed = password.trim_end();
+            let mut password_trimmed = password.trim_end().to_string();
+            password.zeroize();
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if clipboard.set_text(password_trimmed.to_string()).is_ok() {
+                if clipboard.set_text(password_trimmed.clone()).is_ok() {
                     std::thread::sleep(std::time::Duration::from_secs(secs));
-                    let _ = clipboard.set_text("");
+                    if let Ok(current_text) = clipboard.get_text() {
+                        if current_text == password_trimmed {
+                            let _ = clipboard.set_text("");
+                        }
+                    }
                 }
             }
+            password_trimmed.zeroize();
         }
         return;
     }
