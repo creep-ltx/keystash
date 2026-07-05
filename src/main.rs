@@ -10,6 +10,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use rpassword::read_password;
+use zeroize::Zeroize;
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 fn set_dir_permissions<P: AsRef<Path>>(path: P) {
@@ -19,6 +21,60 @@ fn set_dir_permissions<P: AsRef<Path>>(path: P) {
 
 #[cfg(not(unix))]
 fn set_dir_permissions<P: AsRef<Path>>(_path: P) {}
+
+fn copy_to_clipboard(text: String, label: &str) {
+    if text.trim().is_empty() {
+        eprintln!("Cannot copy: {} is empty!", label);
+        return;
+    }
+
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if child.is_err() {
+        child = Command::new("xclip")
+            .arg("-selection")
+            .arg("clipboard")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    if child.is_err() {
+        child = Command::new("xsel")
+            .arg("--clipboard")
+            .arg("--input")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    match child {
+        Ok(mut child_proc) => {
+            if let Some(mut stdin) = child_proc.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child_proc.wait();
+            println!("Copied {} to clipboard! Will clear in 10s.", label);
+
+            // Spawn background shell job to clear the clipboard after 10 seconds
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 10 && (wl-copy -c || xclip -selection clipboard /dev/null || xsel --clipboard --clear)")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        Err(_) => {
+            eprintln!("Failed to copy: No clipboard utility found (wl-copy, xclip, xsel).");
+        }
+    }
+}
 
 pub fn get_db_path() -> PathBuf {
     let mut path = if let Ok(home) = env::var("HOME") {
@@ -52,6 +108,8 @@ fn print_help() {
     println!("  keystash add <title> <category> <user> [url] Add a new secret to the database");
     println!("  keystash list [--reveal]                  List stored credentials (passwords masked by default)");
     println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
+    println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
+    println!("  keystash copy <id> [username|password|url] Copy entry's field to clipboard (default: password)");
     println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
@@ -380,6 +438,137 @@ fn main() {
             match sync::git_sync_vault(&db_path) {
                 Ok(msg) => println!("{}", msg),
                 Err(err) => eprintln!("Sync Error: {}", err),
+            }
+        }
+        "show" | "view" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash show <id> [--reveal]");
+                return;
+            }
+            let id: i64 = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("Invalid ID: {}", args[2]);
+                    return;
+                }
+            };
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
+            match db::get_secrets(&conn) {
+                Ok(records) => {
+                    if let Some(r) = records.into_iter().find(|rec| rec.id == id) {
+                        let decrypted_pass = if reveal {
+                            crypto::decrypt(&r.encrypted_password, &key)
+                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                .unwrap_or_else(|_| "<Error>".to_string())
+                        } else {
+                            "••••••••".to_string()
+                        };
+                        let decrypted_notes = if let Some(enc_notes) = &r.encrypted_notes {
+                            if reveal {
+                                crypto::decrypt(enc_notes, &key)
+                                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                    .unwrap_or_else(|_| "<Error>".to_string())
+                            } else {
+                                "••••••••".to_string()
+                            }
+                        } else {
+                            "[No Notes]".to_string()
+                        };
+
+                        println!("Secret Details (ID: {}):", r.id);
+                        println!("----------------------------------------");
+                        println!("Title:    {}", r.title);
+                        println!("Category: {}", r.category);
+                        println!("Username: {}", r.username);
+                        println!("URL:      {}", r.url);
+                        println!("Password: {}", decrypted_pass);
+                        println!("Notes:    {}", decrypted_notes);
+                        println!("Updated:  {}", r.updated_at);
+                        println!("----------------------------------------");
+                    } else {
+                        println!("Secret with ID {} not found.", id);
+                    }
+                }
+                Err(e) => eprintln!("Error fetching secrets: {}", e),
+            }
+        }
+        "copy" => {
+            if args.len() < 3 {
+                eprintln!("Usage: keystash copy <id> [username|password|url]");
+                return;
+            }
+            let id: i64 = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("Invalid ID: {}", args[2]);
+                    return;
+                }
+            };
+            let field = if args.len() >= 4 { args[3].as_str() } else { "password" };
+            let conn = match db::init_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database error: {}", e);
+                    return;
+                }
+            };
+            if db::is_first_run(&conn).unwrap_or(true) {
+                eprintln!("Vault is not initialized. Run `keystash init` first.");
+                return;
+            }
+            let master_pass = prompt_password("Enter Master Password: ");
+            let key = match db::unlock_vault(&conn, &master_pass) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    return;
+                }
+            };
+            match db::get_secrets(&conn) {
+                Ok(records) => {
+                    if let Some(r) = records.into_iter().find(|rec| rec.id == id) {
+                        let text_to_copy = match field {
+                            "username" | "user" => Some(r.username.clone()),
+                            "url" => Some(r.url.clone()),
+                            "password" | "pass" => {
+                                crypto::decrypt(&r.encrypted_password, &key)
+                                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                    .ok()
+                            }
+                            other => {
+                                eprintln!("Unknown copy target '{}'. Choose from: username, password, url.", other);
+                                None
+                            }
+                        };
+
+                        if let Some(mut text) = text_to_copy {
+                            copy_to_clipboard(text.clone(), field);
+                            text.zeroize();
+                        }
+                    } else {
+                        println!("Secret with ID {} not found.", id);
+                    }
+                }
+                Err(e) => eprintln!("Error fetching secrets: {}", e),
             }
         }
         "help" | "-h" | "--help" => {

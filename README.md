@@ -99,6 +99,16 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash search <query> [--reveal]
   ```
   *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext)*
+* **Show Detailed Secret:**
+  ```bash
+  keystash show <ID> [--reveal]
+  ```
+  *(Shows detailed fields of a secret; passwords and notes are masked by default unless `--reveal` or `-r` is provided)*
+* **Copy Secret Field to Clipboard:**
+  ```bash
+  keystash copy <ID> [username|password|url]
+  ```
+  *(Copies target field to system clipboard and automatically clears it after 10 seconds. Defaults to password)*
 * **Insert a Secret:**
   ```bash
   keystash add <Title> <Category> <Username> [URL]
