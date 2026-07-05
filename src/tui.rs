@@ -244,6 +244,15 @@ impl TuiApp {
                     format!("Copied {} to clipboard! Will clear in 10s.", label),
                     Instant::now(),
                 ));
+
+                // Spawn background shell job to clear the clipboard after 10 seconds
+                // This ensures it gets cleared even if the TUI is closed immediately
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg("sleep 10 && (wl-copy -c || xclip -selection clipboard /dev/null || xsel --clipboard --clear)")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
             }
             Err(_) => {
                 self.copied_message = Some((
@@ -257,24 +266,6 @@ impl TuiApp {
     fn clear_clipboard_if_expired(&mut self) {
         if let Some((_, instant)) = &self.copied_message {
             if instant.elapsed() >= Duration::from_secs(10) {
-                // Clear clipboard using wl-copy clear if available, or piping empty string
-                let _ = Command::new("wl-copy").arg("-c").spawn();
-                
-                // Fallback piping empty string to xclip
-                if let Ok(mut child) = Command::new("xclip")
-                    .arg("-selection")
-                    .arg("clipboard")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(b"");
-                    }
-                    let _ = child.wait();
-                }
-
                 self.copied_message = None;
             }
         }
