@@ -63,39 +63,8 @@ const COMMON_WEAK: &[&str] = &[
 /// Audit a list of decrypted passwords.
 ///
 /// `records` is `(id, title, category, username, plaintext_password)`.
-/// **Passwords are zeroized before the function returns.**
+/// Passwords are zeroized inside `run_full_audit` before the function returns.
 pub fn audit_passwords(records: &mut Vec<(i64, String, String, String, String)>) -> AuditReport {
-    // ── Step 1: strength audit per entry ──
-    let entries: Vec<AuditEntry> = records
-        .iter_mut()
-        .map(|(id, title, category, username, password)| {
-            let (severity, issues, score) = check_strength(password);
-            // zeroize the plaintext as soon as we're done with it
-            password.zeroize();
-            AuditEntry {
-                id: *id,
-                title: title.clone(),
-                category: category.clone(),
-                username: username.clone(),
-                severity,
-                issues,
-                score,
-            }
-        })
-        .collect();
-
-    // ── Step 2: duplicate detection ──
-    // We need the passwords again for hashing — but they've been zeroized above.
-    // So we re-derive duplicates from a hash map built *before* zeroizing.
-    // Strategy: collect SHA-256 digests of passwords in a first pass, then find dupes.
-    // Since we zeroized above already, we need to re-do this logic in one pass.
-    // → Re-architecture: do a single-pass scan collecting (sha256, entry_idx).
-    //
-    // However, because we already zeroized, we can't rehash. The solution is to
-    // collect the hash BEFORE zeroizing. We do that below by restructuring.
-    // This function is rebuilt properly — see the helper below.
-    let _ = entries; // will be replaced
-
     run_full_audit(records)
 }
 
