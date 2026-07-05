@@ -44,3 +44,24 @@ This document outlines planned improvements, security enhancements, and user sug
 * **Implementation Plan**:
   * Add a `--profile <name>` CLI parameter to specify custom database filenames.
   * Integrate an interactive profile manager screen/dropdown inside the TUI.
+
+---
+
+## 🏁 Recently Completed
+
+### Release v0.2.1 (Patches)
+- **TUI Panic Terminal Restoration**: Implemented standard crossterm panic handler to restore terminal settings on crashes.
+- **Clipboard Daemon Hardening**: Prevent overwriting clipboard if the user copies new text during the 10-second lifetime; zeroized sensitive buffers.
+- **Sync Collision Prevention**: Appended process ID to remote sync temporary database paths to avoid parallel file locking collisions.
+
+### Release v0.2.0 (Minor Features)
+- **Persistent HIBP Database Cache**: Added `hibp_checks` SQLite table to remember HaveIBeenPwned check results across sessions.
+- **Inline Security Auditing**: Retired the standalone audit screen and integrated security auditing summaries directly into the dashboard Detail Pane.
+- **Bulk HIBP Checks via `[h]`**: Made `[h]` run a rate-limited lookup loop for all marked secrets, automatically unmarking them as they finish.
+- **Password Generator Upgrades**:
+  * Filtered ambiguous characters (`l`, `I`, `|`, `0`, `O`, `1`) out of charsets.
+  * Added `generator.json` persistent configuration settings memory for both CLI and TUI.
+  * Integrated inline `Ctrl+G` password generator in Add/Edit forms.
+- **Non-blocking Startup Sync**: Moved initial Git sync off the TUI main thread to run asynchronously while users type their Master Password.
+- **Backward Keyboard Navigation**: Added `Shift+Tab` focus backward navigation across setup and form inputs.
+- **Zeroized Cryptographic Vectors**: Hardened heap safety using `Zeroizing<Vec<u8>>` wrappers for decrypted passwords.
