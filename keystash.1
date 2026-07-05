@@ -21,10 +21,10 @@ Bypass all Git synchronization processes (startup pull, database updates thread,
 Initialize a new local password vault database and configure your Master Password.
 .TP
 .B add \fItitle\fR \fIcategory\fR \fIusername\fR [\fIurl\fR]
-Insert a new credential. The CLI will securely prompt you for your password.
+Insert a new credential. The CLI will securely prompt you for your password. Double quotes are required for arguments containing spaces (e.g. keystash add "My Google Account" "Email" "user@gmail.com").
 .TP
 .B list [\-r|\-\-reveal]
-List all stored credentials in the vault. Passwords are masked by default unless \-r or \-\-reveal is supplied.
+List all stored credentials in the vault. Passwords are masked by default unless \-r or \-\-reveal is supplied. WARNING: Revealing all passwords dumps them in plaintext into the terminal scrollback buffer. Use with caution.
 .TP
 .B search \fIquery\fR [\-r|\-\-reveal]
 Search for matching credentials across titles, categories, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied.
@@ -138,6 +138,22 @@ DO NOT run "keystash init" on a secondary device. This will generate a different
   git branch -M main
   git pull origin main
 .fi
+.SH SECURITY CONSIDERATIONS
+.B Symmetric Encryption Split (Plaintext vs Encrypted Fields)
+.IP
+To support logical merging and search across multiple devices, only sensitive fields (password and notes) are encrypted. Database metadata—specifically title, category, username, url, and transaction timestamps—are stored in unencrypted plaintext inside the SQLite database file. Users should be aware that these plaintext metadata fields will be visible to anyone with read access to their private Git backup repository.
+.PP
+.B Clipboard Security
+.IP
+KeyStash automatically clears copied credentials from the system clipboard after 10 seconds. However, third-party clipboard history managers (like CopyQ or Klipper) can intercept and save copied text. You should configure these managers to ignore copy actions from the "keystash" binary.
+.PP
+.B Memory Cleansing
+.IP
+Master passwords and decryption keys are securely zeroized from RAM after use. TUI buffers are pre-allocated and cleared/zeroized in-place to prevent heap reallocation remnants.
+.PP
+.B Schema Migrations
+.IP
+Database schema integrity checks and upgrades are performed automatically on startup using a custom embedded migrations mechanism.
 .SH FILES
 .TP
 .I ~/.config/keystash/vault.db

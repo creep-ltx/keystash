@@ -4,13 +4,6 @@
 
 ---
 
-## 📂 Vault Database Storage Path
-
-Your credentials database is stored offline inside your user config folder:
-* **Linux/macOS:** `~/.config/keystash/vault.db`
-
----
-
 ## 🛠️ Features
 
 ### 🖥️ Interactive TUI Dashboard
@@ -27,39 +20,7 @@ For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` expos
 
 ---
 
-## 🔒 Security & Cryptographic Model
-
-1. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit symmetric key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and saved in the database.
-2. **XChaCha20-Poly1305 AEAD:** Sensitive columns (`password` and `notes`) are encrypted individually before being stored. Every column write generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
-3. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
-4. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
-5. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
-
----
-
-## 🚀 Keyboard Shortcuts (TUI)
-
-| Key | Action |
-|:---|:---|
-| `[Tab]` | Toggle focus between panels (Categories ➔ Credentials ➔ Details) |
-| `[↑]` / `[↓]` | Scroll up/down through lists |
-| `[PgUp]` / `[PgDn]` | Page up/down (moves selection by 10 items in secrets, 5 items in categories) |
-| `[Space]` | Mark / Unmark selected credential |
-| `[/]` | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
-| `[v]` | Toggle password visibility in detail pane |
-| `[c]` | Copy username to clipboard (clears in 10s) |
-| `[p]` | Copy decrypted password to clipboard (clears in 10s) |
-| `[u]` | Copy website URL to clipboard (clears in 10s) |
-| `[a]` | Add new credential |
-| `[e]` | Edit selected credential |
-| `[d]` | Delete credential (opens verification modal) |
-| `[i]` | Import unencrypted credentials from backups |
-| `[x]` | Export credentials (all or selected) to CSV |
-| `[Esc]` | Cancel form, exit modal, or close the application |
-
----
-
-## 📥 Installation
+## 📥 Installation & Vault Path
 
 ### 1. Install via Crates.io (Recommended)
 You can install the latest released binary directly from the official Rust package registry:
@@ -85,6 +46,32 @@ mkdir -p ~/.local/share/man/man1
 cp keystash.1 ~/.local/share/man/man1/
 ```
 
+### 📂 Vault Database Storage Path
+Your credentials database is stored offline inside your user config folder:
+* **Linux/macOS:** `~/.config/keystash/vault.db`
+
+---
+
+## 🚀 Keyboard Shortcuts (TUI)
+
+| Key | Action |
+| :--- | :--- |
+| **`[Tab]`** | Toggle focus between panels (Categories ➔ Credentials ➔ Details) |
+| **`[↑]` / `[↓]`** | Scroll up/down through lists |
+| **`[PgUp]` / `[PgDn]`** | Page up/down (moves selection by 10 items in secrets, 5 items in categories) |
+| **`[Space]`** | Mark / Unmark selected credential |
+| **`[/]`** | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
+| **`[v]`** | Toggle password visibility in detail pane |
+| **`[c]`** | Copy username to clipboard (clears in 10s) |
+| **`[p]`** | Copy decrypted password to clipboard (clears in 10s) |
+| **`[u]`** | Copy website URL to clipboard (clears in 10s) |
+| **`[a]`** | Add new credential |
+| **`[e]`** | Edit selected credential |
+| **`[d]`** | Delete credential (opens verification modal) |
+| **`[i]`** | Import unencrypted credentials from backups |
+| **`[x]`** | Export credentials (all or selected) to CSV |
+| **`[Esc]`** | Cancel form, exit modal, or close the application |
+
 ---
 
 ## 💻 CLI Subcommand Reference
@@ -105,6 +92,8 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash list [--reveal]
   ```
   *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext)*
+  > [!WARNING]
+  > Running `keystash list --reveal` outputs all decrypted credentials in plaintext directly into your terminal scrollback buffer. Use with caution or pipe it to `less` to prevent screen/scrollback logs exposure.
 * **Search Vault:**
   ```bash
   keystash search <query> [--reveal]
@@ -124,7 +113,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash add <Title> <Category> <Username> [URL]
   ```
-  *(Prompt will safely hide your password keystrokes during entry)*
+  *Note: Double quotes are mandatory for arguments containing spaces (e.g. `keystash add "My Google Account" "Email" "user@gmail.com"`)*
 * **Import Credentials:**
   ```bash
   keystash import <path/to/backup_file>
@@ -155,6 +144,20 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```
   *(Decrypts all vault items using your old password and re-encrypts them with a newly derived key and salt)*
 
+---
+
+## 🔒 Security & Cryptographic Model
+
+1. **Symmetric Encryption Split (Plaintext vs Encrypted Fields):**
+   To support logical merging and search across multiple devices, **only sensitive fields (`password` and `notes`) are encrypted**. Database metadata—specifically `title`, `category`, `username`, `url`, and transaction timestamps—are stored in **unencrypted plaintext** inside the SQLite file.
+   > [!IMPORTANT]
+   > Because metadata is stored in plaintext, users must be aware that repository names, websites, categories, and usernames will be visible to anyone with read access to their private Git backup repository.
+2. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit symmetric key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and saved in the database.
+3. **XChaCha20-Poly1305 AEAD:** The sensitive fields are encrypted individually before being stored. Every column write generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
+4. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
+5. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
+6. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
+7. **Schema Migrations:** Database schema integrity checks and upgrades are performed automatically on startup using a custom embedded migrations mechanism.
 
 ---
 
