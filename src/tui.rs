@@ -113,6 +113,9 @@ pub struct TuiApp {
     // Password Generator State
     pub gen_options: crate::generator::GeneratorOptions,
     pub gen_password: String,
+
+    // Help dialog scroll
+    pub help_scroll: u16,
 }
 
 impl TuiApp {
@@ -156,6 +159,7 @@ impl TuiApp {
             export_only_marked: false,
             gen_options: crate::generator::GeneratorOptions::default(),
             gen_password: String::new(),
+            help_scroll: 0,
         }
     }
 
@@ -824,8 +828,24 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
 
 fn handle_help_input(app: &mut TuiApp, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Char(' ') => {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('?') => {
+            app.help_scroll = 0;
             app.screen = Screen::Dashboard;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            app.help_scroll = app.help_scroll.saturating_sub(5);
+        }
+        KeyCode::PageDown => {
+            app.help_scroll = app.help_scroll.saturating_add(5);
+        }
+        KeyCode::Home => {
+            app.help_scroll = 0;
         }
         _ => {}
     }
@@ -1367,17 +1387,12 @@ fn draw_confirmation_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(confirm_p, area);
 }
 
-fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
+fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     let size = f.size();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Help & Keybindings")
-        .border_style(Style::default().fg(Color::Green));
-
-    let area = centered_rect(70, 75, size);
+    let area = centered_rect(70, 85, size);
     f.render_widget(Clear, area);
 
-    let help_text = vec![
+    let help_text: Vec<Line> = vec![
         Line::from(Span::styled("Navigation & Selection:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
             Span::styled("  [Tab]         ", Style::default().fg(Color::Yellow)),
@@ -1452,14 +1467,86 @@ fn draw_help_dialog(f: &mut ratatui::Frame, _app: &TuiApp) {
             Span::styled("Copy website URL to clipboard", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Press [Esc] / [Enter] / [h] to close help dialog", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("Git Sync:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  [s]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("Force manual sync with Git remote", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Other:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  [?] / [h]     ", Style::default().fg(Color::Yellow)),
+            Span::styled("Open this help screen", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [q] / [Esc]   ", Style::default().fg(Color::Yellow)),
+            Span::styled("Quit KeyStash", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Scroll with [↑]/[↓] · [PgUp]/[PgDn] · [Home]", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  Press [Esc] or [h] to close", Style::default().fg(Color::DarkGray))),
     ];
+
+    // Calculate total lines and clamp scroll
+    let total_lines = help_text.len() as u16;
+    // inner height = area height minus 2 border rows minus 1 footer row
+    let inner_h = area.height.saturating_sub(3);
+    let max_scroll = total_lines.saturating_sub(inner_h);
+    let scroll = app.help_scroll.min(max_scroll);
+
+    // Build a dynamic title showing scroll position
+    let title = if max_scroll > 0 {
+        format!(" Help & Keybindings  [{}/{}] ", scroll + 1, total_lines)
+    } else {
+        " Help & Keybindings ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    // Bottom hint bar
+    let hint_area = ratatui::layout::Rect {
+        x: area.x + 1,
+        y: area.y + area.height - 2,
+        width: area.width - 2,
+        height: 1,
+    };
+
+    let scroll_hint = if max_scroll > 0 {
+        Line::from(vec![
+            Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
+            Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/PgDn ", Style::default().fg(Color::Cyan)),
+            Span::styled("fast scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Home ", Style::default().fg(Color::Cyan)),
+            Span::styled("top  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Red)),
+            Span::styled("close", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Esc ", Style::default().fg(Color::Red)),
+            Span::styled("/ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("h ", Style::default().fg(Color::Red)),
+            Span::styled("to close", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    // Content area excludes the last 1 row (hint bar)
+    let content_area = ratatui::layout::Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
 
     let help_p = Paragraph::new(help_text)
         .block(block)
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
-    f.render_widget(help_p, area);
+    f.render_widget(help_p, content_area);
+    f.render_widget(Paragraph::new(scroll_hint), hint_area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
