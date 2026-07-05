@@ -23,9 +23,17 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
 
     // 1. Run git fetch to see if remote changes exist
     let fetch_status = Command::new("git")
+        .arg("-c")
+        .arg("connection.timeout=5")
+        .arg("-c")
+        .arg("http.lowSpeedLimit=1000")
+        .arg("-c")
+        .arg("http.lowSpeedTime=5")
         .arg("fetch")
         .arg("origin")
         .arg("main")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=5 -o ConnectionAttempts=1")
         .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -68,7 +76,8 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
         
         // Attach the remote database
         let remote_path_str = remote_db_path.to_string_lossy();
-        conn.execute(&format!("ATTACH DATABASE '{}' AS remote_db", remote_path_str), [])
+        let escaped_path = remote_path_str.replace('\'', "''");
+        conn.execute(&format!("ATTACH DATABASE '{}' AS remote_db", escaped_path), [])
             .map_err(|e| format!("Failed to attach remote database: {}", e))?;
 
         // Start Transaction
@@ -178,9 +187,17 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P) -> Result<String, String> {
 
     // Run push to update remote repository state
     let push_status = Command::new("git")
+        .arg("-c")
+        .arg("connection.timeout=5")
+        .arg("-c")
+        .arg("http.lowSpeedLimit=1000")
+        .arg("-c")
+        .arg("http.lowSpeedTime=5")
         .arg("push")
         .arg("origin")
         .arg("main")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=5 -o ConnectionAttempts=1")
         .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

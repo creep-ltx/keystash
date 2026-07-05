@@ -539,8 +539,9 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
                 if let Some(key) = &app.key {
                     if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
-                        if let Ok(plaintext) = String::from_utf8(dec) {
-                            app.copy_to_clipboard(plaintext, "password");
+                        if let Ok(mut plaintext) = String::from_utf8(dec.to_vec()) {
+                            app.copy_to_clipboard(plaintext.clone(), "password");
+                            plaintext.zeroize();
                         }
                     }
                 }

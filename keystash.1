@@ -19,11 +19,11 @@ Initialize a new local password vault database and configure your Master Passwor
 .B add \fItitle\fR \fIcategory\fR \fIusername\fR [\fIurl\fR]
 Insert a new credential. The CLI will securely prompt you for your password.
 .TP
-.B list
-List all decrypted credentials stored in the vault.
+.B list [\-r|\-\-reveal]
+List all stored credentials in the vault. Passwords are masked by default unless \-r or \-\-reveal is supplied.
 .TP
-.B search \fIquery\fR
-Search for matching credentials across titles, categories, usernames, or URLs.
+.B search \fIquery\fR [\-r|\-\-reveal]
+Search for matching credentials across titles, categories, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied.
 .TP
 .B import-bitwarden \fIpath/to/bitwarden_export.json\fR
 Import folders and login credentials from an unencrypted Bitwarden JSON export.

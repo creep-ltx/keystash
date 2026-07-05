@@ -91,12 +91,14 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```
 * **List Decrypted Credentials:**
   ```bash
-  keystash list
+  keystash list [--reveal]
   ```
+  *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext)*
 * **Search Vault:**
   ```bash
-  keystash search <query>
+  keystash search <query> [--reveal]
   ```
+  *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext)*
 * **Insert a Secret:**
   ```bash
   keystash add <Title> <Category> <Username> [URL]

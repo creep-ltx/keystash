@@ -40,8 +40,8 @@ fn print_help() {
     println!("  keystash [tui]                            Start the interactive TUI (default)");
     println!("  keystash init                             Initialize the password vault");
     println!("  keystash add <title> <category> <user> [url] Add a new secret to the database");
-    println!("  keystash list                             List all stored credentials");
-    println!("  keystash search <query>                   Search stored credentials");
+    println!("  keystash list [--reveal]                  List stored credentials (passwords masked by default)");
+    println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
     println!("  keystash import-bitwarden <path>          Import unencrypted Bitwarden JSON export");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
@@ -158,14 +158,20 @@ fn main() {
                     return;
                 }
             };
+            let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
             match db::get_secrets(&conn) {
                 Ok(records) => {
-                    println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | Password", "ID", "Title", "Category", "Username", "URL");
+                    let pass_header = if reveal { "Password" } else { "Password (Masked)" };
+                    println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Category", "Username", "URL", pass_header);
                     println!("{}", "-".repeat(100));
                     for r in records {
-                        let decrypted_pass = crypto::decrypt(&r.encrypted_password, &key)
-                            .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                            .unwrap_or_else(|_| "<Error>".to_string());
+                        let decrypted_pass = if reveal {
+                            crypto::decrypt(&r.encrypted_password, &key)
+                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                .unwrap_or_else(|_| "<Error>".to_string())
+                        } else {
+                            "••••••••".to_string()
+                        };
                         println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
                     }
                 }
@@ -173,11 +179,16 @@ fn main() {
             }
         }
         "search" => {
-            if args.len() < 3 {
-                eprintln!("Usage: keystash search <query>");
-                return;
-            }
-            let query = args[2].to_lowercase();
+            let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
+            // Find query by skipping flags
+            let query_opt = args.iter().skip(2).find(|arg| *arg != "--reveal" && *arg != "-r" && !arg.starts_with('-'));
+            let query = match query_opt {
+                Some(q) => q.to_lowercase(),
+                None => {
+                    eprintln!("Usage: keystash search <query> [--reveal]");
+                    return;
+                }
+            };
             let conn = match db::init_db(&db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -212,12 +223,17 @@ fn main() {
                     if filtered.is_empty() {
                         println!("No credentials matching '{}' found.", query);
                     } else {
-                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | Password", "ID", "Title", "Category", "Username", "URL");
+                        let pass_header = if reveal { "Password" } else { "Password (Masked)" };
+                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Category", "Username", "URL", pass_header);
                         println!("{}", "-".repeat(100));
                         for r in filtered {
-                            let decrypted_pass = crypto::decrypt(&r.encrypted_password, &key)
-                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                                .unwrap_or_else(|_| "<Error>".to_string());
+                            let decrypted_pass = if reveal {
+                                crypto::decrypt(&r.encrypted_password, &key)
+                                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
+                                    .unwrap_or_else(|_| "<Error>".to_string())
+                            } else {
+                                "••••••••".to_string()
+                            };
                             println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
                         }
                     }

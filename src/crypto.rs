@@ -23,7 +23,7 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
 /// Derives a 256-bit key from the master password and a salt using Argon2id.
 pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let mut derived_key = [0u8; KEY_LEN];
-    let params = Params::new(15360, 2, 1, Some(KEY_LEN)).map_err(|e| e.to_string())?;
+    let params = Params::new(65536, 3, 4, Some(KEY_LEN)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         Version::V0x13,
@@ -57,7 +57,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String>
 }
 
 /// Decrypts a combined payload containing `nonce (24 bytes) + ciphertext`.
-pub fn decrypt(encrypted_data: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String> {
+pub fn decrypt(encrypted_data: &[u8], key: &[u8; KEY_LEN]) -> Result<Zeroizing<Vec<u8>>, String> {
     if encrypted_data.len() < NONCE_LEN {
         return Err("Encrypted data is too short".to_string());
     }
@@ -70,5 +70,5 @@ pub fn decrypt(encrypted_data: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>, St
         .decrypt(nonce, ciphertext)
         .map_err(|e| e.to_string())?;
 
-    Ok(decrypted)
+    Ok(Zeroizing::new(decrypted))
 }

@@ -144,7 +144,7 @@ pub fn unlock_vault(conn: &Connection, master_password: &str) -> Result<Zeroizin
     let decrypted = crypto::decrypt(&encrypted_token, &key)
         .map_err(|_| "Incorrect master password.".to_string())?;
 
-    if decrypted == b"keystash-verification-token" {
+    if *decrypted == b"keystash-verification-token" {
         Ok(key)
     } else {
         Err("Incorrect master password.".to_string())
