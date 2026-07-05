@@ -28,51 +28,28 @@ fn copy_to_clipboard(text: String, label: &str) {
         return;
     }
 
-    let mut child = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if child.is_err() {
-        child = Command::new("xclip")
-            .arg("-selection")
-            .arg("clipboard")
+    if let Ok(exe) = env::current_exe() {
+        let child = Command::new(exe)
+            .arg("__internal-clear-clipboard")
+            .arg("10")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
-    }
 
-    if child.is_err() {
-        child = Command::new("xsel")
-            .arg("--clipboard")
-            .arg("--input")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-
-    match child {
-        Ok(mut child_proc) => {
-            if let Some(mut stdin) = child_proc.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+        match child {
+            Ok(mut child_proc) => {
+                if let Some(mut stdin) = child_proc.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                println!("Copied {} to clipboard! Will clear in 10s.", label);
             }
-            let _ = child_proc.wait();
-            println!("Copied {} to clipboard! Will clear in 10s.", label);
-
-            // Spawn background shell job to clear the clipboard after 10 seconds
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg("sleep 10 && (wl-copy -c || xclip -selection clipboard /dev/null || xsel --clipboard --clear)")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+            Err(_) => {
+                eprintln!("Failed to spawn clipboard manager process.");
+            }
         }
-        Err(_) => {
-            eprintln!("Failed to copy: No clipboard utility found (wl-copy, xclip, xsel).");
-        }
+    } else {
+        eprintln!("Failed to locate KeyStash executable path.");
     }
 }
 
@@ -121,6 +98,21 @@ fn print_help() {
 
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
+    if raw_args.len() >= 3 && raw_args[1] == "__internal-clear-clipboard" {
+        use std::io::Read;
+        let secs: u64 = raw_args[2].parse().unwrap_or(10);
+        let mut password = String::new();
+        if std::io::stdin().read_to_string(&mut password).is_ok() {
+            let password_trimmed = password.trim_end();
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if clipboard.set_text(password_trimmed.to_string()).is_ok() {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    let _ = clipboard.set_text("");
+                }
+            }
+        }
+        return;
+    }
     let no_sync = raw_args.iter().any(|arg| arg == "--no-sync");
     let args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--no-sync").collect();
     let db_path = get_db_path();

@@ -15,7 +15,7 @@ use zeroize::{Zeroize, Zeroizing};
 use std::cell::RefCell;
 use rusqlite::Connection;
 use std::{
-    io::{self, Write},
+    io,
     time::{Duration, Instant},
     collections::HashSet,
     process::{Command, Stdio},
@@ -205,61 +205,38 @@ impl TuiApp {
             return;
         }
 
-        // Try wl-copy (Wayland native)
-        let mut child = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        // Fallback to xclip (X11) if wl-copy is not available/fails
-        if child.is_err() {
-            child = Command::new("xclip")
-                .arg("-selection")
-                .arg("clipboard")
+        if let Ok(exe) = std::env::current_exe() {
+            let child = Command::new(exe)
+                .arg("__internal-clear-clipboard")
+                .arg("10")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn();
-        }
 
-        // Fallback to xsel if xclip fails too
-        if child.is_err() {
-            child = Command::new("xsel")
-                .arg("--clipboard")
-                .arg("--input")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        }
-
-        match child {
-            Ok(mut child_proc) => {
-                if let Some(mut stdin) = child_proc.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
+            match child {
+                Ok(mut child_proc) => {
+                    use std::io::Write;
+                    if let Some(mut stdin) = child_proc.stdin.take() {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    self.copied_message = Some((
+                        format!("Copied {} to clipboard! Will clear in 10s.", label),
+                        Instant::now(),
+                    ));
                 }
-                let _ = child_proc.wait();
-                self.copied_message = Some((
-                    format!("Copied {} to clipboard! Will clear in 10s.", label),
-                    Instant::now(),
-                ));
-
-                // Spawn background shell job to clear the clipboard after 10 seconds
-                // This ensures it gets cleared even if the TUI is closed immediately
-                let _ = Command::new("sh")
-                    .arg("-c")
-                    .arg("sleep 10 && (wl-copy -c || xclip -selection clipboard /dev/null || xsel --clipboard --clear)")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
+                Err(_) => {
+                    self.copied_message = Some((
+                        "Failed to spawn clipboard manager process.".to_string(),
+                        Instant::now(),
+                    ));
+                }
             }
-            Err(_) => {
-                self.copied_message = Some((
-                    "Failed to copy: No clipboard utility found (wl-copy, xclip, xsel).".to_string(),
-                    Instant::now(),
-                ));
-            }
+        } else {
+            self.copied_message = Some((
+                "Failed to locate KeyStash executable path.".to_string(),
+                Instant::now(),
+            ));
         }
     }
 

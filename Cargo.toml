@@ -1,6 +1,6 @@
 [package]
 name = "keystash"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A secure offline TUI and CLI password manager featuring logical Git sync"
 license = "MIT"
@@ -9,6 +9,7 @@ readme = "README.md"
 
 
 [dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
 ratatui = "0.26"
 crossterm = { version = "0.27", features = ["event-stream"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -221,10 +221,10 @@ You can now run `keystash` on Device B, enter your existing Master Password, and
 
 ## 📦 Dependencies
 
-KeyStash relies exclusively on safe and audited pure-Rust libraries:
+KeyStash relies exclusively on safe and audited Rust libraries:
 - `ratatui` & `crossterm` for drawing interactive terminal screens.
 - `rusqlite` (with bundled features) for local SQLite database integrations.
 - `chacha20poly1305` & `argon2` for modern cryptography.
-- System clipboard utilities (`wl-copy`, `xclip`, `xsel`) for native Wayland and X11 clipboard integration.
+- `arboard` for native Wayland and X11 clipboard integration (requires zero external system utilities).
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.
