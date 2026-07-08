@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+- Feat: Full-database encryption via SQLCipher, replacing the previous scheme where only the `password`/`notes` fields were encrypted (`title`/`category`/`username`/`url` were plaintext columns). The whole vault file is now opaque at rest.
+- Feat: Automatic one-time migration of existing vaults to the new encrypted format on first unlock; the pre-migration file is kept as a backup rather than deleted.
+- Fix: Sync conflict resolution now re-runs the full logical merge afterward instead of only staging/committing/pushing directly, so unrelated concurrent changes from another device (new records, non-conflicting edits, deletions) are no longer silently dropped when a conflict is resolved.
+- Fix: Background sync could race with the exit-time sync when the app was unlocked and quit again quickly, leaving the vault in an inconsistent state with no error shown. The two are now serialized.
+- Fix: The Argon2id salt sidecar file is now synced via git alongside the vault database, so a second device can actually derive the right key to unlock an already-migrated vault (previously only the database file was tracked).
+- Fix: Sync now recovers automatically when the remote copy can't be read with the current key (e.g. an unmigrated or otherwise incompatible copy) by backing it up locally and pushing the local vault as the new source of truth, instead of failing.
+
 ## [0.2.5] - 2026-07-05
 - Feat: Auto-lock idle timeout for persistent TuiApp sessions
 - Feat: Real-time password strength meter in Add/Edit forms

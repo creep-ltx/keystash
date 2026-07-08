@@ -84,6 +84,44 @@ fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     zeroize::Zeroizing::new(read_password().unwrap_or_default())
 }
 
+/// Prompts for the master password and opens the vault at `db_path`, transparently
+/// migrating a pre-SQLCipher legacy vault (encrypted-columns-only, plaintext
+/// schema) to the new whole-database SQLCipher format first if needed. Shared by
+/// every CLI subcommand that operates on an existing vault, since opening it now
+/// requires the key up front rather than being possible before a password prompt.
+fn open_or_migrate_vault(db_path: &Path) -> Option<(rusqlite::Connection, zeroize::Zeroizing<[u8; 32]>)> {
+    match db::detect_vault_state(db_path) {
+        db::VaultState::New => {
+            eprintln!("Vault is not initialized. Run `keystash init` first.");
+            None
+        }
+        db::VaultState::NeedsMigration => {
+            println!("Legacy vault detected -- migrating to the new encrypted database format.");
+            let master_pass = prompt_password("Enter Master Password: ");
+            match db::migrate_legacy_vault(db_path, &master_pass) {
+                Ok(pair) => {
+                    println!("Migration complete. The previous vault file was kept as a backup.");
+                    Some(pair)
+                }
+                Err(e) => {
+                    eprintln!("Migration failed: {}", e);
+                    None
+                }
+            }
+        }
+        db::VaultState::Ready => {
+            let master_pass = prompt_password("Enter Master Password: ");
+            match db::open_vault(db_path, &master_pass) {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    eprintln!("Unlock failed: {}", e);
+                    None
+                }
+            }
+        }
+    }
+}
+
 fn print_help() {
     println!("KeyStash 🔑 - Secure Offline Password Manager");
     println!();
@@ -145,25 +183,29 @@ fn main() {
     }
 
     if args.len() < 2 {
-        start_tui(&db_path, no_sync);
+        start_tui(no_sync);
         return;
     }
 
     match args[1].as_str() {
         "tui" => {
-            start_tui(&db_path, no_sync);
+            start_tui(no_sync);
         }
         "init" => {
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to initialize database: {}", e);
+            match db::detect_vault_state(&db_path) {
+                db::VaultState::Ready => {
+                    println!("Vault is already initialized at {:?}", db_path);
                     return;
                 }
-            };
-            if !db::is_first_run(&conn).unwrap_or(true) {
-                println!("Vault is already initialized at {:?}", db_path);
-                return;
+                db::VaultState::NeedsMigration => {
+                    // Reuse the same migration path as every other command; init's
+                    // job here is just to get an old vault onto the new format.
+                    if open_or_migrate_vault(&db_path).is_some() {
+                        println!("Vault at {:?} is now on the new encrypted format.", db_path);
+                    }
+                    return;
+                }
+                db::VaultState::New => {}
             }
             let pass = prompt_password("Set Master Password: ");
             let confirm = prompt_password("Confirm Master Password: ");
@@ -171,7 +213,7 @@ fn main() {
                 eprintln!("Passwords do not match.");
                 return;
             }
-            match db::setup_vault(&conn, &pass) {
+            match db::create_vault(&db_path, &pass) {
                 Ok(_) => println!("Vault successfully initialized at {:?}", db_path),
                 Err(e) => eprintln!("Initialization failed: {}", e),
             }
@@ -181,24 +223,9 @@ fn main() {
                 eprintln!("Usage: keystash add <title> <category> <username> [url]");
                 return;
             }
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             let pass = prompt_password("Enter Secret Password: ");
             print!("Enter Notes (optional): ");
@@ -224,24 +251,9 @@ fn main() {
             }
         }
         "list" => {
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
             match db::get_secrets(&conn) {
@@ -274,24 +286,9 @@ fn main() {
                     return;
                 }
             };
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             match db::get_secrets(&conn) {
                 Ok(records) => {
@@ -338,18 +335,10 @@ fn main() {
                     return;
                 }
             };
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
+            let (conn, _key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
-            let master_pass = prompt_password("Enter Master Password: ");
-            if let Err(e) = db::unlock_vault(&conn, &master_pass) {
-                eprintln!("Unlock failed: {}", e);
-                return;
-            }
             match db::delete_secret(&conn, id) {
                 Ok(_) => println!("Secret successfully deleted."),
                 Err(e) => eprintln!("Error deleting secret: {}", e),
@@ -361,14 +350,7 @@ fn main() {
                 return;
             }
             let file_path = &args[2];
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
+            if db::detect_vault_state(&db_path) == db::VaultState::New {
                 eprintln!("Vault is not initialized. Run `keystash init` first.");
                 return;
             }
@@ -391,13 +373,9 @@ fn main() {
                 return;
             }
 
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
 
             let import_result = match detected_format {
@@ -414,7 +392,7 @@ fn main() {
                     println!("Success: Imported {} items from {}!", count, detected_format.name());
                     if sync::is_git_configured(&db_path) {
                         println!("Syncing updates to Git remote...");
-                        let _ = sync::git_sync_vault(&db_path);
+                        let _ = sync::git_sync_vault(&db_path, &key);
                     }
                 }
                 Err(e) => eprintln!("Import failed: {}", e),
@@ -426,14 +404,7 @@ fn main() {
                 return;
             }
             let output_path = &args[2];
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
+            if db::detect_vault_state(&db_path) == db::VaultState::New {
                 eprintln!("Vault is not initialized. Run `keystash init` first.");
                 return;
             }
@@ -448,13 +419,9 @@ fn main() {
                 return;
             }
 
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
 
             println!("Decrypting and exporting vault records to CSV...");
@@ -473,11 +440,25 @@ fn main() {
             let mut answer = String::new();
             let _ = io::stdin().read_line(&mut answer);
             if answer.trim().to_lowercase() == "y" {
-                if db_path.exists() {
-                    match fs::remove_file(&db_path) {
-                        Ok(_) => println!("Vault database successfully deleted. You can run `keystash init` to create a new one."),
-                        Err(e) => eprintln!("Failed to delete vault file: {}", e),
+                // Also remove the salt sidecar and WAL/SHM journal sidecars, so a
+                // reset can't leave a stale vault.salt behind that would silently
+                // make the next `init` create a blank vault under a mismatched key.
+                let mut removed_any = false;
+                for path in [
+                    db_path.clone(),
+                    db_path.with_file_name("vault.db-wal"),
+                    db_path.with_file_name("vault.db-shm"),
+                    db_path.with_file_name("vault.salt"),
+                ] {
+                    if path.exists() {
+                        match fs::remove_file(&path) {
+                            Ok(_) => removed_any = true,
+                            Err(e) => eprintln!("Failed to delete {:?}: {}", path, e),
+                        }
                     }
+                }
+                if removed_any {
+                    println!("Vault database successfully deleted. You can run `keystash init` to create a new one.");
                 } else {
                     println!("No database file existed at {:?}", db_path);
                 }
@@ -486,24 +467,9 @@ fn main() {
             }
         }
         "change-password" => {
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let old_pass = prompt_password("Enter Current Master Password: ");
-            let old_key = match db::unlock_vault(&conn, &old_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, old_key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
 
             let new_pass = prompt_password("Enter New Master Password: ");
@@ -518,38 +484,33 @@ fn main() {
             }
 
             println!("Rotating encryption keys and re-encrypting vault records...");
-            match db::change_master_password(&conn, &old_key, &new_pass) {
-                Ok(_) => {
+            match db::change_master_password(&conn, &db_path, &old_key, &new_pass) {
+                Ok(new_key) => {
                     println!("Success: Master Password changed and vault records re-encrypted!");
                     if sync::is_git_configured(&db_path) {
                         println!("Syncing updates to Git remote...");
-                        let _ = sync::git_sync_vault(&db_path);
+                        let _ = sync::git_sync_vault(&db_path, &new_key);
                     }
                 }
                 Err(e) => eprintln!("Failed to change Master Password: {}", e),
             }
         }
         "sync" => {
+            let (_conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
+            };
             println!("Syncing vault with Git remote...");
-            match sync::git_sync_vault(&db_path) {
+            match sync::git_sync_vault(&db_path, &key) {
                 Ok(msg) => println!("{}", msg),
                 Err(err) => eprintln!("Sync Error: {}", err),
             }
         }
         "audit" => {
             let run_hibp = args.iter().any(|a| a == "--hibp");
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => { eprintln!("Database error: {}", e); return; }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => { eprintln!("Unlock failed: {}", e); return; }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             let records = match db::get_secrets(&conn) {
                 Ok(r) => r,
@@ -669,24 +630,9 @@ fn main() {
                     return;
                 }
             };
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
             match db::get_secrets(&conn) {
@@ -741,24 +687,9 @@ fn main() {
                 }
             };
             let field = if args.len() >= 4 { args[3].as_str() } else { "password" };
-            let conn = match db::init_db(&db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Database error: {}", e);
-                    return;
-                }
-            };
-            if db::is_first_run(&conn).unwrap_or(true) {
-                eprintln!("Vault is not initialized. Run `keystash init` first.");
-                return;
-            }
-            let master_pass = prompt_password("Enter Master Password: ");
-            let key = match db::unlock_vault(&conn, &master_pass) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Unlock failed: {}", e);
-                    return;
-                }
+            let (conn, key) = match open_or_migrate_vault(&db_path) {
+                Some(pair) => pair,
+                None => return,
             };
             match db::get_secrets(&conn) {
                 Ok(records) => {
@@ -861,26 +792,15 @@ fn main() {
     }
 }
 
-fn start_tui(db_path: &Path, no_sync: bool) {
-    let conn = match db::init_db(db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to open vault database: {}", e);
-            return;
-        }
-    };
-
-    let app = tui::TuiApp::new(conn, no_sync);
+fn start_tui(no_sync: bool) {
+    // TuiApp no longer needs (or can use) a pre-opened Connection: opening the
+    // now SQLCipher-encrypted vault.db requires the key, which isn't known until
+    // the user has entered their master password on the Setup/Lock screen. See
+    // `tui::TuiApp::new` for how it defers the real connection until then, and
+    // `tui::run_tui` for where the exit-time sync now lives (it also needs the
+    // key, so it has to run from inside tui.rs after the app has one).
+    let app = tui::TuiApp::new(no_sync);
     if let Err(e) = tui::run_tui(app) {
         eprintln!("Terminal application crashed: {}", e);
-    }
-
-    // Auto-sync updates on exit if Git is configured and sync is not disabled
-    if !no_sync && sync::is_git_configured(db_path) {
-        println!("Syncing vault updates on exit...");
-        match sync::git_sync_vault(db_path) {
-            Ok(msg) => println!("{}", msg),
-            Err(err) => eprintln!("Sync Warning: {}", err),
-        }
     }
 }

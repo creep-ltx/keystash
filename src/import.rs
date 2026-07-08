@@ -540,7 +540,10 @@ mod tests {
 
     #[test]
     fn test_rfc4180_csv_import() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
 
         let temp_dir = std::env::temp_dir();
         let file_path = temp_dir.join("test_import.csv");

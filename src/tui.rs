@@ -177,17 +177,42 @@ pub struct TuiApp {
     pub sync_conflicts: Vec<crate::sync::ConflictGroup>,
     pub selected_conflict_idx: usize,
     pub sync_conflicts_detected: Arc<Mutex<Option<Vec<crate::sync::ConflictGroup>>>>,
+
+    // Whether the vault at db_path predates SQLCipher and needs one-time migration
+    // on next successful password entry (see `handle_lock_input`).
+    needs_migration: bool,
+
+    // Handle to whatever background sync thread is currently in flight (from
+    // `trigger_postunlock_sync`), if any. `run_tui`'s exit-time sync joins this
+    // before running its own git_sync_vault call, so the two can never run
+    // concurrently against the same working directory / SQLite file -- letting
+    // them race is what caused a real vault to revert to its pre-migration,
+    // unencrypted format with no error ever being shown.
+    pending_sync_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 
 
 impl TuiApp {
-    pub fn new(conn: Connection, no_sync: bool) -> Self {
-        let is_first = db::is_first_run(&conn).unwrap_or(true);
-        let screen = if is_first { Screen::Setup } else { Screen::Lock };
+    /// Constructs the app without touching vault.db at all: opening it now
+    /// requires the SQLCipher key, which isn't known until the user has typed
+    /// their master password on the Setup/Lock screen. `conn` starts out pointing
+    /// at a throwaway in-memory database -- it's replaced with the real, keyed
+    /// connection in `handle_setup_input`/`handle_lock_input` on success, and no
+    /// screen reachable before that ever reads from `conn`.
+    pub fn new(no_sync: bool) -> Self {
+        let db_path = crate::get_db_path();
+        let vault_state = db::detect_vault_state(&db_path);
+        let screen = match vault_state {
+            db::VaultState::New => Screen::Setup,
+            db::VaultState::NeedsMigration | db::VaultState::Ready => Screen::Lock,
+        };
+        let placeholder_conn = Connection::open_in_memory()
+            .expect("failed to open in-memory placeholder database");
 
         let app = Self {
-            conn,
+            conn: placeholder_conn,
+            needs_migration: vault_state == db::VaultState::NeedsMigration,
             key: None,
             screen,
             password_input: String::with_capacity(128),
@@ -247,8 +272,9 @@ impl TuiApp {
             sync_conflicts: Vec::new(),
             selected_conflict_idx: 0,
             sync_conflicts_detected: Arc::new(Mutex::new(None)),
+            pending_sync_thread: Arc::new(Mutex::new(None)),
         };
-        app.trigger_background_sync();
+        app.trigger_prelock_fetch();
         app
     }
 
@@ -557,77 +583,30 @@ impl TuiApp {
         }
     }
 
-    fn trigger_background_sync(&self) {
+    /// Runs at construction time, before the vault is unlocked -- so before any
+    /// key exists. SQLCipher means the actual logical merge (which needs to open
+    /// and ATTACH the encrypted database) can no longer happen this early; only
+    /// the network fetch can run with no key at all. This still hides the fetch's
+    /// network latency behind the password prompt exactly as before -- the merge
+    /// itself is fast and local, and runs immediately after a successful unlock
+    /// in `trigger_postunlock_sync`, reusing the ref this fetch just updated.
+    fn trigger_prelock_fetch(&self) {
         if self.no_sync {
             return;
         }
-        let key_opt = self.key.clone();
         let db_path = crate::get_db_path();
-        let detected_clone = Arc::clone(&self.sync_conflicts_detected);
         std::thread::spawn(move || {
-            if let Some(key) = key_opt {
-                let dir = db_path.parent().unwrap();
-                let _ = Command::new("git")
-                    .arg("-c")
-                    .arg("connection.timeout=5")
-                    .arg("fetch")
-                    .arg("origin")
-                    .arg("main")
-                    .current_dir(dir)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-
-                match crate::sync::detect_sync_conflicts(&db_path, &key) {
-                    Ok(conflicts) => {
-                        if !conflicts.is_empty() {
-                            *detected_clone.lock().unwrap() = Some(conflicts);
-                            return;
-                        }
-                    }
-                    Err(_) => {}
-                }
+            let dir = match db_path.parent() {
+                Some(d) => d,
+                None => return,
+            };
+            if !dir.join(".git").exists() {
+                return;
             }
-            let _ = crate::sync::git_sync_vault(db_path);
-        });
-    }
-
-    fn trigger_background_sync_completion(&self) {
-        if self.no_sync {
-            return;
-        }
-        let db_path = crate::get_db_path();
-        std::thread::spawn(move || {
-            let dir = db_path.parent().unwrap();
-            let _ = Command::new("git")
-                .arg("reset")
-                .arg("origin/main")
-                .current_dir(dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-
-            let _ = Command::new("git")
-                .arg("add")
-                .arg("vault.db")
-                .current_dir(dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-
-            let _ = Command::new("git")
-                .arg("commit")
-                .arg("-m")
-                .arg("sync: auto-merge resolved conflicts")
-                .current_dir(dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-
             let _ = Command::new("git")
                 .arg("-c")
                 .arg("connection.timeout=5")
-                .arg("push")
+                .arg("fetch")
                 .arg("origin")
                 .arg("main")
                 .current_dir(dir)
@@ -635,6 +614,69 @@ impl TuiApp {
                 .stderr(Stdio::null())
                 .status();
         });
+    }
+
+    /// Runs right after a successful unlock/setup/migration, once a key exists.
+    /// Detects conflicts against the ref `trigger_prelock_fetch` already updated;
+    /// if none are found, performs the normal full logical merge + push.
+    fn trigger_postunlock_sync(&self) {
+        if self.no_sync {
+            return;
+        }
+        let key = match &self.key {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let db_path = crate::get_db_path();
+        let detected_clone = Arc::clone(&self.sync_conflicts_detected);
+        let handle = std::thread::spawn(move || {
+            match crate::sync::detect_sync_conflicts(&db_path, &key) {
+                Ok(conflicts) => {
+                    if !conflicts.is_empty() {
+                        *detected_clone.lock().unwrap() = Some(conflicts);
+                        return;
+                    }
+                }
+                Err(_) => {}
+            }
+            let _ = crate::sync::git_sync_vault(&db_path, &key);
+        });
+        if let Ok(mut slot) = self.pending_sync_thread.lock() {
+            // If a previous background sync is somehow still running, wait for
+            // it to finish before this one starts touching the same files.
+            if let Some(previous) = slot.take() {
+                let _ = previous.join();
+            }
+            *slot = Some(handle);
+        }
+    }
+
+    /// Runs once every conflict in `sync_conflicts` has been resolved. Previously
+    /// this only staged/committed/pushed whatever was on disk -- which silently
+    /// dropped any *other* remote change (new records, non-conflicting edits,
+    /// deletions) that wasn't part of the conflict set, since it never re-ran the
+    /// real merge. It now calls the same `git_sync_vault` merge used everywhere
+    /// else instead, relying on the conflict handlers above having already
+    /// re-stamped each resolved record with a fresh "now" timestamp so the
+    /// ordinary last-write-wins merge logic doesn't immediately re-clobber them.
+    fn trigger_postconflict_sync(&self) {
+        if self.no_sync {
+            return;
+        }
+        let key = match &self.key {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let db_path = crate::get_db_path();
+        let handle = std::thread::spawn(move || {
+            let _ = crate::sync::git_sync_vault(&db_path, &key);
+        });
+        if let Ok(mut slot) = self.pending_sync_thread.lock() {
+            if let Some(previous) = slot.take() {
+                let _ = previous.join();
+            }
+            *slot = Some(handle);
+        }
     }
 }
 
@@ -666,6 +708,37 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     if let Err(err) = res {
         println!("TUI Error: {:?}", err);
     }
+
+    // Wait for any background sync still in flight (from trigger_postunlock_sync,
+    // e.g. right after an unlock/migration/import) to finish *before* possibly
+    // running our own git_sync_vault call below. Two git_sync_vault invocations
+    // running concurrently against the same working directory and SQLite file --
+    // both doing `git reset`/`add`/`commit`/`push` -- is exactly what corrupted a
+    // real vault back to its pre-migration format with no error ever surfacing,
+    // when the app was unlocked and quit again quickly.
+    if let Ok(mut slot) = app.pending_sync_thread.lock() {
+        if let Some(handle) = slot.take() {
+            let _ = handle.join();
+        }
+    }
+
+    // Auto-sync updates on exit if Git is configured and sync is not disabled.
+    // Only possible if the vault was actually unlocked at some point during this
+    // session -- git_sync_vault needs the key to open/attach the now
+    // SQLCipher-encrypted database, and there's nothing to merge otherwise.
+    if !app.no_sync {
+        if let Some(key) = app.key.clone() {
+            let db_path = crate::get_db_path();
+            if crate::sync::is_git_configured(&db_path) {
+                println!("Syncing vault updates on exit...");
+                match crate::sync::git_sync_vault(&db_path, &key) {
+                    Ok(msg) => println!("{}", msg),
+                    Err(err) => eprintln!("Sync Warning: {}", err),
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -753,13 +826,22 @@ fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
             app.password_input.pop();
         }
         KeyCode::Enter => {
-            match db::unlock_vault(&app.conn, &app.password_input) {
-                Ok(derived_key) => {
+            let db_path = crate::get_db_path();
+            let result = if app.needs_migration {
+                db::migrate_legacy_vault(&db_path, &app.password_input)
+            } else {
+                db::open_vault(&db_path, &app.password_input)
+            };
+            match result {
+                Ok((conn, derived_key)) => {
+                    app.conn = conn;
+                    app.needs_migration = false;
                     app.key = Some(derived_key);
                     app.screen = Screen::Dashboard;
                     app.password_input.zeroize();
                     app.password_input.clear();
                     app.refresh_secrets();
+                    app.trigger_postunlock_sync();
                 }
                 Err(err) => {
                     app.error_message = err;
@@ -805,8 +887,10 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
                 app.error_message = "Passwords do not match!".to_string();
                 return false;
             }
-            match db::setup_vault(&app.conn, &app.password_input) {
-                Ok(derived_key) => {
+            let db_path = crate::get_db_path();
+            match db::create_vault(&db_path, &app.password_input) {
+                Ok((conn, derived_key)) => {
+                    app.conn = conn;
                     app.key = Some(derived_key);
                     app.screen = Screen::Dashboard;
                     app.password_input.zeroize();
@@ -815,6 +899,7 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
                     app.password_confirm_input.clear();
                     app.error_message = String::new();
                     app.refresh_secrets();
+                    app.trigger_postunlock_sync();
                 }
                 Err(err) => {
                     app.error_message = err;
@@ -1358,13 +1443,14 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
             };
 
             // Check if old password matches current active key
-            if db::unlock_vault(&app.conn, &app.password_input).is_err() {
+            let db_path = crate::get_db_path();
+            if db::open_vault(&db_path, &app.password_input).is_err() {
                 app.error_message = "Incorrect current password!".to_string();
                 return;
             }
 
             // Rotate keys
-            match db::change_master_password(&app.conn, old_key, &app.password_confirm_input) {
+            match db::change_master_password(&app.conn, &db_path, old_key, &app.password_confirm_input) {
                 Ok(new_key) => {
                     app.key = Some(new_key);
                     app.password_input.zeroize();
@@ -1471,7 +1557,7 @@ fn handle_import_input(app: &mut TuiApp, code: KeyCode) {
                     app.copied_message = Some((format!("Success: Imported {} items from {}!", count, detected_format.name()), Instant::now(), StatusType::Normal));
                     app.import_path_input.clear();
                     app.refresh_secrets();
-                    app.trigger_background_sync();
+                    app.trigger_postunlock_sync();
                     app.screen = Screen::Dashboard;
                 }
                 Err(e) => {
@@ -1593,7 +1679,12 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         ])
         .split(size);
 
-    let title = Paragraph::new("KeyStash Password Vault")
+    let title_text = if app.needs_migration {
+        "KeyStash Password Vault (legacy vault -- will migrate to encrypted format)"
+    } else {
+        "KeyStash Password Vault"
+    };
+    let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(title, chunks[0]);
@@ -1608,6 +1699,11 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         let err = Paragraph::new(&*app.error_message)
             .style(Style::default().fg(Color::Red));
         f.render_widget(err, chunks[2]);
+    } else if app.needs_migration {
+        let hints = Paragraph::new("Press [Enter] to migrate & unlock | [Esc] to Exit")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(hints, chunks[2]);
     } else {
         let hints = Paragraph::new("Press [Enter] to Unlock | [Esc] to Exit")
             .style(Style::default().fg(Color::DarkGray))
@@ -3272,31 +3368,52 @@ fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
             }
         }
         KeyCode::Char('l') | KeyCode::Left => {
-            let _resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
-            if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
-                app.selected_conflict_idx = app.sync_conflicts.len() - 1;
-            }
-            if app.sync_conflicts.is_empty() {
-                app.trigger_background_sync_completion();
-                app.screen = Screen::Dashboard;
-            }
-        }
-        KeyCode::Char('r') | KeyCode::Right => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
-            let _ = crate::db::update_secret_raw(
-                &app.conn,
-                resolved.local_secret.id,
-                &resolved.remote_secret.url,
-                &resolved.remote_secret.encrypted_password,
-                resolved.remote_secret.encrypted_notes.as_deref(),
-                &resolved.remote_secret.updated_at,
-            );
+            // Re-stamp local's own data with a fresh "now" timestamp rather than
+            // leaving it untouched. Otherwise the subsequent full merge (which
+            // uses ordinary last-write-wins semantics) has no way to know this
+            // record was just deliberately kept, and could overwrite it again
+            // with the remote version if remote's original timestamp happened
+            // to be newer than local's.
+            if let Ok(now) = crate::db::now_timestamp(&app.conn) {
+                let _ = crate::db::update_secret_raw(
+                    &app.conn,
+                    resolved.local_secret.id,
+                    &resolved.local_secret.url,
+                    &resolved.local_secret.encrypted_password,
+                    resolved.local_secret.encrypted_notes.as_deref(),
+                    &now,
+                );
+            }
             if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
                 app.selected_conflict_idx = app.sync_conflicts.len() - 1;
             }
             app.refresh_secrets();
             if app.sync_conflicts.is_empty() {
-                app.trigger_background_sync_completion();
+                app.trigger_postconflict_sync();
+                app.screen = Screen::Dashboard;
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Right => {
+            let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            // Stamp with "now", not remote's original updated_at -- see the
+            // comment in the 'l' branch above for why.
+            if let Ok(now) = crate::db::now_timestamp(&app.conn) {
+                let _ = crate::db::update_secret_raw(
+                    &app.conn,
+                    resolved.local_secret.id,
+                    &resolved.remote_secret.url,
+                    &resolved.remote_secret.encrypted_password,
+                    resolved.remote_secret.encrypted_notes.as_deref(),
+                    &now,
+                );
+            }
+            if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
+                app.selected_conflict_idx = app.sync_conflicts.len() - 1;
+            }
+            app.refresh_secrets();
+            if app.sync_conflicts.is_empty() {
+                app.trigger_postconflict_sync();
                 app.screen = Screen::Dashboard;
             }
         }
@@ -3324,21 +3441,25 @@ fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
                     crate::crypto::encrypt(merged.as_bytes(), key).ok()
                 };
 
-                let _ = crate::db::update_secret_raw(
-                    &app.conn,
-                    resolved.local_secret.id,
-                    &resolved.local_secret.url,
-                    &resolved.local_secret.encrypted_password,
-                    enc_notes.as_deref(),
-                    &resolved.remote_secret.updated_at,
-                );
+                // Stamp with "now", not remote's original updated_at -- see the
+                // comment in the 'l' branch above for why.
+                if let Ok(now) = crate::db::now_timestamp(&app.conn) {
+                    let _ = crate::db::update_secret_raw(
+                        &app.conn,
+                        resolved.local_secret.id,
+                        &resolved.local_secret.url,
+                        &resolved.local_secret.encrypted_password,
+                        enc_notes.as_deref(),
+                        &now,
+                    );
+                }
             }
             if app.selected_conflict_idx >= app.sync_conflicts.len() && !app.sync_conflicts.is_empty() {
                 app.selected_conflict_idx = app.sync_conflicts.len() - 1;
             }
             app.refresh_secrets();
             if app.sync_conflicts.is_empty() {
-                app.trigger_background_sync_completion();
+                app.trigger_postconflict_sync();
                 app.screen = Screen::Dashboard;
             }
         }

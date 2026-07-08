@@ -186,9 +186,10 @@ To upload your existing vault database to GitHub for the first time:
 cd ~/.config/keystash
 git init
 
-# Track only the encrypted database
+# Track only the encrypted database and its salt file
 echo "*" > .gitignore
 echo "!vault.db" >> .gitignore
+echo "!vault.salt" >> .gitignore
 
 # Link your private remote (e.g. GitHub)
 git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
@@ -199,10 +200,12 @@ git add .
 git commit -m "Initial vault backup"
 git push -u origin main
 ```
+> [!NOTE]
+> `vault.salt` isn't secret on its own (it only becomes meaningful combined with your master password), but it's required to derive your encryption key, so it needs to sync alongside `vault.db`. KeyStash force-adds it during automatic sync even if your `.gitignore` doesn't explicitly allow it, but tracking it explicitly here keeps `git status` clean.
 
 #### **Device B (Adding a New/Secondary Device)**
 > [!WARNING]
-> **DO NOT run `keystash init` on a secondary device.** If you do, it will generate a new database salt and your master password keys will not match, causing decryption errors.
+> **DO NOT run `keystash init` on a secondary device.** If you do, it will generate a brand new vault (new salt, new empty database) instead of using your existing one, and your master password won't unlock the vault you meant to sync.
 > 
 > Instead, clone the existing database file from GitHub directly:
 
@@ -215,10 +218,11 @@ cd ~/.config/keystash
 git init
 echo "*" > .gitignore
 echo "!vault.db" >> .gitignore
+echo "!vault.salt" >> .gitignore
 git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
 git branch -M main
 
-# Pull down the existing database (clones the salt/key structure)
+# Pull down the existing database and salt file
 git pull origin main
 ```
 You can now run `keystash` on Device B, enter your existing Master Password, and sync. Both machines will sync and decrypt seamlessly!
