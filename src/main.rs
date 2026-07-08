@@ -25,6 +25,30 @@ fn set_dir_permissions<P: AsRef<Path>>(path: P) {
 #[cfg(not(unix))]
 fn set_dir_permissions<P: AsRef<Path>>(_path: P) {}
 
+/// Every file/directory KeyStash creates (vault.db, vault.salt, the config
+/// directory, exported CSVs) is created first under the process's default
+/// umask and only `chmod`'d to its intended restrictive mode afterward --
+/// leaving a brief window, on a permissive umask, where it could be readable
+/// by other local users before that follow-up chmod lands. Restricting the
+/// umask once at startup, before any of those files exist, means every one of
+/// them is created with the restrictive mode from the very first byte written,
+/// closing that window everywhere at once instead of at each call site.
+#[cfg(unix)]
+fn set_restrictive_umask() {
+    // SAFETY: umask(2) is a simple side-effect-only libc call operating purely
+    // on integers (the process's file-creation mask) -- no pointers, no
+    // aliasing or lifetime concerns.
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    unsafe {
+        umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_restrictive_umask() {}
+
 /// Takes ownership as `Zeroizing<String>` rather than a plain `String` so the
 /// plaintext is wiped when this function returns, regardless of which branch
 /// below is taken -- a plain `String` parameter would just drop normally,
@@ -162,6 +186,7 @@ fn print_help() {
 }
 
 fn main() {
+    set_restrictive_umask();
     let raw_args: Vec<String> = env::args().collect();
     if raw_args.len() >= 3 && raw_args[1] == "__internal-clear-clipboard" {
         use std::io::Read;
@@ -836,5 +861,38 @@ mod tests {
         // character count, not byte count.
         let emoji_title: String = std::iter::repeat('\u{1F511}').take(30).collect();
         assert_eq!(truncate_chars(&emoji_title, 22).chars().count(), 22);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_umask_applies_to_newly_created_files_before_any_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // umask(2) returns the *previous* mask, so this both applies a
+        // deliberately permissive starting mask and captures it for restoring
+        // afterward -- umask is process-wide state, and this runs alongside
+        // other tests in the same process, so it must not leak.
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let original_mask = unsafe { umask(0o022) };
+
+        let dir = std::env::temp_dir().join(format!("keystash_umask_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("probe_file");
+
+        set_restrictive_umask();
+        // No chmod call here at all -- if the umask weren't actually applied,
+        // this file would come out world/group-readable (mode & 0o022 bits
+        // set), the exact window this fix closes.
+        std::fs::write(&file_path, b"probe").unwrap();
+
+        let mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+
+        unsafe { umask(original_mask) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(mode, 0o600, "file created after set_restrictive_umask() should be owner-only, got {:o}", mode);
     }
 }

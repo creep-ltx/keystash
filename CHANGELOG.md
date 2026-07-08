@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.3.0] - 2026-07-08
 - Feat: Full-database encryption via SQLCipher, replacing the previous scheme where only the `password`/`notes` fields were encrypted (`title`/`category`/`username`/`url` were plaintext columns). The whole vault file is now opaque at rest.
 - Feat: Automatic one-time migration of existing vaults to the new encrypted format on first unlock; the pre-migration file is kept as a backup rather than deleted.
 - Fix: Sync conflict resolution now re-runs the full logical merge afterward instead of only staging/committing/pushing directly, so unrelated concurrent changes from another device (new records, non-conflicting edits, deletions) are no longer silently dropped when a conflict is resolved.
@@ -10,6 +10,8 @@
 - Fix: `keystash audit` crashed on titles/categories/usernames containing multi-byte Unicode characters near the column-truncation boundary; truncation is now character-aware.
 - Fix: Bulk imports (Bitwarden, Brave/Chrome, Firefox, LastPass, KeePassXC, 1Password) now run inside a single transaction, so a failure partway through rolls back the whole import instead of leaving a partial, inconsistent set of rows while reporting the import as failed.
 - Fix: Decrypted passwords and notes are now wiped from memory much more consistently instead of just being dropped as ordinary (unzeroized) `String`s — covers clipboard copies, CLI reveal output, the HIBP audit check, form/dashboard/dedupe/sync-conflict screens, and the sync/export paths that decrypt purely for comparison.
+- Fix: A 1Password CSV export missing a `notes` column would be confidently detected as 1Password format and then immediately fail to import; the column is now treated as optional.
+- Fix: `vault.db`, `vault.salt`, the config directory, and exported CSVs were created under the process's default umask and `chmod`'d restrictive only afterward, leaving a brief window where they could be readable by other local users. The process umask is now restricted at startup instead.
 
 ## [0.2.5] - 2026-07-05
 - Feat: Auto-lock idle timeout for persistent TuiApp sessions

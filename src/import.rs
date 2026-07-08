@@ -458,7 +458,11 @@ pub fn import_onepassword_csv(
     let title_idx = norm_headers.iter().position(|h| h == "title").ok_or("Missing 'title' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
-    let notes_idx = norm_headers.iter().position(|h| h == "notes").ok_or("Missing 'notes' column")?;
+    // Not every 1Password export template includes a notes column, and
+    // detect_format() never requires one either -- treat it as optional rather
+    // than failing an otherwise-valid, correctly-detected import over its
+    // absence (matching the leniency already given to url/website below).
+    let notes_idx = norm_headers.iter().position(|h| h == "notes");
 
     // 1Password might use either "url" or "website" as URL column
     let url_idx = norm_headers.iter().position(|h| h == "url")
@@ -468,7 +472,10 @@ pub fn import_onepassword_csv(
     with_import_transaction(conn, || {
         let mut count = 0;
         for fields in records {
-            let max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, url_idx))));
+            let mut max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, url_idx)));
+            if let Some(idx) = notes_idx {
+                max_idx = std::cmp::max(max_idx, idx);
+            }
             if fields.len() <= max_idx {
                 continue;
             }
@@ -476,7 +483,7 @@ pub fn import_onepassword_csv(
             let title = &fields[title_idx];
             let username = &fields[user_idx];
             let password = &fields[pass_idx];
-            let notes = &fields[notes_idx];
+            let notes = notes_idx.map(|idx| fields[idx].as_str()).unwrap_or("");
             let url = &fields[url_idx];
 
             if title.is_empty() && password.is_empty() {
@@ -650,6 +657,36 @@ url,username,password,httprealm
         assert_eq!(result, Ok(2));
         let secrets = crate::db::get_secrets(&conn).unwrap();
         assert_eq!(secrets.len(), 2);
+    }
+
+    #[test]
+    fn onepassword_csv_without_notes_column_is_detected_and_imports() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_1password_no_notes_{}.csv", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        // No "notes" column, no "group" column -- detect_format() has always
+        // classified this as 1Password since it never checks for notes; the
+        // importer used to then fail on that same file with "Missing 'notes'
+        // column" despite having just been confidently detected.
+        let csv_content = "title,username,password,url\nGitHub,me,hunter2,https://github.com\n";
+        std::fs::write(&file_path, csv_content).unwrap();
+
+        assert_eq!(detect_format(file_path_str).unwrap(), ImportFormat::OnePasswordCsv);
+
+        let count = import_onepassword_csv(&conn, file_path_str, &key).unwrap();
+        assert_eq!(count, 1);
+
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].encrypted_notes, None);
+
+        let _ = std::fs::remove_file(&file_path);
     }
 }
 
