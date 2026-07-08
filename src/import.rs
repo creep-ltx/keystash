@@ -3,8 +3,31 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use rusqlite::Connection;
+use zeroize::Zeroizing;
 
 use crate::db;
+
+/// Runs `body` (which inserts rows one at a time via `db::add_secret`, each
+/// normally its own auto-committed statement) inside a single explicit
+/// transaction, so a failure partway through an import rolls back everything
+/// inserted so far instead of leaving a partial, silently-inconsistent import
+/// while still reporting the whole operation as failed.
+fn with_import_transaction<F>(conn: &Connection, body: F) -> Result<usize, String>
+where
+    F: FnOnce() -> Result<usize, String>,
+{
+    conn.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
+    match body() {
+        Ok(count) => {
+            conn.execute("COMMIT", []).map_err(|e| e.to_string())?;
+            Ok(count)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 struct BwFolder {
@@ -152,7 +175,7 @@ pub fn import_bitwarden_json(
 ) -> Result<usize, String> {
     let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
     let reader = BufReader::new(file);
-    
+
     let export: BwExport = serde_json::from_reader(reader)
         .map_err(|e| format!("JSON parsing failed (is this a valid unencrypted Bitwarden JSON export?): {}", e))?;
 
@@ -165,54 +188,56 @@ pub fn import_bitwarden_json(
         }
     }
 
-    let mut import_count = 0;
+    with_import_transaction(conn, || {
+        let mut import_count = 0;
 
-    if let Some(items) = export.items {
-        for item in items {
-            let category = item
-                .folder_id
-                .and_then(|fid| folders_map.get(&fid).cloned())
-                .unwrap_or_else(|| "Imported".to_string());
+        if let Some(items) = export.items {
+            for item in items {
+                let category = item
+                    .folder_id
+                    .and_then(|fid| folders_map.get(&fid).cloned())
+                    .unwrap_or_else(|| "Imported".to_string());
 
-            let mut username = String::new();
-            let mut password = String::new();
-            let mut url = String::new();
+                let mut username = String::new();
+                let mut password = String::new();
+                let mut url = String::new();
 
-            if let Some(login) = &item.login {
-                if let Some(u) = &login.username {
-                    username = u.clone();
-                }
-                if let Some(p) = &login.password {
-                    password = p.clone();
-                }
-                if let Some(uris) = &login.uris {
-                    if !uris.is_empty() {
-                        if let Some(uri) = &uris[0].uri {
-                            url = uri.clone();
+                if let Some(login) = &item.login {
+                    if let Some(u) = &login.username {
+                        username = u.clone();
+                    }
+                    if let Some(p) = &login.password {
+                        password = p.clone();
+                    }
+                    if let Some(uris) = &login.uris {
+                        if !uris.is_empty() {
+                            if let Some(uri) = &uris[0].uri {
+                                url = uri.clone();
+                            }
                         }
                     }
                 }
-            }
 
-            if password.is_empty() && item.item_type != 1 {
-                password = "[Secure Note]".to_string();
-            }
+                if password.is_empty() && item.item_type != 1 {
+                    password = "[Secure Note]".to_string();
+                }
 
-            db::add_secret(
-                conn,
-                &item.name,
-                &category,
-                &username,
-                &url,
-                &password,
-                item.notes.as_deref(),
-                key,
-            )?;
-            import_count += 1;
+                db::add_secret(
+                    conn,
+                    &item.name,
+                    &category,
+                    &username,
+                    &url,
+                    &password,
+                    item.notes.as_deref(),
+                    key,
+                )?;
+                import_count += 1;
+            }
         }
-    }
 
-    Ok(import_count)
+        Ok(import_count)
+    })
 }
 
 /// Parses a Brave / Google Chrome unencrypted CSV export and inserts the entries.
@@ -223,43 +248,45 @@ pub fn import_brave_chrome_csv(
 ) -> Result<usize, String> {
     let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    
+
     let name_idx = norm_headers.iter().position(|h| h == "name").ok_or("Missing 'name' column")?;
     let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
-    
-    let mut count = 0;
-    for fields in records {
-        if fields.len() <= std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx))) {
-            continue;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            if fields.len() <= std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx))) {
+                continue;
+            }
+
+            let title = &fields[name_idx];
+            let url = &fields[url_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+
+            if title.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let display_title = if title.is_empty() { url } else { title };
+
+            db::add_secret(
+                conn,
+                display_title,
+                "Browser",
+                username,
+                url,
+                password,
+                None,
+                key,
+            )?;
+            count += 1;
         }
-        
-        let title = &fields[name_idx];
-        let url = &fields[url_idx];
-        let username = &fields[user_idx];
-        let password = &fields[pass_idx];
-        
-        if title.is_empty() && password.is_empty() {
-            continue;
-        }
-        
-        let display_title = if title.is_empty() { url } else { title };
-        
-        db::add_secret(
-            conn,
-            display_title,
-            "Browser",
-            username,
-            url,
-            password,
-            None,
-            key,
-        )?;
-        count += 1;
-    }
-    
-    Ok(count)
+
+        Ok(count)
+    })
 }
 
 /// Parses a Firefox unencrypted CSV export and inserts the entries.
@@ -270,41 +297,43 @@ pub fn import_firefox_csv(
 ) -> Result<usize, String> {
     let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    
+
     let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
-    
-    let mut count = 0;
-    for fields in records {
-        if fields.len() <= std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx)) {
-            continue;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            if fields.len() <= std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx)) {
+                continue;
+            }
+
+            let url = &fields[url_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+
+            if url.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let clean_title = extract_domain(url);
+
+            db::add_secret(
+                conn,
+                &clean_title,
+                "Browser",
+                username,
+                url,
+                password,
+                None,
+                key,
+            )?;
+            count += 1;
         }
-        
-        let url = &fields[url_idx];
-        let username = &fields[user_idx];
-        let password = &fields[pass_idx];
-        
-        if url.is_empty() && password.is_empty() {
-            continue;
-        }
-        
-        let clean_title = extract_domain(url);
-        
-        db::add_secret(
-            conn,
-            &clean_title,
-            "Browser",
-            username,
-            url,
-            password,
-            None,
-            key,
-        )?;
-        count += 1;
-    }
-    
-    Ok(count)
+
+        Ok(count)
+    })
 }
 
 /// Parses a LastPass unencrypted CSV export and inserts the entries.
@@ -315,49 +344,51 @@ pub fn import_lastpass_csv(
 ) -> Result<usize, String> {
     let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    
+
     let name_idx = norm_headers.iter().position(|h| h == "name").ok_or("Missing 'name' column")?;
     let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
     let extra_idx = norm_headers.iter().position(|h| h == "extra").ok_or("Missing 'extra' (notes) column")?;
     let group_idx = norm_headers.iter().position(|h| h == "grouping").ok_or("Missing 'grouping' column")?;
-    
-    let mut count = 0;
-    for fields in records {
-        let max_idx = std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(extra_idx, group_idx)))));
-        if fields.len() <= max_idx {
-            continue;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            let max_idx = std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(extra_idx, group_idx)))));
+            if fields.len() <= max_idx {
+                continue;
+            }
+
+            let title = &fields[name_idx];
+            let url = &fields[url_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+            let notes = &fields[extra_idx];
+            let category = &fields[group_idx];
+
+            if title.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let display_title = if title.is_empty() { url } else { title };
+            let display_category = if category.is_empty() { "LastPass" } else { category };
+
+            db::add_secret(
+                conn,
+                display_title,
+                display_category,
+                username,
+                url,
+                password,
+                if notes.is_empty() { None } else { Some(notes) },
+                key,
+            )?;
+            count += 1;
         }
-        
-        let title = &fields[name_idx];
-        let url = &fields[url_idx];
-        let username = &fields[user_idx];
-        let password = &fields[pass_idx];
-        let notes = &fields[extra_idx];
-        let category = &fields[group_idx];
-        
-        if title.is_empty() && password.is_empty() {
-            continue;
-        }
-        
-        let display_title = if title.is_empty() { url } else { title };
-        let display_category = if category.is_empty() { "LastPass" } else { category };
-        
-        db::add_secret(
-            conn,
-            display_title,
-            display_category,
-            username,
-            url,
-            password,
-            if notes.is_empty() { None } else { Some(notes) },
-            key,
-        )?;
-        count += 1;
-    }
-    
-    Ok(count)
+
+        Ok(count)
+    })
 }
 
 /// Parses a KeePassXC unencrypted CSV export and inserts the entries.
@@ -368,49 +399,51 @@ pub fn import_keepassxc_csv(
 ) -> Result<usize, String> {
     let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    
+
     let group_idx = norm_headers.iter().position(|h| h == "group").ok_or("Missing 'group' column")?;
     let title_idx = norm_headers.iter().position(|h| h == "title").ok_or("Missing 'title' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
     let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
     let notes_idx = norm_headers.iter().position(|h| h == "notes").ok_or("Missing 'notes' column")?;
-    
-    let mut count = 0;
-    for fields in records {
-        let max_idx = std::cmp::max(group_idx, std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(url_idx, notes_idx)))));
-        if fields.len() <= max_idx {
-            continue;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            let max_idx = std::cmp::max(group_idx, std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(url_idx, notes_idx)))));
+            if fields.len() <= max_idx {
+                continue;
+            }
+
+            let category = &fields[group_idx];
+            let title = &fields[title_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+            let url = &fields[url_idx];
+            let notes = &fields[notes_idx];
+
+            if title.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let display_title = if title.is_empty() { url } else { title };
+            let display_category = if category.is_empty() { "KeePassXC" } else { category };
+
+            db::add_secret(
+                conn,
+                display_title,
+                display_category,
+                username,
+                url,
+                password,
+                if notes.is_empty() { None } else { Some(notes) },
+                key,
+            )?;
+            count += 1;
         }
-        
-        let category = &fields[group_idx];
-        let title = &fields[title_idx];
-        let username = &fields[user_idx];
-        let password = &fields[pass_idx];
-        let url = &fields[url_idx];
-        let notes = &fields[notes_idx];
-        
-        if title.is_empty() && password.is_empty() {
-            continue;
-        }
-        
-        let display_title = if title.is_empty() { url } else { title };
-        let display_category = if category.is_empty() { "KeePassXC" } else { category };
-        
-        db::add_secret(
-            conn,
-            display_title,
-            display_category,
-            username,
-            url,
-            password,
-            if notes.is_empty() { None } else { Some(notes) },
-            key,
-        )?;
-        count += 1;
-    }
-    
-    Ok(count)
+
+        Ok(count)
+    })
 }
 
 /// Parses a 1Password unencrypted CSV export and inserts the entries.
@@ -421,50 +454,52 @@ pub fn import_onepassword_csv(
 ) -> Result<usize, String> {
     let (headers, records) = read_csv_records(file_path)?;
     let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    
+
     let title_idx = norm_headers.iter().position(|h| h == "title").ok_or("Missing 'title' column")?;
     let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
     let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
     let notes_idx = norm_headers.iter().position(|h| h == "notes").ok_or("Missing 'notes' column")?;
-    
+
     // 1Password might use either "url" or "website" as URL column
     let url_idx = norm_headers.iter().position(|h| h == "url")
         .or_else(|| norm_headers.iter().position(|h| h == "website"))
         .ok_or("Missing URL / Website column")?;
-    
-    let mut count = 0;
-    for fields in records {
-        let max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, url_idx))));
-        if fields.len() <= max_idx {
-            continue;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            let max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, url_idx))));
+            if fields.len() <= max_idx {
+                continue;
+            }
+
+            let title = &fields[title_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+            let notes = &fields[notes_idx];
+            let url = &fields[url_idx];
+
+            if title.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let display_title = if title.is_empty() { url } else { title };
+
+            db::add_secret(
+                conn,
+                display_title,
+                "1Password",
+                username,
+                url,
+                password,
+                if notes.is_empty() { None } else { Some(notes) },
+                key,
+            )?;
+            count += 1;
         }
-        
-        let title = &fields[title_idx];
-        let username = &fields[user_idx];
-        let password = &fields[pass_idx];
-        let notes = &fields[notes_idx];
-        let url = &fields[url_idx];
-        
-        if title.is_empty() && password.is_empty() {
-            continue;
-        }
-        
-        let display_title = if title.is_empty() { url } else { title };
-        
-        db::add_secret(
-            conn,
-            display_title,
-            "1Password",
-            username,
-            url,
-            password,
-            if notes.is_empty() { None } else { Some(notes) },
-            key,
-        )?;
-        count += 1;
-    }
-    
-    Ok(count)
+
+        Ok(count)
+    })
 }
 
 /// Escapes fields containing commas, quotes, or newlines according to standard RFC 4180 CSV specifications.
@@ -506,15 +541,15 @@ pub fn export_vault_csv(
             }
         }
         
-        let decrypted_pass = crate::crypto::decrypt(&r.encrypted_password, key)
-            .map(|dec| String::from_utf8_lossy(&dec).to_string())
-            .unwrap_or_else(|_| String::new());
-            
-        let decrypted_notes = match &r.encrypted_notes {
+        let decrypted_pass: Zeroizing<String> = crate::crypto::decrypt(&r.encrypted_password, key)
+            .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+            .unwrap_or_else(|_| Zeroizing::new(String::new()));
+
+        let decrypted_notes: Zeroizing<String> = match &r.encrypted_notes {
             Some(notes_blob) => crate::crypto::decrypt(notes_blob, key)
-                .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                .unwrap_or_else(|_| String::new()),
-            None => String::new(),
+                .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                .unwrap_or_else(|_| Zeroizing::new(String::new())),
+            None => Zeroizing::new(String::new()),
         };
         
         let row = format!(
@@ -572,6 +607,49 @@ url,username,password,httprealm
         assert_eq!(String::from_utf8(dec2.to_vec()).unwrap(), "pass\nwith\nnewlines");
 
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn import_transaction_rolls_back_all_rows_on_failure() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        // Simulates a real importer that successfully inserts a couple of rows
+        // before hitting a failure on a later one -- the whole batch should be
+        // undone, not left half-committed while being reported as failed.
+        let result = with_import_transaction(&conn, || {
+            db::add_secret(&conn, "One", "Cat", "user", "", "pw1", None, &key)?;
+            db::add_secret(&conn, "Two", "Cat", "user", "", "pw2", None, &key)?;
+            Err("simulated failure partway through the import".to_string())
+        });
+
+        assert!(result.is_err());
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert!(
+            secrets.is_empty(),
+            "expected the failed import to leave no rows behind, found: {:?}",
+            secrets.iter().map(|s| &s.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn import_transaction_commits_all_rows_on_success() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        let result = with_import_transaction(&conn, || {
+            db::add_secret(&conn, "One", "Cat", "user", "", "pw1", None, &key)?;
+            db::add_secret(&conn, "Two", "Cat", "user", "", "pw2", None, &key)?;
+            Ok(2)
+        });
+
+        assert_eq!(result, Ok(2));
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 2);
     }
 }
 

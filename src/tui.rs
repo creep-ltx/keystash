@@ -47,7 +47,7 @@ pub struct DuplicateGroup {
     pub username: String,
     pub url: String,
     pub records: Vec<SecretRecord>,
-    pub decrypted_passwords: Vec<String>,
+    pub decrypted_passwords: Vec<Zeroizing<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,18 +288,34 @@ impl TuiApp {
         self.password_confirm_input.clear();
         self.form_password.zeroize();
         self.form_password.clear();
+        // Notes are an equally sensitive encrypted field as the password --
+        // clear() alone only resets the length, it doesn't wipe the buffer.
+        self.form_notes.zeroize();
+        self.form_notes.clear();
 
         // Reset form variables to prevent leaving secret text in memory
         self.form_title.clear();
         self.form_category.clear();
         self.form_username.clear();
         self.form_url.clear();
-        self.form_notes.clear();
         self.edit_id = None;
 
         // Clear cached secrets
         self.secrets.clear();
         self.filtered_secrets.clear();
+
+        // Duplicate-scan results hold decrypted passwords for as long as they're
+        // cached; wipe them rather than letting the Vec just get dropped/replaced
+        // with its contents intact in already-freed heap memory.
+        for group in &mut self.duplicate_groups {
+            for pw in &mut group.decrypted_passwords {
+                pw.zeroize();
+            }
+        }
+        self.duplicate_groups.clear();
+
+        self.gen_password.zeroize();
+        self.gen_password.clear();
 
         // Clear active screen states and redirect to lock
         self.screen = Screen::Lock;
@@ -325,11 +341,12 @@ impl TuiApp {
             }
 
             let mut group_records = vec![r1.clone()];
-            let pw1 = crate::crypto::decrypt(&r1.encrypted_password, key)
+            let pw1: Zeroizing<String> = crate::crypto::decrypt(&r1.encrypted_password, key)
                 .ok()
                 .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                .map(Zeroizing::new)
                 .unwrap_or_default();
-            let mut group_pws = vec![pw1.clone()];
+            let mut group_pws = vec![pw1];
 
             for j in (i + 1)..self.secrets.len() {
                 let r2 = &self.secrets[j];
@@ -342,9 +359,10 @@ impl TuiApp {
                 let match_title = !r1.title.is_empty() && r1.title.to_lowercase() == r2.title.to_lowercase();
 
                 if match_username && (match_url || match_title) {
-                    let pw2 = crate::crypto::decrypt(&r2.encrypted_password, key)
+                    let pw2: Zeroizing<String> = crate::crypto::decrypt(&r2.encrypted_password, key)
                         .ok()
                         .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
+                        .map(Zeroizing::new)
                         .unwrap_or_default();
                     group_records.push(r2.clone());
                     group_pws.push(pw2);
@@ -365,6 +383,14 @@ impl TuiApp {
             }
         }
         
+        // Wipe the previous scan's decrypted passwords before the Vec they live
+        // in is replaced wholesale -- otherwise they're just dropped with their
+        // contents intact in already-freed heap memory.
+        for group in &mut self.duplicate_groups {
+            for pw in &mut group.decrypted_passwords {
+                pw.zeroize();
+            }
+        }
         self.duplicate_groups = groups;
         self.selected_dup_group_idx = 0;
         self.selected_dup_item_idx = 0;
@@ -507,7 +533,11 @@ impl TuiApp {
         }
     }
 
-    fn copy_to_clipboard(&mut self, text: String, label: &str) {
+    /// Takes ownership as `Zeroizing<String>` rather than a plain `String` so
+    /// the plaintext is wiped when this returns, regardless of which branch is
+    /// taken -- a plain `String` parameter would just drop normally, leaving
+    /// its contents intact in already-freed heap memory.
+    fn copy_to_clipboard(&mut self, text: Zeroizing<String>, label: &str) {
         if text.trim().is_empty() {
             self.copied_message = Some((
                 format!("Cannot copy: {} is empty!", label),
@@ -947,7 +977,9 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.form_category.clear();
             app.form_username.clear();
             app.form_url.clear();
+            app.form_password.zeroize();
             app.form_password.clear();
+            app.form_notes.zeroize();
             app.form_notes.clear();
             app.edit_id = None;
         }
@@ -961,6 +993,12 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                 app.form_url = record.url.clone();
                 app.edit_id = Some(record.id);
 
+                // Wipe whatever the previous form held before overwriting it.
+                app.form_password.zeroize();
+                app.form_password.clear();
+                app.form_notes.zeroize();
+                app.form_notes.clear();
+
                 // Decrypt password & notes for editing
                 if let Some(key) = &app.key {
                     if let Ok(dec_pass) = crate::crypto::decrypt(&record.encrypted_password, key) {
@@ -970,8 +1008,6 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                         if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
                             app.form_notes = String::from_utf8_lossy(&dec_notes).to_string();
                         }
-                    } else {
-                        app.form_notes.clear();
                     }
                 }
             }
@@ -1005,7 +1041,7 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
         }
         KeyCode::Char('c') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
-                app.copy_to_clipboard(record.username.clone(), "username");
+                app.copy_to_clipboard(Zeroizing::new(record.username.clone()), "username");
             }
         }
         KeyCode::Char('m') => {
@@ -1026,6 +1062,7 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
         }
         KeyCode::Char('g') => {
             app.gen_options = crate::generator::GeneratorOptions::load();
+            app.gen_password.zeroize();
             if let Ok(pass) = crate::generator::generate_password(&app.gen_options) {
                 app.gen_password = pass;
             }
@@ -1056,16 +1093,15 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
 
         KeyCode::Char('u') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
-                app.copy_to_clipboard(record.url.clone(), "URL");
+                app.copy_to_clipboard(Zeroizing::new(record.url.clone()), "URL");
             }
         }
         KeyCode::Char('p') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
                 if let Some(key) = &app.key {
                     if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
-                        if let Ok(mut plaintext) = String::from_utf8(dec.to_vec()) {
-                            app.copy_to_clipboard(plaintext.clone(), "password");
-                            plaintext.zeroize();
+                        if let Ok(plaintext) = String::from_utf8(dec.to_vec()) {
+                            app.copy_to_clipboard(Zeroizing::new(plaintext), "password");
                         }
                     }
                 }
@@ -1359,6 +1395,10 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
 
                 match res {
                     Ok(_) => {
+                        app.form_password.zeroize();
+                        app.form_password.clear();
+                        app.form_notes.zeroize();
+                        app.form_notes.clear();
                         app.screen = Screen::Dashboard;
                         app.refresh_secrets();
                     }
@@ -1370,6 +1410,10 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
         KeyCode::Esc => {
+            app.form_password.zeroize();
+            app.form_password.clear();
+            app.form_notes.zeroize();
+            app.form_notes.clear();
             app.screen = Screen::Dashboard;
         }
         _ => {}
@@ -1866,25 +1910,25 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
         let password_str = if app.reveal_password {
             if let Some(key) = &app.key {
                 crate::crypto::decrypt(&record.encrypted_password, key)
-                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                    .unwrap_or_else(|_| "<Error Decrypting>".to_string())
+                    .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                    .unwrap_or_else(|_| Zeroizing::new("<Error Decrypting>".to_string()))
             } else {
-                "<Locked>".to_string()
+                Zeroizing::new("<Locked>".to_string())
             }
         } else {
-            "••••••••••••".to_string()
+            Zeroizing::new("••••••••••••".to_string())
         };
 
         let notes_str = if let Some(enc_notes) = &record.encrypted_notes {
             if let Some(key) = &app.key {
                 crate::crypto::decrypt(enc_notes, key)
-                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                    .unwrap_or_else(|_| "<Error Decrypting>".to_string())
+                    .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                    .unwrap_or_else(|_| Zeroizing::new("<Error Decrypting>".to_string()))
             } else {
-                "<Locked>".to_string()
+                Zeroizing::new("<Locked>".to_string())
             }
         } else {
-            "[No Notes]".to_string()
+            Zeroizing::new("[No Notes]".to_string())
         };
 
         let details_text = vec![
@@ -1906,11 +1950,11 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
             ]),
             Line::from(vec![
                 Span::styled("Password: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(password_str, Style::default().fg(Color::LightRed)),
+                Span::styled(password_str.as_str(), Style::default().fg(Color::LightRed)),
             ]),
             Line::from(""),
             Line::from(Span::styled("Notes:", Style::default().fg(Color::DarkGray))),
-            Line::from(Span::styled(notes_str, Style::default().fg(Color::White))),
+            Line::from(Span::styled(notes_str.as_str(), Style::default().fg(Color::White))),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Last Updated: ", Style::default().fg(Color::DarkGray)),
@@ -2140,7 +2184,8 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
                 }
                 if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, key) {
                     if let Ok(pw) = String::from_utf8(dec.to_vec()) {
-                        if pw == app.form_password {
+                        let pw = Zeroizing::new(pw);
+                        if *pw == app.form_password {
                             reuse_count += 1;
                         }
                     }
@@ -2450,6 +2495,13 @@ impl Drop for TuiApp {
         self.password_input.zeroize();
         self.password_confirm_input.zeroize();
         self.form_password.zeroize();
+        self.form_notes.zeroize();
+        self.gen_password.zeroize();
+        for group in &mut self.duplicate_groups {
+            for pw in &mut group.decrypted_passwords {
+                pw.zeroize();
+            }
+        }
     }
 }
 
@@ -2713,7 +2765,7 @@ fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
         }
         // Copy to clipboard
         KeyCode::Char('c') => {
-            let pass = app.gen_password.clone();
+            let pass = Zeroizing::new(app.gen_password.clone());
             app.copy_to_clipboard(pass, "password");
         }
         // Fill current form field (if opened from form — future use)
@@ -2900,27 +2952,27 @@ fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
         KeyCode::Char('m') => {
             let keep_idx = app.selected_dup_item_idx;
             let keep_record = &current_group.records[keep_idx];
-            let mut merged_notes = String::new();
-            
+            let mut merged_notes: Zeroizing<String> = Zeroizing::new(String::new());
+
             if let Some(key) = &app.key {
                 if let Some(enc_notes) = &keep_record.encrypted_notes {
                     if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
-                        merged_notes = String::from_utf8_lossy(&dec_notes).to_string();
+                        *merged_notes = String::from_utf8_lossy(&dec_notes).to_string();
                     }
                 }
-                
+
                 for (idx, r) in current_group.records.iter().enumerate() {
                     if idx == keep_idx {
                         continue;
                     }
                     if let Some(enc_notes) = &r.encrypted_notes {
                         if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
-                            let other_note = String::from_utf8_lossy(&dec_notes).to_string();
+                            let other_note = Zeroizing::new(String::from_utf8_lossy(&dec_notes).to_string());
                             if !other_note.is_empty() {
                                 if !merged_notes.is_empty() {
                                     merged_notes.push_str("\n---\n");
                                 }
-                                merged_notes.push_str(&format!("Merged from duplicate: {}", other_note));
+                                merged_notes.push_str(&format!("Merged from duplicate: {}", *other_note));
                             }
                         }
                     }
@@ -3044,9 +3096,10 @@ fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
             r.encrypted_notes.as_ref()
                 .and_then(|enc| crate::crypto::decrypt(enc, key).ok())
                 .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
-                .unwrap_or_default()
+                .map(Zeroizing::new)
+                .unwrap_or_else(|| Zeroizing::new(String::new()))
         } else {
-            String::new()
+            Zeroizing::new(String::new())
         };
         
         let mut detail_lines = vec![
@@ -3068,7 +3121,7 @@ fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
             ]),
             Line::from(vec![
                 Span::styled("  Password:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(pw.clone(), Style::default().fg(Color::LightCyan)),
+                Span::styled(pw.as_str(), Style::default().fg(Color::LightCyan)),
             ]),
             Line::from(vec![
                 Span::styled("  Updated At: ", Style::default().fg(Color::DarkGray)),
@@ -3420,19 +3473,19 @@ fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         KeyCode::Char('m') => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
             if let Some(key) = &app.key {
-                let local_notes = crate::crypto::decrypt(&resolved.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
-                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                let local_notes: Zeroizing<String> = crate::crypto::decrypt(&resolved.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
+                    .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                     .unwrap_or_default();
-                let remote_notes = crate::crypto::decrypt(&resolved.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
-                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                let remote_notes: Zeroizing<String> = crate::crypto::decrypt(&resolved.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
+                    .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                     .unwrap_or_default();
 
-                let merged = if local_notes.is_empty() {
+                let merged: Zeroizing<String> = if local_notes.is_empty() {
                     remote_notes
                 } else if remote_notes.is_empty() {
                     local_notes
                 } else {
-                    format!("{}\n---\n{}", local_notes, remote_notes)
+                    Zeroizing::new(format!("{}\n---\n{}", *local_notes, *remote_notes))
                 };
 
                 let enc_notes = if merged.is_empty() {
@@ -3523,30 +3576,30 @@ fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         .split(main_layout[1]);
 
     let key = app.key.as_ref().unwrap();
-    
-    let local_pw = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_password, key)
-        .map(|d| String::from_utf8_lossy(&d).into_owned())
+
+    let local_pw: Zeroizing<String> = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_password, key)
+        .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
         .unwrap_or_default();
-    let local_notes = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
-        .map(|d| String::from_utf8_lossy(&d).into_owned())
+    let local_notes: Zeroizing<String> = crate::crypto::decrypt(&current_conflict.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
+        .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
         .unwrap_or_default();
 
-    let remote_pw = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_password, key)
-        .map(|d| String::from_utf8_lossy(&d).into_owned())
+    let remote_pw: Zeroizing<String> = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_password, key)
+        .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
         .unwrap_or_default();
-    let remote_notes = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
-        .map(|d| String::from_utf8_lossy(&d).into_owned())
+    let remote_notes: Zeroizing<String> = crate::crypto::decrypt(&current_conflict.remote_secret.encrypted_notes.clone().unwrap_or_default(), key)
+        .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
         .unwrap_or_default();
 
-    let mut base_pw = String::new();
-    let mut base_notes = String::new();
+    let mut base_pw: Zeroizing<String> = Zeroizing::new(String::new());
+    let mut base_notes: Zeroizing<String> = Zeroizing::new(String::new());
     let mut base_url = String::new();
     if let Some(base_sec) = &current_conflict.base_secret {
         base_pw = crate::crypto::decrypt(&base_sec.encrypted_password, key)
-            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
             .unwrap_or_default();
         base_notes = crate::crypto::decrypt(&base_sec.encrypted_notes.clone().unwrap_or_default(), key)
-            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
             .unwrap_or_default();
         base_url = base_sec.url.clone();
     }
@@ -3563,11 +3616,11 @@ fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         ]),
         Line::from(vec![
             Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&local_pw, if local_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(local_pw.as_str(), if local_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
         ]),
         Line::from(vec![
             Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&local_notes, if local_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(local_notes.as_str(), if local_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
         ]),
     ];
     let local_p = Paragraph::new(local_text).block(local_block);
@@ -3585,11 +3638,11 @@ fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         ]),
         Line::from(vec![
             Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&remote_pw, if remote_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(remote_pw.as_str(), if remote_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
         ]),
         Line::from(vec![
             Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&remote_notes, if remote_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(remote_notes.as_str(), if remote_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
         ]),
         Line::from(""),
         Line::from(vec![

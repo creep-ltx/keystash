@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
+use zeroize::Zeroizing;
 
 /// Combined with the process id, guarantees the temp filenames below are unique
 /// even across two sync operations racing on separate threads within the same
@@ -433,41 +434,41 @@ pub fn detect_sync_conflicts(
 
     for (k, local_sec) in &local_map {
         if let Some(remote_sec) = remote_map.get(k) {
-            let local_pw = crate::crypto::decrypt(&local_sec.encrypted_password, key)
-                .map(|d| String::from_utf8_lossy(&d).into_owned())
+            let local_pw: Zeroizing<String> = crate::crypto::decrypt(&local_sec.encrypted_password, key)
+                .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                 .unwrap_or_default();
-            let remote_pw = crate::crypto::decrypt(&remote_sec.encrypted_password, key)
-                .map(|d| String::from_utf8_lossy(&d).into_owned())
+            let remote_pw: Zeroizing<String> = crate::crypto::decrypt(&remote_sec.encrypted_password, key)
+                .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                 .unwrap_or_default();
 
-            let local_notes = if let Some(notes) = &local_sec.encrypted_notes {
+            let local_notes: Zeroizing<String> = if let Some(notes) = &local_sec.encrypted_notes {
                 crate::crypto::decrypt(notes, key)
-                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                     .unwrap_or_default()
             } else {
-                String::new()
+                Zeroizing::new(String::new())
             };
 
-            let remote_notes = if let Some(notes) = &remote_sec.encrypted_notes {
+            let remote_notes: Zeroizing<String> = if let Some(notes) = &remote_sec.encrypted_notes {
                 crate::crypto::decrypt(notes, key)
-                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                     .unwrap_or_default()
             } else {
-                String::new()
+                Zeroizing::new(String::new())
             };
 
             let differs = local_pw != remote_pw || local_notes != remote_notes || local_sec.url != remote_sec.url;
             if differs {
                 if let Some(base_sec) = base_map.get(k) {
-                    let base_pw = crate::crypto::decrypt(&base_sec.encrypted_password, key)
-                        .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    let base_pw: Zeroizing<String> = crate::crypto::decrypt(&base_sec.encrypted_password, key)
+                        .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                         .unwrap_or_default();
-                    let base_notes = if let Some(notes) = &base_sec.encrypted_notes {
+                    let base_notes: Zeroizing<String> = if let Some(notes) = &base_sec.encrypted_notes {
                         crate::crypto::decrypt(notes, key)
-                            .map(|d| String::from_utf8_lossy(&d).into_owned())
+                            .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                             .unwrap_or_default()
                     } else {
-                        String::new()
+                        Zeroizing::new(String::new())
                     };
 
                     let local_changed = local_pw != base_pw || local_notes != base_notes || local_sec.url != base_sec.url;

@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use rpassword::read_password;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
@@ -25,7 +25,11 @@ fn set_dir_permissions<P: AsRef<Path>>(path: P) {
 #[cfg(not(unix))]
 fn set_dir_permissions<P: AsRef<Path>>(_path: P) {}
 
-fn copy_to_clipboard(text: String, label: &str) {
+/// Takes ownership as `Zeroizing<String>` rather than a plain `String` so the
+/// plaintext is wiped when this function returns, regardless of which branch
+/// below is taken -- a plain `String` parameter would just drop normally,
+/// leaving its contents intact in already-freed heap memory.
+fn copy_to_clipboard(text: Zeroizing<String>, label: &str) {
     if text.trim().is_empty() {
         eprintln!("Cannot copy: {} is empty!", label);
         return;
@@ -82,6 +86,14 @@ fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     print!("{}", prompt);
     let _ = io::stdout().flush();
     zeroize::Zeroizing::new(read_password().unwrap_or_default())
+}
+
+/// Truncates to at most `max_chars` Unicode scalar values. Slicing a `&str` by
+/// raw byte index (e.g. `&s[..22]`) panics if that byte offset falls in the
+/// middle of a multi-byte character -- reachable with any title/category/
+/// username containing non-ASCII text.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }
 
 /// Prompts for the master password and opens the vault at `db_path`, transparently
@@ -264,12 +276,12 @@ fn main() {
                     for r in records {
                         let decrypted_pass = if reveal {
                             crypto::decrypt(&r.encrypted_password, &key)
-                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                                .unwrap_or_else(|_| "<Error>".to_string())
+                                .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                                .unwrap_or_else(|_| Zeroizing::new("<Error>".to_string()))
                         } else {
-                            "••••••••".to_string()
+                            Zeroizing::new("••••••••".to_string())
                         };
-                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
+                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, *decrypted_pass);
                     }
                 }
                 Err(e) => eprintln!("Error fetching secrets: {}", e),
@@ -311,12 +323,12 @@ fn main() {
                         for r in filtered {
                             let decrypted_pass = if reveal {
                                 crypto::decrypt(&r.encrypted_password, &key)
-                                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                                    .unwrap_or_else(|_| "<Error>".to_string())
+                                    .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                                    .unwrap_or_else(|_| Zeroizing::new("<Error>".to_string()))
                             } else {
-                                "••••••••".to_string()
+                                Zeroizing::new("••••••••".to_string())
                             };
-                            println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, decrypted_pass);
+                            println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", r.id, r.title, r.category, r.username, r.url, *decrypted_pass);
                         }
                     }
                 }
@@ -521,8 +533,11 @@ fn main() {
                 return;
             }
 
-            // Keep a copy of plaintext passwords for HIBP if needed
-            let mut plaintext_for_hibp: Vec<(i64, String)> = Vec::new();
+            // Keep a copy of plaintext passwords for HIBP if needed. This can
+            // sit in memory for a while (the HIBP loop below rate-limits at
+            // 700ms/entry), so each password is wrapped so it's wiped once
+            // this whole scope is done with it.
+            let mut plaintext_for_hibp: Vec<(i64, Zeroizing<String>)> = Vec::new();
             let mut plaintext_records: Vec<(i64, String, String, String, String)> = records
                 .iter()
                 .filter_map(|r| {
@@ -531,7 +546,7 @@ fn main() {
                         .and_then(|dec| String::from_utf8(dec.to_vec()).ok())
                         .map(|pw| {
                             if run_hibp {
-                                plaintext_for_hibp.push((r.id, pw.clone()));
+                                plaintext_for_hibp.push((r.id, Zeroizing::new(pw.clone())));
                             }
                             (r.id, r.title.clone(), r.category.clone(), r.username.clone(), pw)
                         })
@@ -607,9 +622,9 @@ fn main() {
                 println!(
                     "  {:<4}  {:<22}  {:<14}  {:<22}  {}  {}{}",
                     entry.id,
-                    &entry.title[..entry.title.len().min(22)],
-                    &entry.category[..entry.category.len().min(14)],
-                    &entry.username[..entry.username.len().min(22)],
+                    truncate_chars(&entry.title, 22),
+                    truncate_chars(&entry.category, 14),
+                    truncate_chars(&entry.username, 22),
                     label,
                     issue_str,
                     hibp_str
@@ -640,21 +655,21 @@ fn main() {
                     if let Some(r) = records.into_iter().find(|rec| rec.id == id) {
                         let decrypted_pass = if reveal {
                             crypto::decrypt(&r.encrypted_password, &key)
-                                .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                                .unwrap_or_else(|_| "<Error>".to_string())
+                                .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                                .unwrap_or_else(|_| Zeroizing::new("<Error>".to_string()))
                         } else {
-                            "••••••••".to_string()
+                            Zeroizing::new("••••••••".to_string())
                         };
                         let decrypted_notes = if let Some(enc_notes) = &r.encrypted_notes {
                             if reveal {
                                 crypto::decrypt(enc_notes, &key)
-                                    .map(|dec| String::from_utf8_lossy(&dec).to_string())
-                                    .unwrap_or_else(|_| "<Error>".to_string())
+                                    .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
+                                    .unwrap_or_else(|_| Zeroizing::new("<Error>".to_string()))
                             } else {
-                                "••••••••".to_string()
+                                Zeroizing::new("••••••••".to_string())
                             }
                         } else {
-                            "[No Notes]".to_string()
+                            Zeroizing::new("[No Notes]".to_string())
                         };
 
                         println!("Secret Details (ID: {}):", r.id);
@@ -663,8 +678,8 @@ fn main() {
                         println!("Category: {}", r.category);
                         println!("Username: {}", r.username);
                         println!("URL:      {}", r.url);
-                        println!("Password: {}", decrypted_pass);
-                        println!("Notes:    {}", decrypted_notes);
+                        println!("Password: {}", *decrypted_pass);
+                        println!("Notes:    {}", *decrypted_notes);
                         println!("Updated:  {}", r.updated_at);
                         println!("----------------------------------------");
                     } else {
@@ -708,9 +723,8 @@ fn main() {
                             }
                         };
 
-                        if let Some(mut text) = text_to_copy {
-                            copy_to_clipboard(text.clone(), field);
-                            text.zeroize();
+                        if let Some(text) = text_to_copy {
+                            copy_to_clipboard(Zeroizing::new(text), field);
                         }
                     } else {
                         println!("Secret with ID {} not found.", id);
@@ -772,10 +786,9 @@ fn main() {
             let _ = options.save();
 
             match generator::generate_password(&options) {
-                Ok(mut pass) => {
+                Ok(pass) => {
                     println!("{}", pass);
-                    copy_to_clipboard(pass.clone(), "generated password");
-                    pass.zeroize();
+                    copy_to_clipboard(Zeroizing::new(pass), "generated password");
                 }
                 Err(e) => {
                     eprintln!("Error generating password: {}", e);
@@ -802,5 +815,26 @@ fn start_tui(no_sync: bool) {
     let app = tui::TuiApp::new(no_sync);
     if let Err(e) = tui::run_tui(app) {
         eprintln!("Terminal application crashed: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_does_not_panic_on_multibyte_boundaries() {
+        // 21 ASCII chars followed by a 2-byte character: byte-slicing at 22
+        // would land inside that character's second byte and panic.
+        let title = format!("{}\u{00e9}more text after", "a".repeat(21));
+        assert_eq!(truncate_chars(&title, 22).chars().count(), 22);
+
+        // Shorter than the limit: returned unchanged.
+        assert_eq!(truncate_chars("short", 22), "short");
+
+        // Entirely multi-byte (emoji, 4 bytes each): still truncates by
+        // character count, not byte count.
+        let emoji_title: String = std::iter::repeat('\u{1F511}').take(30).collect();
+        assert_eq!(truncate_chars(&emoji_title, 22).chars().count(), 22);
     }
 }

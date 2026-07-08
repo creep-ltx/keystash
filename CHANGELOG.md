@@ -7,6 +7,9 @@
 - Fix: Background sync could race with the exit-time sync when the app was unlocked and quit again quickly, leaving the vault in an inconsistent state with no error shown. The two are now serialized.
 - Fix: The Argon2id salt sidecar file is now synced via git alongside the vault database, so a second device can actually derive the right key to unlock an already-migrated vault (previously only the database file was tracked).
 - Fix: Sync now recovers automatically when the remote copy can't be read with the current key (e.g. an unmigrated or otherwise incompatible copy) by backing it up locally and pushing the local vault as the new source of truth, instead of failing.
+- Fix: `keystash audit` crashed on titles/categories/usernames containing multi-byte Unicode characters near the column-truncation boundary; truncation is now character-aware.
+- Fix: Bulk imports (Bitwarden, Brave/Chrome, Firefox, LastPass, KeePassXC, 1Password) now run inside a single transaction, so a failure partway through rolls back the whole import instead of leaving a partial, inconsistent set of rows while reporting the import as failed.
+- Fix: Decrypted passwords and notes are now wiped from memory much more consistently instead of just being dropped as ordinary (unzeroized) `String`s — covers clipboard copies, CLI reveal output, the HIBP audit check, form/dashboard/dedupe/sync-conflict screens, and the sync/export paths that decrypt purely for comparison.
 
 ## [0.2.5] - 2026-07-05
 - Feat: Auto-lock idle timeout for persistent TuiApp sessions
