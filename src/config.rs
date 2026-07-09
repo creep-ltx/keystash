@@ -26,7 +26,13 @@ impl AppConfig {
         path.set_file_name("config.json");
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str::<Self>(&content) {
+                if let Ok(mut config) = serde_json::from_str::<Self>(&content) {
+                    // Clamp here too, not just in the settings-screen save path,
+                    // so a hand-edited or otherwise corrupted config.json can't
+                    // reintroduce an idle timeout of 0 (instant, permanent
+                    // relock loop on every tick).
+                    config.idle_timeout_seconds = config.idle_timeout_seconds.max(10);
+                    config.clipboard_clear_seconds = config.clipboard_clear_seconds.clamp(1, 3600);
                     return config;
                 }
             }

@@ -54,6 +54,8 @@ pub struct DuplicateGroup {
 enum Screen {
     Lock,
     Setup,
+    InterruptedMigration,
+    InterruptedRotation,
     Dashboard,
     AddSecret,
     EditSecret,
@@ -206,6 +208,8 @@ impl TuiApp {
         let screen = match vault_state {
             db::VaultState::New => Screen::Setup,
             db::VaultState::NeedsMigration | db::VaultState::Ready => Screen::Lock,
+            db::VaultState::InterruptedMigration => Screen::InterruptedMigration,
+            db::VaultState::InterruptedRotation => Screen::InterruptedRotation,
         };
         let placeholder_conn = Connection::open_in_memory()
             .expect("failed to open in-memory placeholder database");
@@ -659,7 +663,17 @@ impl TuiApp {
         };
         let db_path = crate::get_db_path();
         let detected_clone = Arc::clone(&self.sync_conflicts_detected);
+        // Take the previous handle out and hand it to the new thread so the
+        // join happens *before* this sync touches any files, rather than
+        // racing against it: spawning first and joining after (the previous
+        // ordering here) let two `git_sync_vault` runs execute concurrently
+        // against the same working directory, which has corrupted a real
+        // vault before (see the comment in `run_tui`'s exit-time sync).
+        let previous = self.pending_sync_thread.lock().ok().and_then(|mut s| s.take());
         let handle = std::thread::spawn(move || {
+            if let Some(prev) = previous {
+                let _ = prev.join();
+            }
             match crate::sync::detect_sync_conflicts(&db_path, &key) {
                 Ok(conflicts) => {
                     if !conflicts.is_empty() {
@@ -672,11 +686,6 @@ impl TuiApp {
             let _ = crate::sync::git_sync_vault(&db_path, &key);
         });
         if let Ok(mut slot) = self.pending_sync_thread.lock() {
-            // If a previous background sync is somehow still running, wait for
-            // it to finish before this one starts touching the same files.
-            if let Some(previous) = slot.take() {
-                let _ = previous.join();
-            }
             *slot = Some(handle);
         }
     }
@@ -698,13 +707,16 @@ impl TuiApp {
             None => return,
         };
         let db_path = crate::get_db_path();
+        // See trigger_postunlock_sync: join the previous handle inside the
+        // new thread, before it touches any files, rather than after spawning.
+        let previous = self.pending_sync_thread.lock().ok().and_then(|mut s| s.take());
         let handle = std::thread::spawn(move || {
+            if let Some(prev) = previous {
+                let _ = prev.join();
+            }
             let _ = crate::sync::git_sync_vault(&db_path, &key);
         });
         if let Ok(mut slot) = self.pending_sync_thread.lock() {
-            if let Some(previous) = slot.take() {
-                let _ = previous.join();
-            }
             *slot = Some(handle);
         }
     }
@@ -818,6 +830,11 @@ fn run_loop<B: ratatui::backend::Backend>(
                         }
                         Screen::Setup => {
                             if handle_setup_input(app, key.code) {
+                                return Ok(());
+                            }
+                        }
+                        Screen::InterruptedMigration | Screen::InterruptedRotation => {
+                            if handle_interrupted_migration_input(key.code) {
                                 return Ok(());
                             }
                         }
@@ -944,6 +961,101 @@ fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
     false
 }
 
+/// Spawns the background HIBP-scan thread over exactly `records`, wiring up
+/// the same progress/abort/cache machinery for both the single/marked-entry
+/// (`h`) and full-vault (`H`) checks -- so a single check gets the same
+/// keyed-connection persistence, progress dialog, and abort key that
+/// previously only the full scan had.
+fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
+    let key = match &app.key {
+        Some(k) => k,
+        None => return,
+    };
+    let already_running = app.hibp_progress.lock().map(|p| p.is_some()).unwrap_or(false);
+    let total_checks = records.len();
+    if already_running || total_checks == 0 {
+        return;
+    }
+
+    *app.hibp_progress.lock().unwrap() = Some((0, total_checks));
+    app.hibp_abort.store(false, Ordering::SeqCst);
+
+    let progress_clone = Arc::clone(&app.hibp_progress);
+    let abort_clone = Arc::clone(&app.hibp_abort);
+    let key_clone = key.clone();
+    let checked_hashes_clone = Arc::clone(&app.checked_hashes_this_session);
+
+    std::thread::spawn(move || {
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_clone);
+        if let Ok(conn) = crate::db::open_keyed_connection(crate::get_db_path(), &sqlcipher_key) {
+            let cached_checks = crate::db::get_all_hibp_checks(&conn).unwrap_or_default();
+            for (i, record) in records.iter().enumerate() {
+                if abort_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let mut checked_online = false;
+                if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone) {
+                    if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                        let hash_bytes = crate::audit::sha256(pw.as_bytes());
+                        let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+
+                        if let Ok(checked_lock) = checked_hashes_clone.lock() {
+                            if checked_lock.contains(&hash_hex) {
+                                pw.zeroize();
+                                if let Ok(mut progress_lock) = progress_clone.lock() {
+                                    if let Some(p) = &mut *progress_lock {
+                                        p.0 = i + 1;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        if let Some(Some(count)) = cached_checks.get(&hash_hex) {
+                            if *count > 0 {
+                                pw.zeroize();
+                                if let Ok(mut progress_lock) = progress_clone.lock() {
+                                    if let Some(p) = &mut *progress_lock {
+                                        p.0 = i + 1;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        let result = crate::audit::check_hibp(&pw);
+                        pw.zeroize();
+                        checked_online = true;
+
+                        let count = match result {
+                            Ok(n) => {
+                                if let Ok(mut checked_lock) = checked_hashes_clone.lock() {
+                                    checked_lock.insert(hash_hex.clone());
+                                }
+                                Some(n)
+                            }
+                            Err(_) => None,
+                        };
+                        let _ = crate::db::save_hibp_check(&conn, &hash_hex, count);
+                    }
+                }
+
+                if let Ok(mut progress_lock) = progress_clone.lock() {
+                    if let Some(p) = &mut *progress_lock {
+                        p.0 = i + 1;
+                    }
+                }
+
+                if checked_online && total_checks > 1 && i + 1 < total_checks {
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+            }
+        }
+        *progress_clone.lock().unwrap() = None;
+    });
+}
+
 fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) -> bool {
     // If in search mode, intercept text keys
     if app.searching {
@@ -1045,8 +1157,11 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             }
         }
         KeyCode::Char('m') => {
+            app.password_input.zeroize();
             app.password_input.clear();
+            app.password_confirm_input.zeroize();
             app.password_confirm_input.clear();
+            app.form_password.zeroize();
             app.form_password.clear();
             app.change_pass_field = 0;
             app.error_message.clear();
@@ -1125,126 +1240,28 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.screen = Screen::HelpDialog;
         }
         KeyCode::Char('h') => {
-            if let Some(key) = &app.key {
-                let mut ids_to_check = Vec::new();
-                if !app.marked_secrets.is_empty() {
-                    ids_to_check.extend(app.marked_secrets.iter().copied());
-                } else if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
-                    ids_to_check.push(record.id);
-                }
-
-                let total_checks = ids_to_check.len();
-                for (i, entry_id) in ids_to_check.iter().copied().enumerate() {
-                    if let Ok(Some(record)) = crate::db::get_secret_by_id(&app.conn, entry_id) {
-                        if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
-                            if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
-                                let result = crate::audit::check_hibp(&pw);
-                                let hash_bytes = crate::audit::sha256(pw.as_bytes());
-                                let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-                                pw.zeroize();
-
-                                let count = match result {
-                                    Ok(n) => Some(n),
-                                    Err(_) => None,
-                                };
-                                let _ = crate::db::save_hibp_check(&app.conn, &hash_hex, count);
-                            }
-                        }
-                    }
-                    app.marked_secrets.remove(&entry_id);
-                    if total_checks > 1 && i + 1 < total_checks {
-                        std::thread::sleep(Duration::from_millis(700));
-                    }
-                }
-                app.refresh_secrets();
+            // Reuses the same background-scan machinery as `H` (progress
+            // dialog, abort key, cache lookups, and -- since the earlier fix --
+            // a properly keyed connection so results actually persist)
+            // instead of checking synchronously on the UI thread: a handful of
+            // marked entries against a slow HIBP response used to freeze the
+            // whole TUI, unpaintable and unabortable, for seconds at a time.
+            let mut ids_to_check: Vec<i64> = Vec::new();
+            if !app.marked_secrets.is_empty() {
+                ids_to_check.extend(app.marked_secrets.iter().copied());
+            } else if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
+                ids_to_check.push(record.id);
             }
+            let records: Vec<crate::db::SecretRecord> = ids_to_check
+                .iter()
+                .filter_map(|id| crate::db::get_secret_by_id(&app.conn, *id).ok().flatten())
+                .collect();
+            app.marked_secrets.clear();
+            spawn_hibp_scan(app, records);
         }
         KeyCode::Char('H') => {
-            if let Some(key) = &app.key {
-                let already_running = app.hibp_progress.lock().map(|p| p.is_some()).unwrap_or(false);
-                if !already_running {
-                    if let Ok(records) = crate::db::get_secrets(&app.conn) {
-                        let total_checks = records.len();
-                        if total_checks > 0 {
-                            *app.hibp_progress.lock().unwrap() = Some((0, total_checks));
-                            app.hibp_abort.store(false, Ordering::SeqCst);
-
-                            let progress_clone = Arc::clone(&app.hibp_progress);
-                            let abort_clone = Arc::clone(&app.hibp_abort);
-                            let key_clone = key.clone();
-                            let checked_hashes_clone = Arc::clone(&app.checked_hashes_this_session);
-
-                            std::thread::spawn(move || {
-                                if let Ok(conn) = rusqlite::Connection::open(crate::get_db_path()) {
-                                    let cached_checks = crate::db::get_all_hibp_checks(&conn).unwrap_or_default();
-                                    for (i, record) in records.iter().enumerate() {
-                                        if abort_clone.load(Ordering::SeqCst) {
-                                            break;
-                                        }
-
-                                        let mut checked_online = false;
-                                        if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone) {
-                                            if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
-                                                let hash_bytes = crate::audit::sha256(pw.as_bytes());
-                                                let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-
-                                                if let Ok(checked_lock) = checked_hashes_clone.lock() {
-                                                    if checked_lock.contains(&hash_hex) {
-                                                        pw.zeroize();
-                                                        if let Ok(mut progress_lock) = progress_clone.lock() {
-                                                            if let Some(p) = &mut *progress_lock {
-                                                                p.0 = i + 1;
-                                                            }
-                                                        }
-                                                        continue;
-                                                    }
-                                                }
-
-                                                if let Some(Some(count)) = cached_checks.get(&hash_hex) {
-                                                    if *count > 0 {
-                                                        pw.zeroize();
-                                                        if let Ok(mut progress_lock) = progress_clone.lock() {
-                                                            if let Some(p) = &mut *progress_lock {
-                                                                p.0 = i + 1;
-                                                            }
-                                                        }
-                                                        continue;
-                                                    }
-                                                }
-
-                                                let result = crate::audit::check_hibp(&pw);
-                                                pw.zeroize();
-                                                checked_online = true;
-
-                                                let count = match result {
-                                                    Ok(n) => {
-                                                        if let Ok(mut checked_lock) = checked_hashes_clone.lock() {
-                                                            checked_lock.insert(hash_hex.clone());
-                                                        }
-                                                        Some(n)
-                                                    }
-                                                    Err(_) => None,
-                                                };
-                                                let _ = crate::db::save_hibp_check(&conn, &hash_hex, count);
-                                            }
-                                        }
-
-                                        if let Ok(mut progress_lock) = progress_clone.lock() {
-                                            if let Some(p) = &mut *progress_lock {
-                                                p.0 = i + 1;
-                                            }
-                                        }
-
-                                        if checked_online && total_checks > 1 && i + 1 < total_checks {
-                                            std::thread::sleep(Duration::from_millis(700));
-                                        }
-                                    }
-                                }
-                                *progress_clone.lock().unwrap() = None;
-                            });
-                        }
-                    }
-                }
+            if let Ok(records) = crate::db::get_secrets(&app.conn) {
+                spawn_hibp_scan(app, records);
             }
         }
 
@@ -1311,6 +1328,7 @@ fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
     if modifiers.contains(KeyModifiers::CONTROL) && (code == KeyCode::Char('g') || code == KeyCode::Char('G')) {
         let opts = crate::generator::GeneratorOptions::load();
         if let Ok(pw) = crate::generator::generate_password(&opts) {
+            app.form_password.zeroize();
             app.form_password = pw;
         }
         return;
@@ -1493,19 +1511,36 @@ fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                 return;
             }
 
-            // Rotate keys
+            // Rotate keys. change_master_password builds the re-keyed vault
+            // at a separate temp path and swaps it into place at db_path, so
+            // app.conn (left open against whatever the pre-rotation backup
+            // path now is) must be replaced with a fresh connection to the
+            // new file on success, not reused.
             match db::change_master_password(&app.conn, &db_path, old_key, &app.password_confirm_input) {
                 Ok(new_key) => {
-                    app.key = Some(new_key);
-                    app.password_input.zeroize();
-                    app.password_confirm_input.zeroize();
-                    app.form_password.zeroize();
-                    app.password_input.clear();
-                    app.password_confirm_input.clear();
-                    app.form_password.clear();
-                    app.error_message = String::new();
-                    app.screen = Screen::Dashboard;
-                    app.refresh_secrets();
+                    match db::open_vault(&db_path, &app.password_confirm_input) {
+                        Ok((new_conn, _)) => {
+                            app.conn = new_conn;
+                            app.key = Some(new_key);
+                            app.password_input.zeroize();
+                            app.password_confirm_input.zeroize();
+                            app.form_password.zeroize();
+                            app.password_input.clear();
+                            app.password_confirm_input.clear();
+                            app.form_password.clear();
+                            app.error_message = String::new();
+                            app.screen = Screen::Dashboard;
+                            app.refresh_secrets();
+                        }
+                        Err(err) => {
+                            // change_master_password already confirmed the new
+                            // vault opens before returning Ok, so this should
+                            // be unreachable -- but surface it loudly rather
+                            // than silently leaving app.conn stale if it ever
+                            // does happen.
+                            app.error_message = format!("Password changed but failed to reopen the vault: {}", err);
+                        }
+                    }
                 }
                 Err(err) => {
                     app.error_message = err;
@@ -1688,6 +1723,8 @@ fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
     match app.screen {
         Screen::Lock => draw_lock_screen(f, app),
         Screen::Setup => draw_setup_screen(f, app),
+        Screen::InterruptedMigration => draw_interrupted_migration_screen(f),
+        Screen::InterruptedRotation => draw_interrupted_rotation_screen(f),
         Screen::Dashboard => draw_dashboard(f, app),
         Screen::AddSecret | Screen::EditSecret => draw_form(f, app),
         Screen::ConfirmationDialog(_) => draw_confirmation_dialog(f, app),
@@ -1754,6 +1791,54 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(hints, chunks[2]);
     }
+}
+
+/// Terminal state for an interrupted `migrate_legacy_vault` run: nothing else
+/// in the TUI is safe to do from here (there's no key, and no vault.db this
+/// process should touch), so this just surfaces the recovery instructions and
+/// waits for the user to quit, fix it from a shell, and relaunch.
+fn draw_interrupted_migration_screen(f: &mut ratatui::Frame) {
+    let size = f.size();
+    f.render_widget(Clear, size);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Interrupted Migration -- Recovery Needed ")
+        .border_style(Style::default().fg(Color::Red));
+
+    let mut text = db::interrupted_migration_message(&crate::get_db_path());
+    text.push_str("\n\nPress [Esc] or [q] to exit.");
+
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .block(block)
+        .style(Style::default().fg(Color::White));
+    f.render_widget(paragraph, size);
+}
+
+fn handle_interrupted_migration_input(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
+}
+
+/// Same reasoning as `draw_interrupted_migration_screen`, for an interrupted
+/// `change_master_password` run instead.
+fn draw_interrupted_rotation_screen(f: &mut ratatui::Frame) {
+    let size = f.size();
+    f.render_widget(Clear, size);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Interrupted Password Change -- Recovery Needed ")
+        .border_style(Style::default().fg(Color::Red));
+
+    let mut text = db::interrupted_rotation_message(&crate::get_db_path());
+    text.push_str("\n\nPress [Esc] or [q] to exit.");
+
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .block(block)
+        .style(Style::default().fg(Color::White));
+    f.render_widget(paragraph, size);
 }
 
 fn draw_setup_screen(f: &mut ratatui::Frame, app: &TuiApp) {
@@ -2890,6 +2975,27 @@ fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 //  Deduplication Screen
 // ─────────────────────────────────────────────
 
+/// Re-stamps a record's `updated_at` to now. Must be called *after* deleting
+/// its duplicates, not before: `delete_secret` writes a tombstone keyed on
+/// the shared (title, category, username) triple, and if the kept record's
+/// timestamp predates that tombstone, the ordinary last-write-wins sync merge
+/// treats the kept record as older than its own tombstone and deletes it on
+/// the next sync -- silently destroying the entry the user just chose to keep.
+fn restamp_record(conn: &rusqlite::Connection, id: i64) {
+    if let Ok(now) = crate::db::now_timestamp(conn) {
+        if let Ok(Some(r)) = crate::db::get_secret_by_id(conn, id) {
+            let _ = crate::db::update_secret_raw(
+                conn,
+                id,
+                &r.url,
+                &r.encrypted_password,
+                r.encrypted_notes.as_deref(),
+                &now,
+            );
+        }
+    }
+}
+
 fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
     let group_count = app.duplicate_groups.len();
     if group_count == 0 {
@@ -2936,10 +3042,11 @@ fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
             for id in ids_to_delete {
                 let _ = crate::db::delete_secret(&app.conn, id);
             }
-            
+            restamp_record(&app.conn, keep_id);
+
             app.refresh_secrets();
             app.find_duplicate_groups();
-            
+
             if app.duplicate_groups.is_empty() {
                 app.screen = Screen::Dashboard;
             } else {
@@ -3001,10 +3108,11 @@ fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
             for id in ids_to_delete {
                 let _ = crate::db::delete_secret(&app.conn, id);
             }
-            
+            restamp_record(&app.conn, keep_id);
+
             app.refresh_secrets();
             app.find_duplicate_groups();
-            
+
             if app.duplicate_groups.is_empty() {
                 app.screen = Screen::Dashboard;
             } else {
@@ -3220,9 +3328,14 @@ fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
             }
         }
         KeyCode::Enter => {
-            let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300);
-            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(10);
-            let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20);
+            // Clamped rather than accepted as-typed: an idle timeout of 0 makes
+            // `last_activity.elapsed() >= Duration::from_secs(0)` always true,
+            // locking the vault on the very next tick -- including right after
+            // this save, soft-locking the user out of the TUI (settings screen
+            // included) until they hand-edit config.json.
+            let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300).max(10);
+            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(10).clamp(1, 3600);
+            let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20).clamp(4, 256);
 
             app.config.idle_timeout_seconds = timeout;
             app.config.clipboard_clear_seconds = clip;
@@ -3518,6 +3631,15 @@ fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.sync_conflicts.clear();
+            // Discarding here (rather than resolving each conflict) means
+            // trigger_postunlock_sync returned early without merging or
+            // pushing -- sync is silently stalled until the next unlock or
+            // exit unless the user is told.
+            app.copied_message = Some((
+                "Sync postponed -- unresolved conflicts remain".to_string(),
+                Instant::now(),
+                StatusType::Normal,
+            ));
             app.screen = Screen::Dashboard;
         }
         _ => {}

@@ -1,6 +1,6 @@
 # KeyStash 🔑
 
-`KeyStash` is a lightweight, secure, and completely offline Terminal User Interface (TUI) secret and password manager written in Rust. It stores credentials locally in an SQLite database, encrypts individual sensitive fields using XChaCha20-Poly1305, derives encryption keys with Argon2id, and supports unencrypted Bitwarden JSON exports.
+`KeyStash` is a lightweight, secure, and completely offline Terminal User Interface (TUI) secret and password manager written in Rust. It stores credentials locally in a SQLCipher-encrypted SQLite database (the entire file, not just individual fields), additionally encrypts `password`/`notes` with XChaCha20-Poly1305 as a second, independent layer, derives encryption keys with Argon2id, and supports unencrypted Bitwarden JSON exports.
 
 ---
 
@@ -158,16 +158,14 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 
 ## 🔒 Security & Cryptographic Model
 
-1. **Symmetric Encryption Split (Plaintext vs Encrypted Fields):**
-   To support logical merging and search across multiple devices, **only sensitive fields (`password` and `notes`) are encrypted**. Database metadata—specifically `title`, `category`, `username`, `url`, and transaction timestamps—are stored in **unencrypted plaintext** inside the SQLite file.
-   > [!IMPORTANT]
-   > Because metadata is stored in plaintext, users must be aware that repository names, websites, categories, and usernames will be visible to anyone with read access to their private Git backup repository.
-2. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit symmetric key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and saved in the database.
-3. **XChaCha20-Poly1305 AEAD:** The sensitive fields are encrypted individually before being stored. Every column write generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
-4. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
-5. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
-6. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
-7. **Schema Migrations:** Database schema integrity checks and upgrades are performed automatically on startup using a custom embedded migrations mechanism.
+1. **Full-Database Encryption (SQLCipher):** The entire `vault.db` file is encrypted via SQLCipher — schema, indexes, and every column, including `title`, `category`, `username`, and `url`. Without the correct master password, the file is an opaque blob, not a readable SQLite database; there is no plaintext metadata for anyone with read access to your Git backup repository (or the raw file) to see.
+2. **Independent Column-Level Layer:** As defense in depth on top of full-database encryption, `password` and `notes` are *additionally* encrypted individually with XChaCha20-Poly1305, using a key derived independently (via HKDF-SHA256, with domain separation) from the same Argon2id master key. A compromise of the SQLCipher layer alone does not, by itself, expose these fields.
+3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and stored in a small sidecar file (`vault.salt`) next to the vault, since nothing inside the encrypted database can be read until the key derived from that salt is already known.
+4. **XChaCha20-Poly1305 AEAD:** The column-level sensitive fields are encrypted individually before being stored. Every encryption generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
+5. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
+6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
+7. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
+8. **Schema Migrations & Crash Safety:** Database schema integrity checks and upgrades are performed automatically on startup. Both the one-time move to the encrypted database format and a master-password change build the new vault file at a temporary path and swap it into place atomically, rather than modifying the live file in place — if the process is interrupted partway through (crash, power loss), KeyStash detects the leftover backup/temp files on next launch and shows exact recovery instructions instead of mistaking your vault for a fresh install.
 
 ---
 
@@ -228,10 +226,12 @@ git pull origin main
 You can now run `keystash` on Device B, enter your existing Master Password, and sync. Both machines will sync and decrypt seamlessly!
 
 ### 2. How it operates
-* **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to pull and logically merge any remote changes concurrent with displaying the Master Password lock screen.
+* **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to fetch (but not yet merge) remote changes concurrent with displaying the Master Password lock screen. The database itself is encrypted, so the actual logical merge needs the key and runs immediately after you unlock, before the dashboard appears.
 * **Background Change Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote. Runs automatically after bulk CSV imports. Single changes inside the TUI are queued locally until exit to avoid redundant network calls.
 * **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
-* **Logical Database Merge:** Compares records using natural keys (`Title + Category + Username`). If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept.
+* **Logical Database Merge:** Every record carries a stable, randomly generated sync ID (independent of its title/category/username, which can otherwise coincidentally repeat between records) that merges, updates, and tombstones are all matched on. If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept.
+> [!NOTE]
+> Syncing requires every device to be on a KeyStash version that supports this sync ID. If one device is still on an older version, syncing from an updated device produces a clear "update KeyStash on the other device first" message rather than merging incorrectly — update the older device and sync it at least once, then sync resumes normally everywhere.
 
 ---
 
@@ -239,8 +239,8 @@ You can now run `keystash` on Device B, enter your existing Master Password, and
 
 KeyStash relies exclusively on safe and audited Rust libraries:
 - `ratatui` & `crossterm` for drawing interactive terminal screens.
-- `rusqlite` for local SQLite database integrations.
-- `chacha20poly1305` & `argon2` for modern cryptography.
+- `rusqlite`, with SQLCipher and OpenSSL statically vendored in, for the full-database-encrypted local SQLite store.
+- `chacha20poly1305`, `argon2`, & `hkdf` for the column-level encryption layer and key derivation.
 - `arboard` for native Wayland and X11 clipboard integration.
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.

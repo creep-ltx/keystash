@@ -49,6 +49,35 @@ fn set_restrictive_umask() {
 #[cfg(not(unix))]
 fn set_restrictive_umask() {}
 
+/// A panic (or a non-panic crash like SIGSEGV in a C dependency such as
+/// SQLCipher/OpenSSL) can otherwise trigger a core dump containing the
+/// entire process address space -- master key, SQLCipher key, and any
+/// decrypted passwords/notes currently in memory -- written to disk in
+/// plaintext, persistently, outside the app's control. Disabling core dumps
+/// at startup closes that off regardless of what crashes later.
+#[cfg(unix)]
+fn disable_core_dumps() {
+    #[repr(C)]
+    struct RLimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+    // SAFETY: setrlimit(2) is a simple libc call taking a pointer to a
+    // plain-old-data struct we own for the duration of the call; no aliasing
+    // or lifetime concerns.
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+    const RLIMIT_CORE: i32 = 4; // Linux and macOS agree on this value.
+    let zero = RLimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe {
+        setrlimit(RLIMIT_CORE, &zero);
+    }
+}
+
+#[cfg(not(unix))]
+fn disable_core_dumps() {}
+
 /// Takes ownership as `Zeroizing<String>` rather than a plain `String` so the
 /// plaintext is wiped when this function returns, regardless of which branch
 /// below is taken -- a plain `String` parameter would just drop normally,
@@ -131,6 +160,14 @@ fn open_or_migrate_vault(db_path: &Path) -> Option<(rusqlite::Connection, zeroiz
             eprintln!("Vault is not initialized. Run `keystash init` first.");
             None
         }
+        db::VaultState::InterruptedMigration => {
+            eprintln!("{}", db::interrupted_migration_message(db_path));
+            None
+        }
+        db::VaultState::InterruptedRotation => {
+            eprintln!("{}", db::interrupted_rotation_message(db_path));
+            None
+        }
         db::VaultState::NeedsMigration => {
             println!("Legacy vault detected -- migrating to the new encrypted database format.");
             let master_pass = prompt_password("Enter Master Password: ");
@@ -187,6 +224,7 @@ fn print_help() {
 
 fn main() {
     set_restrictive_umask();
+    disable_core_dumps();
     let raw_args: Vec<String> = env::args().collect();
     if raw_args.len() >= 3 && raw_args[1] == "__internal-clear-clipboard" {
         use std::io::Read;
@@ -240,6 +278,16 @@ fn main() {
                     if open_or_migrate_vault(&db_path).is_some() {
                         println!("Vault at {:?} is now on the new encrypted format.", db_path);
                     }
+                    return;
+                }
+                db::VaultState::InterruptedMigration => {
+                    // Refuse to init: falling through here would create a
+                    // brand new empty vault right on top of recoverable data.
+                    eprintln!("{}", db::interrupted_migration_message(&db_path));
+                    return;
+                }
+                db::VaultState::InterruptedRotation => {
+                    eprintln!("{}", db::interrupted_rotation_message(&db_path));
                     return;
                 }
                 db::VaultState::New => {}
@@ -521,6 +569,10 @@ fn main() {
             }
 
             println!("Rotating encryption keys and re-encrypting vault records...");
+            // change_master_password builds the re-keyed vault at a separate
+            // temp path and swaps it in; `conn` (still open against whatever
+            // is now at the pre-rotation backup path) is stale after this and
+            // deliberately not reused -- this process exits right after anyway.
             match db::change_master_password(&conn, &db_path, &old_key, &new_pass) {
                 Ok(new_key) => {
                     println!("Success: Master Password changed and vault records re-encrypted!");

@@ -3,6 +3,61 @@ use std::path::{Path, PathBuf};
 use crate::crypto::{self, KEY_LEN, SALT_LEN};
 use zeroize::Zeroizing;
 
+// ─────────────────────────────────────────────
+//  Minimum compatible app version
+//
+//  Stored in the vault itself (`metadata` table) so an older KeyStash binary
+//  can tell it's too old to safely open a given vault, instead of failing
+//  with a raw, confusing SQL/schema error partway through. This is a *floor*,
+//  not a timestamp of "whatever version last wrote this file" -- most
+//  releases don't touch it at all. It only moves when a change genuinely
+//  cannot be read safely by older code. Notably, the sync_uuid column (H2)
+//  deliberately does *not* bump this: old code's explicit column-list queries
+//  just ignore the extra column, so it stays fully readable without a floor
+//  bump (that transition has its own narrower, dedicated compatibility check
+//  in `sync.rs` instead). The last change that actually broke old readers
+//  outright was the move to whole-database SQLCipher encryption -- a
+//  pre-0.3.0 binary can't read a 0.3.0+ vault at all, not even its metadata,
+//  since the entire file is opaque ciphertext to it from byte one.
+// ─────────────────────────────────────────────
+
+pub const MIN_COMPATIBLE_APP_VERSION: &str = "0.3.0";
+
+/// Parses a plain `MAJOR.MINOR.PATCH` version string (KeyStash doesn't use
+/// pre-release/build suffixes) into a comparable tuple. `None` on anything
+/// that doesn't fit that shape.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// True if `running_version` is new enough to satisfy `required_version`.
+/// Treats unparseable input as satisfied rather than blocking access: this
+/// check exists to give a friendlier error than a raw SQL failure, not to act
+/// as a security boundary, and a corrupt/unexpected value here shouldn't be
+/// able to lock someone out of their own vault.
+pub fn version_satisfies(running_version: &str, required_version: &str) -> bool {
+    match (parse_version(running_version), parse_version(required_version)) {
+        (Some(running), Some(required)) => running >= required,
+        _ => true,
+    }
+}
+
+/// Reads the vault's stored minimum-compatible-version, if any. Vaults
+/// created before this feature existed simply have no row -- treated as "no
+/// floor recorded", not as a compatibility failure.
+pub(crate) fn read_min_app_version(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'min_app_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
 #[derive(Clone, Debug)]
 pub struct SecretRecord {
     pub id: i64,
@@ -13,6 +68,29 @@ pub struct SecretRecord {
     pub encrypted_password: Vec<u8>,
     pub encrypted_notes: Option<Vec<u8>>,
     pub updated_at: String,
+    /// Stable identity used for sync/merge, independent of (title, category,
+    /// username) -- see `new_uuid`.
+    pub sync_uuid: String,
+}
+
+/// Generates a random v4 UUID used as a record's stable sync/merge identity.
+/// Not derived from any secret and not itself sensitive -- it exists purely
+/// so `sync.rs`'s merge logic and tombstones have something unique to key on,
+/// instead of the (title, category, username) triple, which two distinct
+/// records can share (e.g. two blank-username entries for the same site).
+/// Uniqueness, not unpredictability, is what matters here, but `rand`'s
+/// thread-local CSPRNG is what's already used elsewhere in this codebase
+/// (`generator.rs`) so there's no reason to reach for anything weaker.
+pub fn new_uuid() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
 }
 
 // ─────────────────────────────────────────────
@@ -24,6 +102,39 @@ pub struct SecretRecord {
 //  isn't secret, it only needs to not move, so this file needs no stronger
 //  protection than restrictive permissions (matching vault.db's own 0600).
 // ─────────────────────────────────────────────
+
+/// Path of the temp file `migrate_legacy_vault` builds the new SQLCipher-encrypted
+/// vault in before atomically moving it into place at `db_path`.
+fn migrating_tmp_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.to_path_buf();
+    p.set_file_name("vault.db.migrating");
+    p
+}
+
+/// Path `migrate_legacy_vault` renames the pre-migration legacy vault to, rather
+/// than deleting it, before moving the new file into place at `db_path`.
+fn pre_sqlcipher_backup_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.to_path_buf();
+    p.set_file_name("vault.db.pre-sqlcipher-backup");
+    p
+}
+
+/// Path `change_master_password` builds the freshly re-keyed vault in before
+/// atomically moving it into place at `db_path`.
+fn rekeying_tmp_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.to_path_buf();
+    p.set_file_name("vault.db.rekeying");
+    p
+}
+
+/// Path `change_master_password` renames the pre-rotation vault to, before
+/// moving the new file into place at `db_path`. Deleted once the new vault is
+/// confirmed to open successfully.
+fn pre_rekey_backup_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.to_path_buf();
+    p.set_file_name("vault.db.pre-rekey-backup");
+    p
+}
 
 fn salt_sidecar_path(db_path: &Path) -> PathBuf {
     let mut p = db_path.to_path_buf();
@@ -66,16 +177,72 @@ pub enum VaultState {
     NeedsMigration,
     /// Salt sidecar exists -- normal SQLCipher-encrypted vault, ready to unlock.
     Ready,
+    /// A previous `migrate_legacy_vault` run was interrupted (crash, power loss,
+    /// OOM kill) between backing up the old file and finishing the swap -- so
+    /// neither `vault.db` nor `vault.salt` may exist right now even though the
+    /// vault isn't actually new. Detected by the leftover `vault.db.migrating`
+    /// temp file and/or `vault.db.pre-sqlcipher-backup`, either of which means
+    /// there's real data recoverable on disk. Must be checked and handled
+    /// before the `NeedsMigration`/`New` fallthrough, or the app would invite
+    /// the user to `init` a fresh empty vault right over their recoverable data.
+    InterruptedMigration,
+    /// A previous `change_master_password` run was interrupted between backing
+    /// up the pre-rotation file and finishing the swap. Same shape and same
+    /// recovery as `InterruptedMigration`, detected via the leftover
+    /// `vault.db.rekeying` temp file and/or `vault.db.pre-rekey-backup`.
+    InterruptedRotation,
 }
 
 pub fn detect_vault_state(db_path: &Path) -> VaultState {
     if salt_sidecar_path(db_path).exists() {
         VaultState::Ready
+    } else if migrating_tmp_path(db_path).exists() || pre_sqlcipher_backup_path(db_path).exists() {
+        VaultState::InterruptedMigration
+    } else if rekeying_tmp_path(db_path).exists() || pre_rekey_backup_path(db_path).exists() {
+        VaultState::InterruptedRotation
     } else if db_path.exists() {
         VaultState::NeedsMigration
     } else {
         VaultState::New
     }
+}
+
+/// Recovery instructions shown by both the CLI and TUI when `detect_vault_state`
+/// reports `InterruptedMigration`. Nothing is destroyed in this state -- the
+/// pre-migration backup (and/or a partially-built new-format copy) is still on
+/// disk -- but the app can't tell that automatically from just "no vault.db",
+/// so it surfaces the exact recovery command instead of silently falling
+/// through to "no vault found".
+pub fn interrupted_migration_message(db_path: &Path) -> String {
+    format!(
+        "A previous migration to the encrypted database format was interrupted \
+(e.g. a crash or power loss) and left the vault in an inconsistent state. \
+Nothing was lost -- your data is still on disk and recoverable:\n\n\
+1. Restore the pre-migration backup:\n   mv {:?} {:?}\n\
+2. Then run keystash again to retry the migration.\n\n\
+(If present, {:?} is a partially-built copy from the interrupted attempt and \
+can be safely deleted.)",
+        pre_sqlcipher_backup_path(db_path),
+        db_path,
+        migrating_tmp_path(db_path),
+    )
+}
+
+/// Recovery instructions shown by both the CLI and TUI when `detect_vault_state`
+/// reports `InterruptedRotation`. Same reasoning as `interrupted_migration_message`.
+pub fn interrupted_rotation_message(db_path: &Path) -> String {
+    format!(
+        "A previous master password change was interrupted \
+(e.g. a crash or power loss) and left the vault in an inconsistent state. \
+Nothing was lost -- your data is still on disk and recoverable:\n\n\
+1. Restore the pre-rotation backup:\n   mv {:?} {:?}\n\
+2. Then run keystash again and retry the password change.\n\n\
+(If present, {:?} is a partially-built copy from the interrupted attempt and \
+can be safely deleted.)",
+        pre_rekey_backup_path(db_path),
+        db_path,
+        rekeying_tmp_path(db_path),
+    )
 }
 
 /// True if no vault has been created at `db_path` yet. Kept alongside
@@ -139,7 +306,8 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
             url TEXT NOT NULL DEFAULT '',
             encrypted_password BLOB NOT NULL,
             encrypted_notes BLOB,
-            updated_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
+            updated_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+            sync_uuid TEXT
         )",
         [],
     )
@@ -160,6 +328,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
             category TEXT NOT NULL,
             username TEXT NOT NULL,
             deleted_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+            sync_uuid TEXT,
             PRIMARY KEY (title, category, username)
         )",
         [],
@@ -186,6 +355,95 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
 
     if !has_url {
         let _ = conn.execute("ALTER TABLE secrets ADD COLUMN url TEXT NOT NULL DEFAULT ''", []);
+    }
+
+    // Migration: add 'sync_uuid' -- a stable per-record identity for sync/merge
+    // that isn't the user-editable (and not-actually-unique) title/category/
+    // username triple every merge step and tombstone used to key on. See H2 in
+    // the fix roadmap: two records legitimately sharing that triple (the exact
+    // case the dedup screen exists to find) made scalar-subquery merge steps
+    // pick an arbitrary row, and could conflate or drop the wrong one entirely.
+    let has_sync_uuid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name = 'sync_uuid'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .unwrap_or(false);
+
+    if !has_sync_uuid {
+        conn.execute("ALTER TABLE secrets ADD COLUMN sync_uuid TEXT", [])
+            .map_err(|e| e.to_string())?;
+
+        let ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM secrets WHERE sync_uuid IS NULL")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        };
+        for id in ids {
+            conn.execute(
+                "UPDATE secrets SET sync_uuid = ?1 WHERE id = ?2",
+                params![new_uuid(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    // Enforced regardless of whether the column was just added or already
+    // existed, same as the ALTER above being safe to re-run every open.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_secrets_sync_uuid ON secrets(sync_uuid)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let has_tombstone_uuid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('deleted_secrets') WHERE name = 'sync_uuid'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .unwrap_or(false);
+    if !has_tombstone_uuid {
+        // Old tombstones predate sync_uuid entirely and there's no way to
+        // recover which record they originally referred to -- they're left
+        // NULL and simply become inert for merge-matching purposes (a NULL
+        // sync_uuid never matches a real record's non-null one), rather than
+        // risk mismatching them against an unrelated record that happens to
+        // share the old title/category/username triple.
+        let _ = conn.execute("ALTER TABLE deleted_secrets ADD COLUMN sync_uuid TEXT", []);
+    }
+
+    // Stamp the current compatibility floor if it's not already recorded.
+    // Only ever written here if missing -- never overwritten -- so a vault
+    // that already recorded a *higher* floor (written by a newer version)
+    // keeps requiring that higher version; this call only runs after
+    // `open_vault`'s own pre-check already confirmed the running binary
+    // satisfies whatever floor is currently on file.
+    let has_min_version: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM metadata WHERE key = 'min_app_version'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .unwrap_or(false);
+    if !has_min_version {
+        let _ = conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('min_app_version', ?1)",
+            params![MIN_COMPATIBLE_APP_VERSION],
+        );
     }
 
     Ok(())
@@ -239,6 +497,21 @@ pub fn open_vault(
 
     let conn = open_keyed_connection(db_path, &sqlcipher_key)
         .map_err(|_| "Incorrect master password.".to_string())?;
+
+    // Checked before ensure_schema runs any migration logic against this
+    // vault: if it was last written by a version whose format this binary
+    // predates, we shouldn't be altering its schema at all, let alone trying
+    // to operate on it further.
+    if let Some(required) = read_min_app_version(&conn)
+        && !version_satisfies(env!("CARGO_PKG_VERSION"), &required)
+    {
+        return Err(format!(
+            "This vault requires KeyStash v{} or newer to open. You are running v{}. Please update KeyStash and try again.",
+            required,
+            env!("CARGO_PKG_VERSION"),
+        ));
+    }
+
     ensure_schema(&conn)?;
 
     let encrypted_token: Vec<u8> = conn
@@ -306,8 +579,12 @@ pub fn migrate_legacy_vault(
         legacy_old_key
     };
 
-    // 2. Read every row that needs to carry over.
-    let secrets = get_secrets(&old_conn)?;
+    // 2. Read every row that needs to carry over. Uses the pre-sync_uuid
+    //    8-column layout, not the shared get_secrets(): old_conn is a genuine
+    //    legacy vault, deliberately never run through ensure_schema (which
+    //    would alter its on-disk format before the password above is even
+    //    confirmed against it), so it has no sync_uuid column to select.
+    let secrets = get_secrets_legacy(&old_conn)?;
     let tombstones: Vec<(String, String, String, String)> = {
         let mut stmt = old_conn
             .prepare("SELECT title, category, username, deleted_at FROM deleted_secrets")
@@ -327,7 +604,7 @@ pub fn migrate_legacy_vault(
     let new_master_key = crypto::derive_key(master_password, &new_salt)?;
     let new_sqlcipher_key = crypto::derive_sqlcipher_key(&new_master_key);
 
-    let tmp_path = db_path.with_file_name("vault.db.migrating");
+    let tmp_path = migrating_tmp_path(db_path);
     let _ = std::fs::remove_file(&tmp_path);
     let new_conn = open_keyed_connection(&tmp_path, &new_sqlcipher_key)?;
     ensure_schema(&new_conn)?;
@@ -350,11 +627,13 @@ pub fn migrate_legacy_vault(
             }
             None => None,
         };
+        // Legacy vaults predate sync_uuid entirely, so every migrated row gets
+        // a freshly generated one here rather than carrying over anything.
         new_conn
             .execute(
-                "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![r.title, r.category, r.username, r.url, re_encrypted_pass, re_encrypted_notes, r.updated_at],
+                "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![r.title, r.category, r.username, r.url, re_encrypted_pass, re_encrypted_notes, r.updated_at, new_uuid()],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -379,7 +658,7 @@ pub fn migrate_legacy_vault(
     // 4. Back up the old file, then move the new one into place, then persist the
     //    new salt. Order matters: the salt sidecar is only written once the
     //    migrated file is already sitting at db_path.
-    let backup_path = db_path.with_file_name("vault.db.pre-sqlcipher-backup");
+    let backup_path = pre_sqlcipher_backup_path(db_path);
     std::fs::rename(db_path, &backup_path).map_err(|e| format!("Failed to back up legacy vault: {}", e))?;
     std::fs::rename(&tmp_path, db_path).map_err(|e| format!("Failed to move migrated vault into place: {}", e))?;
     write_salt_sidecar(db_path, &new_salt)?;
@@ -406,9 +685,9 @@ pub fn add_secret(
     };
 
     conn.execute(
-        "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
-        params![title, category, username, url, encrypted_password, encrypted_notes],
+        "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), ?7)",
+        params![title, category, username, url, encrypted_password, encrypted_notes, new_uuid()],
     )
     .map_err(|e| e.to_string())?;
 
@@ -472,11 +751,16 @@ pub fn update_secret_raw(
     Ok(())
 }
 
-pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
+/// Reads `secrets` using the pre-sync_uuid 8-column layout. Only for
+/// `migrate_legacy_vault`'s `old_conn` -- see the comment at its call site.
+/// `sync_uuid` is left empty; every row read this way gets a freshly
+/// generated one when copied into the new vault, so nothing reads this
+/// placeholder back.
+fn get_secrets_legacy(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at FROM secrets ORDER BY title ASC")
+        .prepare("SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at FROM secrets")
         .map_err(|e| e.to_string())?;
-    
+
     let secret_iter = stmt
         .query_map([], |row| {
             Ok(SecretRecord {
@@ -488,6 +772,35 @@ pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
                 encrypted_password: row.get(5)?,
                 encrypted_notes: row.get(6)?,
                 updated_at: row.get(7)?,
+                sync_uuid: String::new(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut secrets = Vec::new();
+    for secret in secret_iter {
+        secrets.push(secret.map_err(|e| e.to_string())?);
+    }
+    Ok(secrets)
+}
+
+pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid FROM secrets ORDER BY title ASC")
+        .map_err(|e| e.to_string())?;
+
+    let secret_iter = stmt
+        .query_map([], |row| {
+            Ok(SecretRecord {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                category: row.get(2)?,
+                username: row.get(3)?,
+                url: row.get(4)?,
+                encrypted_password: row.get(5)?,
+                encrypted_notes: row.get(6)?,
+                updated_at: row.get(7)?,
+                sync_uuid: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -501,7 +814,7 @@ pub fn get_secrets(conn: &Connection) -> Result<Vec<SecretRecord>, String> {
 
 pub fn get_secret_by_id(conn: &Connection, id: i64) -> Result<Option<SecretRecord>, String> {
     conn.query_row(
-        "SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at FROM secrets WHERE id = ?1",
+        "SELECT id, title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid FROM secrets WHERE id = ?1",
         params![id],
         |row| Ok(SecretRecord {
             id: row.get(0)?,
@@ -512,6 +825,7 @@ pub fn get_secret_by_id(conn: &Connection, id: i64) -> Result<Option<SecretRecor
             encrypted_password: row.get(5)?,
             encrypted_notes: row.get(6)?,
             updated_at: row.get(7)?,
+            sync_uuid: row.get(8)?,
         }),
     )
     .optional()
@@ -520,56 +834,103 @@ pub fn get_secret_by_id(conn: &Connection, id: i64) -> Result<Option<SecretRecor
 
 pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
     // 1. Fetch details for tombstone
-    let record: Option<(String, String, String)> = conn
+    let record: Option<(String, String, String, String)> = conn
         .query_row(
-            "SELECT title, category, username FROM secrets WHERE id = ?1",
+            "SELECT title, category, username, sync_uuid FROM secrets WHERE id = ?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
 
-    if let Some((title, category, username)) = record {
-        // 2. Insert into deleted_secrets tombstone table
-        conn.execute(
-            "INSERT OR REPLACE INTO deleted_secrets (title, category, username, deleted_at)
-             VALUES (?1, ?2, ?3, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
-            params![title, category, username],
-        )
+    // Tombstone-insert and delete run in one transaction: without it, a crash
+    // between the two left the tombstone written but the row still present --
+    // harmless on its own (the next delete attempt just re-writes the
+    // tombstone), but needlessly leaves the vault in an inconsistent
+    // in-between state for however long until that retry happens.
+    conn.execute("BEGIN TRANSACTION", [])
         .map_err(|e| e.to_string())?;
+
+    if let Some((title, category, username, sync_uuid)) = record {
+        // 2. Insert into deleted_secrets tombstone table. sync_uuid, not the
+        // triple, is what sync merge steps actually match a tombstone against
+        // -- see H2 -- the triple is kept only for display/debugging.
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO deleted_secrets (title, category, username, sync_uuid, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
+            params![title, category, username, sync_uuid],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e.to_string());
+        }
     }
 
     // 3. Delete the actual secret
-    conn.execute("DELETE FROM secrets WHERE id = ?1", params![id])
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = conn.execute("DELETE FROM secrets WHERE id = ?1", params![id]) {
+        let _ = conn.execute("ROLLBACK", []);
+        return Err(e.to_string());
+    }
+
+    conn.execute("COMMIT", []).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Rotates the master password: re-derives a new salt/master key/SQLCipher key,
-/// re-keys the SQLCipher layer itself (`PRAGMA rekey`), re-encrypts every
-/// field-level secret, and replaces the salt sidecar file. All of the fallible,
-/// data-dependent work (decrypting/re-encrypting every secret) happens first and
-/// is fully validated in memory before either of the two irreversible steps
-/// (`PRAGMA rekey` and writing the new salt sidecar) run, to keep the window
-/// where a mid-operation failure could leave the vault inconsistent as small as
-/// possible. `PRAGMA rekey` is a SQLCipher-internal operation and can't be
-/// wrapped in the same explicit transaction as the subsequent metadata/secret
-/// updates.
+/// Rotates the master password by building a brand new SQLCipher-encrypted
+/// vault at a temp path (fresh salt, every secret decrypted with `old_key` and
+/// re-encrypted with the new one) and atomically swapping it into place --
+/// the same build-then-swap discipline `migrate_legacy_vault` already uses,
+/// and for the same reason.
+///
+/// This replaces an earlier version that re-keyed the live file in place via
+/// `PRAGMA rekey` and only wrote the new salt sidecar at the very end. That
+/// had a real bricking window: `PRAGMA rekey` commits immediately and can't
+/// be rolled back, so if the process died anywhere between that and the final
+/// `write_salt_sidecar` call, the on-disk file ended up re-keyed with a salt
+/// that existed nowhere but that process's now-gone memory -- permanently
+/// unrecoverable, with no backup file to point the user at (unlike a botched
+/// migration, which at least keeps `vault.db.pre-sqlcipher-backup`). Building
+/// the new file at a temp path first means the live file is never touched
+/// until a fully-formed, already-validated replacement is ready to swap in;
+/// an interruption anywhere before that swap leaves the original file and
+/// salt untouched, and an interruption during the swap itself is the exact
+/// same recoverable shape as `VaultState::InterruptedMigration` (see
+/// `VaultState::InterruptedRotation`).
+///
+/// The caller's existing `conn` is only read from here, never written to or
+/// closed -- but it should be treated as stale after this returns `Ok`: on
+/// success the live file at `db_path` is a different file than the one that
+/// connection was opened against. Reopen with `open_vault` (as both call
+/// sites do) rather than continuing to use the old connection.
 pub fn change_master_password(
     conn: &Connection,
     db_path: &Path,
     old_key: &[u8; KEY_LEN],
     new_password: &str,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
-    // 1. Generate new salt and derive new master + SQLCipher keys
+    // 1. Generate new salt and derive new master + SQLCipher keys.
     let new_salt = crypto::generate_salt();
     let new_key = crypto::derive_key(new_password, &new_salt)?;
     let new_sqlcipher_key = crypto::derive_sqlcipher_key(&new_key);
 
-    // 2. Fetch all secrets
+    // 2. Read everything that needs to carry over from the still-untouched
+    //    live vault: secrets (to be re-encrypted below), tombstones and the
+    //    HIBP cache (copied verbatim -- neither is field-level encrypted).
     let secrets = get_secrets(conn)?;
+    let tombstones: Vec<(String, String, String, Option<String>, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT title, category, username, sync_uuid, deleted_at FROM deleted_secrets")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+    };
+    let hibp_checks = get_all_hibp_checks(conn)?;
 
-    // 3. Decrypt and re-encrypt all secrets in memory first to verify success
+    // 3. Decrypt and re-encrypt every secret in memory, fully validated before
+    //    any file is touched. sync_uuid is carried over unchanged -- rotating
+    //    the password doesn't change a record's sync identity, only how its
+    //    ciphertext is encrypted.
     let mut re_encrypted_secrets = Vec::with_capacity(secrets.len());
     for r in &secrets {
         let plaintext_pass = crypto::decrypt(&r.encrypted_password, old_key)?;
@@ -583,50 +944,95 @@ pub fn change_master_password(
             None => None,
         };
 
-        re_encrypted_secrets.push((r.id, encrypted_pass, encrypted_notes));
+        re_encrypted_secrets.push((r, encrypted_pass, encrypted_notes));
     }
-
-    // 4. Encrypt verification token with the new key
     let new_verification = crypto::encrypt(b"keystash-verification-token", &new_key)?;
 
-    // 5. Re-key the SQLCipher layer itself. This commits immediately and can't be
-    //    rolled back, so it only runs once every crypto operation above has
-    //    already succeeded.
-    let pragma_hex = crypto::pragma_key_hex(&new_sqlcipher_key);
-    conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", *pragma_hex))
-        .map_err(|e| format!("Failed to re-key vault: {}", e))?;
+    // 4. Build the new vault at a temp path. The live file at db_path is not
+    //    touched by anything above or below this point until step 5's renames.
+    let tmp_path = rekeying_tmp_path(db_path);
+    let _ = std::fs::remove_file(&tmp_path);
+    let new_conn = open_keyed_connection(&tmp_path, &new_sqlcipher_key)?;
+    ensure_schema(&new_conn)?;
 
-    // 6. Update SQLite records in a transaction
-    conn.execute("BEGIN TRANSACTION", [])
-        .map_err(|e| format!("Failed to start key rotation transaction: {}", e))?;
+    new_conn
+        .execute(
+            "INSERT INTO metadata (key, value) VALUES ('verification', ?1)",
+            params![new_verification],
+        )
+        .map_err(|e| e.to_string())?;
 
-    // Update verification token
-    if let Err(e) = conn.execute(
-        "UPDATE metadata SET value = ?1 WHERE key = 'verification'",
-        params![new_verification],
-    ) {
-        let _ = conn.execute("ROLLBACK", []);
-        return Err(e.to_string());
+    for (r, enc_pass, enc_notes) in &re_encrypted_secrets {
+        new_conn
+            .execute(
+                "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), ?7)",
+                params![r.title, r.category, r.username, r.url, enc_pass, enc_notes, r.sync_uuid],
+            )
+            .map_err(|e| e.to_string())?;
     }
-
-    // Update each secret
-    for (id, enc_pass, enc_notes) in re_encrypted_secrets {
-        if let Err(e) = conn.execute(
-            "UPDATE secrets SET encrypted_password = ?1, encrypted_notes = ?2, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?3",
-            params![enc_pass, enc_notes, id],
-        ) {
-            let _ = conn.execute("ROLLBACK", []);
-            return Err(e.to_string());
-        }
+    for (title, category, username, sync_uuid, deleted_at) in &tombstones {
+        new_conn
+            .execute(
+                "INSERT OR REPLACE INTO deleted_secrets (title, category, username, sync_uuid, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![title, category, username, sync_uuid, deleted_at],
+            )
+            .map_err(|e| e.to_string())?;
     }
+    for (hash, count) in &hibp_checks {
+        new_conn
+            .execute(
+                "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
+                params![hash, count.map(|c| c as i64)],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // open_keyed_connection leaves this file in WAL mode, meaning the inserts
+    // above may still be sitting in vault.db.rekeying-wal rather than the main
+    // file. Only tmp_path itself gets renamed below, not its WAL sidecar, so
+    // switching off WAL here forces a full checkpoint back into the main file
+    // and removes the sidecar entirely -- otherwise the swapped-in file can
+    // be nearly empty, containing only what ensure_schema wrote before any of
+    // this function's own inserts ran.
+    new_conn
+        .execute_batch("PRAGMA journal_mode=DELETE;")
+        .map_err(|e| e.to_string())?;
+    new_conn.close().map_err(|(_, e)| e.to_string())?;
 
-    conn.execute("COMMIT", [])
-        .map_err(|e| format!("Failed to commit key rotation: {}", e))?;
+    // The caller's own `conn` is still open in WAL mode against db_path, and
+    // renaming db_path away (below) only moves the main file -- its
+    // `-wal`/`-shm` sidecars stay behind under db_path's original name. Left
+    // alone, they'd sit right next to the freshly swapped-in file at that
+    // same name and get mistaken for *its* WAL state on next open, which is
+    // exactly what caused the new vault to fail reopening (SQLCipher-decoded
+    // WAL frames from a different key look like corruption, not merely a
+    // stale/mismatched WAL SQLite could safely ignore). Checkpointing and
+    // truncating here empties them out first, in place, while `conn` is still
+    // valid to call this on.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| format!("Failed to checkpoint vault before key rotation: {}", e))?;
 
-    // 7. Only persist the new salt sidecar once everything above has committed.
+    // 5. Swap: back up the current file (deleted below once the new one is
+    //    confirmed working, unlike the permanent migration backup -- password
+    //    rotation is routine, not a one-time format change worth keeping
+    //    insurance for indefinitely), move the new file into place, then
+    //    persist the new salt last.
+    let backup_path = pre_rekey_backup_path(db_path);
+    std::fs::rename(db_path, &backup_path).map_err(|e| format!("Failed to back up vault before key rotation: {}", e))?;
+    std::fs::rename(&tmp_path, db_path).map_err(|e| format!("Failed to move re-keyed vault into place: {}", e))?;
     write_salt_sidecar(db_path, &new_salt)?;
 
-    Ok(new_key)
+    // 6. Confirm the new vault actually opens before discarding the backup.
+    match open_vault(db_path, new_password) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(new_key)
+        }
+        Err(e) => Err(format!(
+            "Key rotation produced a vault that failed to reopen ({}). The pre-rotation backup was kept at {:?}.",
+            e, backup_path
+        )),
+    }
 }
 
 pub fn save_hibp_check(conn: &Connection, password_hash: &str, count: Option<u64>) -> Result<(), String> {
@@ -724,16 +1130,25 @@ mod sqlcipher_tests {
         add_secret(&conn, "Site", "Cat", "user", "", "hunter2", None, &old_key).unwrap();
 
         let new_key = change_master_password(&conn, &db_path, &old_key, "new-password-456").unwrap();
-        let secrets = get_secrets(&conn).unwrap();
+        // change_master_password swaps in a physically different file at
+        // db_path; `conn` (left open against whatever now sits at the
+        // pre-rotation backup path) must not be reused afterward -- reopen
+        // fresh, exactly as both real call sites (main.rs, tui.rs) now do.
+        drop(conn);
+
+        let (conn2, key2) = open_vault(&db_path, "new-password-456").expect("new password should unlock after rotation");
+        assert_eq!(&*key2, &*new_key);
+        let secrets = get_secrets(&conn2).unwrap();
         let decrypted = crypto::decrypt(&secrets[0].encrypted_password, &new_key).unwrap();
         assert_eq!(&*decrypted, b"hunter2");
-        drop(conn);
+        drop(conn2);
 
         // Old password no longer opens the vault; SQLCipher itself was re-keyed.
         assert!(open_vault(&db_path, "old-password-123").is_err());
-        // New password does.
-        let (_conn3, key3) = open_vault(&db_path, "new-password-456").expect("new password should unlock after rotation");
-        assert_eq!(&*key3, &*new_key);
+
+        // The pre-rotation backup is cleaned up once the new vault is
+        // confirmed to open successfully.
+        assert!(!db_path.with_file_name("vault.db.pre-rekey-backup").exists());
 
         cleanup(&db_path);
     }
@@ -761,7 +1176,14 @@ mod sqlcipher_tests {
         legacy_conn.execute("INSERT INTO metadata (key, value) VALUES ('salt', ?1)", params![legacy_salt.to_vec()]).unwrap();
         let token = crypto::encrypt(b"keystash-verification-token", &legacy_key).unwrap();
         legacy_conn.execute("INSERT INTO metadata (key, value) VALUES ('verification', ?1)", params![token]).unwrap();
-        add_secret(&legacy_conn, "Old Site", "Legacy", "olduser", "", "legacy-pass", None, &legacy_key).unwrap();
+        // Insert directly against the legacy 8-column schema above rather than
+        // through add_secret(), which now also writes sync_uuid -- a column a
+        // genuine legacy vault (and this hand-built fixture matching it) never has.
+        let legacy_encrypted_pass = crypto::encrypt(b"legacy-pass", &legacy_key).unwrap();
+        legacy_conn.execute(
+            "INSERT INTO secrets (title, category, username, url, encrypted_password) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["Old Site", "Legacy", "olduser", "", legacy_encrypted_pass],
+        ).unwrap();
         drop(legacy_conn);
 
         assert_eq!(detect_vault_state(&db_path), VaultState::NeedsMigration);
@@ -785,6 +1207,67 @@ mod sqlcipher_tests {
         assert!(open_vault(&db_path, "legacy-master-pw").is_ok());
 
         let _ = std::fs::remove_file(db_path.with_file_name("vault.db.pre-sqlcipher-backup"));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn version_satisfies_compares_major_minor_patch_correctly() {
+        assert!(version_satisfies("0.4.0", "0.3.0"));
+        assert!(version_satisfies("0.3.0", "0.3.0"));
+        assert!(!version_satisfies("0.2.9", "0.3.0"));
+        assert!(version_satisfies("1.0.0", "0.9.9"));
+        assert!(version_satisfies("0.10.0", "0.9.0"), "numeric, not lexicographic, comparison");
+        assert!(!version_satisfies("0.9.0", "0.10.0"));
+        // Unparseable input is treated as satisfied -- a friendliness feature,
+        // not a security boundary, so it shouldn't lock anyone out.
+        assert!(version_satisfies("garbage", "0.3.0"));
+        assert!(version_satisfies("0.3.0", "garbage"));
+    }
+
+    #[test]
+    fn open_vault_refuses_a_vault_requiring_a_newer_version() {
+        let db_path = temp_db_path("min-version-gate");
+        let (conn, _key) = create_vault(&db_path, "some-password").unwrap();
+
+        conn.execute(
+            "UPDATE metadata SET value = '99.0.0' WHERE key = 'min_app_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = open_vault(&db_path, "some-password");
+        assert!(result.is_err(), "opening a vault requiring v99.0.0 should fail");
+        let err = result.unwrap_err();
+        assert!(err.contains("99.0.0"), "error should name the required version, got: {}", err);
+        assert!(err.contains("KeyStash"), "error should be a clear, distinct message, got: {}", err);
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn open_vault_ignores_a_missing_or_older_min_version_row() {
+        let db_path = temp_db_path("min-version-ok");
+        let (conn, _key) = create_vault(&db_path, "some-password").unwrap();
+
+        // A vault created by current code always has the row; simulate one
+        // predating this feature entirely by deleting it, and confirm that's
+        // still treated as compatible, not as a failure.
+        conn.execute("DELETE FROM metadata WHERE key = 'min_app_version'", [])
+            .unwrap();
+        drop(conn);
+        assert!(open_vault(&db_path, "some-password").is_ok(), "a vault with no min_app_version row at all should still open");
+
+        // And an explicitly low floor should obviously still be satisfied.
+        let (conn2, _) = open_vault(&db_path, "some-password").unwrap();
+        conn2.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('min_app_version', '0.0.1')",
+            [],
+        )
+        .unwrap();
+        drop(conn2);
+        assert!(open_vault(&db_path, "some-password").is_ok());
+
         cleanup(&db_path);
     }
 }

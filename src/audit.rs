@@ -149,11 +149,18 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>) -> A
 //  Strength checker
 // ─────────────────────────────────────────────
 
+/// Scores by estimated brute-force entropy (character-pool size ^ length, in
+/// bits) rather than the additive-points scheme this replaced. The old scheme
+/// capped out at 5 points needing every charset class present, so a 40-char
+/// random lowercase passphrase -- genuinely excellent -- scored only 2 points
+/// and was reported "Critical" right alongside "password123", while a short
+/// "Aa1!" that happened to touch all four classes scored higher. Entropy is
+/// what actually determines how hard a password is to brute-force, so it's
+/// what determines severity here instead.
 fn check_strength(password: &str) -> (Severity, Vec<String>, u8) {
     let mut issues = Vec::new();
-    let mut score: u8 = 0;
 
-    let len = password.len();
+    let n_chars = password.chars().count();
     let has_upper  = password.chars().any(|c| c.is_uppercase());
     let has_lower  = password.chars().any(|c| c.is_lowercase());
     let has_digit  = password.chars().any(|c| c.is_ascii_digit());
@@ -161,53 +168,68 @@ fn check_strength(password: &str) -> (Severity, Vec<String>, u8) {
     let lower_pw   = password.to_lowercase();
     let is_common  = COMMON_WEAK.contains(&lower_pw.as_str());
 
-    // Length scoring
-    if len >= 16 {
-        score += 2;
-    } else if len >= 10 {
-        score += 1;
-    } else if len < 8 {
-        issues.push(format!("Too short ({} chars, minimum 8 recommended)", len));
-    }
-
-    // Charset scoring
-    if has_upper  { score += 1; } else { issues.push("No uppercase letters".to_string()); }
-    if has_digit  { score += 1; } else { issues.push("No numbers".to_string()); }
-    if has_symbol { score += 1; } else { issues.push("No special characters".to_string()); }
-
-    // Common password check (overrides everything)
-    if is_common {
-        issues.insert(0, "Password is a known common/weak password".to_string());
+    // Empty / blank
+    if n_chars == 0 {
+        issues.push("Password is empty".to_string());
         return (Severity::Critical, issues, 0);
     }
 
-    // Empty / blank
-    if len == 0 {
-        issues.insert(0, "Password is empty".to_string());
+    // Common password check (overrides everything)
+    if is_common {
+        issues.push("Password is a known common/weak password".to_string());
         return (Severity::Critical, issues, 0);
     }
 
     // Repeated characters (e.g. "aaaaaaa")
     let all_same = password.chars().all(|c| c == password.chars().next().unwrap_or(' '));
-    if all_same && len > 0 {
-        issues.insert(0, "Password consists of a single repeated character".to_string());
+    if all_same {
+        issues.push("Password consists of a single repeated character".to_string());
         return (Severity::Critical, issues, 0);
     }
 
-    // Sequential strings (e.g. "12345678", "abcdefgh")
-    if is_sequential(password) {
-        issues.push("Password is a sequential pattern (e.g. 12345678, abcdefgh)".to_string());
-        score = score.saturating_sub(2);
+    let mut pool: f64 = 0.0;
+    if has_lower  { pool += 26.0; }
+    if has_upper  { pool += 26.0; }
+    if has_digit  { pool += 10.0; }
+    if has_symbol { pool += 33.0; }
+    let mut entropy_bits = (n_chars as f64) * pool.max(1.0).log2();
+
+    // Sequential strings (e.g. "12345678", "abcdefgh") are trivially guessable
+    // regardless of what their raw pool size implies.
+    let sequential = is_sequential(password);
+    if sequential {
+        entropy_bits = (entropy_bits - 20.0).max(0.0);
     }
 
-    // Ignore lower flag for scoring (lower alone isn't a bonus)
-    let _ = has_lower;
-
-    let severity = match score {
-        5..=u8::MAX => Severity::Good,
-        3..=4 => Severity::Weak,
-        _ => Severity::Critical,
+    let severity = if entropy_bits >= 75.0 {
+        Severity::Good
+    } else if entropy_bits >= 50.0 {
+        Severity::Weak
+    } else {
+        Severity::Critical
     };
+
+    // AuditEntry::issues is documented as empty when severity == Good, so
+    // charset/length nitpicks only get surfaced once they've actually
+    // affected the outcome -- otherwise a long, Good-rated lowercase
+    // passphrase would still show "No uppercase letters" etc. as if it were
+    // a problem.
+    if severity != Severity::Good {
+        if n_chars < 8 {
+            issues.push(format!("Too short ({} chars, minimum 8 recommended)", n_chars));
+        }
+        if !has_upper  { issues.push("No uppercase letters".to_string()); }
+        if !has_digit  { issues.push("No numbers".to_string()); }
+        if !has_symbol { issues.push("No special characters".to_string()); }
+        if sequential {
+            issues.push("Password is a sequential pattern (e.g. 12345678, abcdefgh)".to_string());
+        }
+    }
+
+    // Displayed elsewhere as an out-of-5 bar; 20 bits/point lines up with the
+    // Good threshold above (a 16-char all-lowercase passphrase, ~75 bits,
+    // lands at a full bar).
+    let score = (entropy_bits / 20.0).min(5.0) as u8;
 
     (severity, issues, score)
 }

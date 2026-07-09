@@ -511,11 +511,25 @@ pub fn import_onepassword_csv(
 
 /// Escapes fields containing commas, quotes, or newlines according to standard RFC 4180 CSV specifications.
 fn escape_csv_cell(val: &str) -> String {
+    // A cell starting with =, +, -, or @ is interpreted as a formula by Excel/
+    // LibreOffice/Google Sheets when the CSV is opened -- so a synced vault
+    // entry planted on one device (title, username, or note) becomes code
+    // execution on whichever device later exports and opens the CSV. Prefixing
+    // with a single quote forces spreadsheet apps to treat it as literal text.
+    let needs_formula_guard = matches!(
+        val.as_bytes().first(),
+        Some(b'=') | Some(b'+') | Some(b'-') | Some(b'@')
+    );
+    let val = if needs_formula_guard {
+        format!("'{}", val)
+    } else {
+        val.to_string()
+    };
     if val.contains(',') || val.contains('"') || val.contains('\n') || val.contains('\r') {
         let escaped = val.replace('"', "\"\"");
         format!("\"{}\"", escaped)
     } else {
-        val.to_string()
+        val
     }
 }
 
