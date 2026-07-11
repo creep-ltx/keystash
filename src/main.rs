@@ -210,7 +210,7 @@ fn print_help() {
     println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
     println!("  keystash copy <id> [username|password|url] Copy entry's field to clipboard (default: password)");
     println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols] Generate a random password");
-    println!("  keystash import <path>                    Import unencrypted logins (supports Bitwarden, Brave/Chrome, Firefox)");
+    println!("  keystash import <path>                    Import unencrypted logins (Bitwarden JSON; KeyStash, Brave/Chrome, Firefox, LastPass, KeePassXC, 1Password CSV)");
     println!("  keystash export <path>                    Export all vault credentials to an unencrypted CSV file");
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
@@ -470,6 +470,7 @@ fn main() {
                 import::ImportFormat::LastPassCsv => import::import_lastpass_csv(&conn, file_path, &key),
                 import::ImportFormat::KeePassXcCsv => import::import_keepassxc_csv(&conn, file_path, &key),
                 import::ImportFormat::OnePasswordCsv => import::import_onepassword_csv(&conn, file_path, &key),
+                import::ImportFormat::KeyStashCsv => import::import_keystash_csv(&conn, file_path, &key),
             };
 
             match import_result {

@@ -1629,6 +1629,7 @@ fn handle_import_input(app: &mut TuiApp, code: KeyCode) {
                 crate::import::ImportFormat::LastPassCsv => crate::import::import_lastpass_csv(&app.conn, file_path, key_ref),
                 crate::import::ImportFormat::KeePassXcCsv => crate::import::import_keepassxc_csv(&app.conn, file_path, key_ref),
                 crate::import::ImportFormat::OnePasswordCsv => crate::import::import_onepassword_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::KeyStashCsv => crate::import::import_keystash_csv(&app.conn, file_path, key_ref),
             };
 
             match import_result {
@@ -2693,7 +2694,7 @@ fn draw_import_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(input_box, chunks[1]);
 
     let footnote = Paragraph::new(vec![
-        Line::from(Span::styled("Supports: Bitwarden JSON, Brave/Chrome/Firefox/LastPass/KeePassXC/1Password CSV", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("Supports: Bitwarden JSON, KeyStash/Brave/Chrome/Firefox/LastPass/KeePassXC/1Password CSV", Style::default().fg(Color::DarkGray))),
         Line::from(""),
         Line::from(vec![
             Span::styled("Press ", Style::default().fg(Color::DarkGray)),

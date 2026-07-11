@@ -72,6 +72,7 @@ pub enum ImportFormat {
     LastPassCsv,
     KeePassXcCsv,
     OnePasswordCsv,
+    KeyStashCsv,
 }
 
 impl ImportFormat {
@@ -83,6 +84,7 @@ impl ImportFormat {
             ImportFormat::LastPassCsv => "LastPass (CSV)",
             ImportFormat::KeePassXcCsv => "KeePassXC (CSV)",
             ImportFormat::OnePasswordCsv => "1Password (CSV)",
+            ImportFormat::KeyStashCsv => "KeyStash (CSV)",
         }
     }
 }
@@ -140,27 +142,44 @@ pub fn detect_format(file_path: &str) -> Result<ImportFormat, String> {
 
     if let Ok((headers, _)) = read_csv_records(file_path) {
         let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-        
-        if norm_headers.contains(&"name".to_string()) && norm_headers.contains(&"url".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) {
-            return Ok(ImportFormat::BraveChromeCsv);
-        }
-        
-        if norm_headers.contains(&"url".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) && norm_headers.contains(&"httprealm".to_string()) {
-            return Ok(ImportFormat::FirefoxCsv);
+        let has = |name: &str| norm_headers.iter().any(|h| h == name);
+
+        // Checked most-specific-first: some formats' header sets are strict
+        // supersets of another's (a LastPass export contains all four
+        // Brave/Chrome columns, a KeyStash export satisfies the 1Password
+        // check), so a generic check running earlier would shadow the
+        // specific format and silently route its rows through the wrong
+        // importer -- dropping whatever columns the generic importer
+        // doesn't read.
+
+        // KeyStash's own export: the exact six columns export_vault_csv writes.
+        if norm_headers.len() == 6 && has("title") && has("url") && has("username") && has("password") && has("notes") && has("category") {
+            return Ok(ImportFormat::KeyStashCsv);
         }
 
-        if norm_headers.contains(&"url".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) && norm_headers.contains(&"extra".to_string()) && norm_headers.contains(&"fav".to_string()) {
+        // LastPass: 'extra' (notes) + 'fav' appear in no other supported format.
+        if has("url") && has("username") && has("password") && has("extra") && has("fav") {
             return Ok(ImportFormat::LastPassCsv);
         }
 
-        if norm_headers.contains(&"group".to_string()) && norm_headers.contains(&"title".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) && norm_headers.contains(&"notes".to_string()) {
+        // Firefox: 'httprealm' is unique to it.
+        if has("url") && has("username") && has("password") && has("httprealm") {
+            return Ok(ImportFormat::FirefoxCsv);
+        }
+
+        // KeePassXC: 'group' alongside title/username/password/notes.
+        if has("group") && has("title") && has("username") && has("password") && has("notes") {
             return Ok(ImportFormat::KeePassXcCsv);
         }
 
-        if norm_headers.contains(&"title".to_string()) && norm_headers.contains(&"username".to_string()) && norm_headers.contains(&"password".to_string()) && (norm_headers.contains(&"website".to_string()) || norm_headers.contains(&"url".to_string())) {
-            if !norm_headers.contains(&"group".to_string()) {
-                return Ok(ImportFormat::OnePasswordCsv);
-            }
+        // Brave/Chrome: the generic name/url/username/password quartet.
+        if has("name") && has("url") && has("username") && has("password") {
+            return Ok(ImportFormat::BraveChromeCsv);
+        }
+
+        // 1Password: title-based, with either 'website' or 'url'.
+        if has("title") && has("username") && has("password") && (has("website") || has("url")) && !has("group") {
+            return Ok(ImportFormat::OnePasswordCsv);
         }
     }
 
@@ -509,6 +528,64 @@ pub fn import_onepassword_csv(
     })
 }
 
+/// Parses a KeyStash CSV export (the exact file `export_vault_csv` writes) and
+/// inserts the entries. Unlike the 1Password path these files used to be routed
+/// through, this preserves each record's original category instead of
+/// hardcoding one.
+pub fn import_keystash_csv(
+    conn: &Connection,
+    file_path: &str,
+    key: &[u8; 32],
+) -> Result<usize, String> {
+    let (headers, records) = read_csv_records(file_path)?;
+    let norm_headers: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
+
+    let title_idx = norm_headers.iter().position(|h| h == "title").ok_or("Missing 'title' column")?;
+    let url_idx = norm_headers.iter().position(|h| h == "url").ok_or("Missing 'url' column")?;
+    let user_idx = norm_headers.iter().position(|h| h == "username").ok_or("Missing 'username' column")?;
+    let pass_idx = norm_headers.iter().position(|h| h == "password").ok_or("Missing 'password' column")?;
+    let notes_idx = norm_headers.iter().position(|h| h == "notes").ok_or("Missing 'notes' column")?;
+    let cat_idx = norm_headers.iter().position(|h| h == "category").ok_or("Missing 'category' column")?;
+
+    with_import_transaction(conn, || {
+        let mut count = 0;
+        for fields in records {
+            let max_idx = std::cmp::max(title_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, cat_idx)))));
+            if fields.len() <= max_idx {
+                continue;
+            }
+
+            let title = &fields[title_idx];
+            let url = &fields[url_idx];
+            let username = &fields[user_idx];
+            let password = &fields[pass_idx];
+            let notes = &fields[notes_idx];
+            let category = &fields[cat_idx];
+
+            if title.is_empty() && password.is_empty() {
+                continue;
+            }
+
+            let display_title = if title.is_empty() { url } else { title };
+            let display_category = if category.is_empty() { "Imported" } else { category };
+
+            db::add_secret(
+                conn,
+                display_title,
+                display_category,
+                username,
+                url,
+                password,
+                if notes.is_empty() { None } else { Some(notes) },
+                key,
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
+    })
+}
+
 /// Escapes fields containing commas, quotes, or newlines according to standard RFC 4180 CSV specifications.
 fn escape_csv_cell(val: &str) -> String {
     // A cell starting with =, +, -, or @ is interpreted as a formula by Excel/
@@ -671,6 +748,101 @@ url,username,password,httprealm
         assert_eq!(result, Ok(2));
         let secrets = crate::db::get_secrets(&conn).unwrap();
         assert_eq!(secrets.len(), 2);
+    }
+
+    #[test]
+    fn detect_format_routes_each_supported_header_set_correctly() {
+        let cases: &[(&str, ImportFormat)] = &[
+            // LastPass headers contain all four Brave/Chrome columns; the old
+            // generic-first check order routed these through the Brave
+            // importer, silently dropping notes ('extra') and folders
+            // ('grouping') from every LastPass import.
+            ("url,username,password,totp,extra,name,grouping,fav", ImportFormat::LastPassCsv),
+            ("name,url,username,password", ImportFormat::BraveChromeCsv),
+            ("url,username,password,httpRealm,formActionOrigin,guid,timeCreated,timeLastUsed,timePasswordChanged", ImportFormat::FirefoxCsv),
+            ("\"Group\",\"Title\",\"Username\",\"Password\",\"URL\",\"Notes\"", ImportFormat::KeePassXcCsv),
+            ("Title,Username,Password,Website,Notes", ImportFormat::OnePasswordCsv),
+            // KeyStash's own export satisfies the 1Password check too (title +
+            // username + password + url), so it must be matched exactly, first.
+            ("title,url,username,password,notes,category", ImportFormat::KeyStashCsv),
+        ];
+
+        let temp_dir = std::env::temp_dir();
+        for (i, (header, expected)) in cases.iter().enumerate() {
+            let file_path = temp_dir.join(format!("test_detect_format_{}_{}.csv", std::process::id(), i));
+            std::fs::write(&file_path, format!("{}\n", header)).unwrap();
+            let detected = detect_format(file_path.to_str().unwrap());
+            let _ = std::fs::remove_file(&file_path);
+            assert_eq!(detected.unwrap(), *expected, "wrong format for header {:?}", header);
+        }
+    }
+
+    #[test]
+    fn lastpass_import_preserves_notes_and_folders() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_lastpass_{}.csv", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        let csv_content = "\
+url,username,password,totp,extra,name,grouping,fav
+https://bank.example.com,me,hunter2,,recovery codes: 1111 2222,Example Bank,Banking,0
+";
+        std::fs::write(&file_path, csv_content).unwrap();
+
+        // End-to-end through detection, not just the importer: the regression
+        // was detect_format handing this file to the Brave importer.
+        assert_eq!(detect_format(file_path_str).unwrap(), ImportFormat::LastPassCsv);
+
+        let count = import_lastpass_csv(&conn, file_path_str, &key).unwrap();
+        let _ = std::fs::remove_file(&file_path);
+        assert_eq!(count, 1);
+
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].title, "Example Bank");
+        assert_eq!(secrets[0].category, "Banking", "the 'grouping' folder must survive the import");
+        let notes = crate::crypto::decrypt(secrets[0].encrypted_notes.as_ref().unwrap(), &key).unwrap();
+        assert_eq!(&*notes, b"recovery codes: 1111 2222", "the 'extra' notes must survive the import");
+    }
+
+    #[test]
+    fn keystash_csv_import_preserves_category_and_notes() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_keystash_native_{}.csv", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        // Exactly the header export_vault_csv writes.
+        let csv_content = "\
+title,url,username,password,notes,category
+GitHub,https://github.com,me,hunter2,my note,Dev
+";
+        std::fs::write(&file_path, csv_content).unwrap();
+
+        assert_eq!(detect_format(file_path_str).unwrap(), ImportFormat::KeyStashCsv);
+
+        let count = import_keystash_csv(&conn, file_path_str, &key).unwrap();
+        let _ = std::fs::remove_file(&file_path);
+        assert_eq!(count, 1);
+
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].title, "GitHub");
+        assert_eq!(secrets[0].category, "Dev", "round-trips must keep the original category, not hardcode one");
+        assert_eq!(secrets[0].url, "https://github.com");
+        let pass = crate::crypto::decrypt(&secrets[0].encrypted_password, &key).unwrap();
+        assert_eq!(&*pass, b"hunter2");
+        let notes = crate::crypto::decrypt(secrets[0].encrypted_notes.as_ref().unwrap(), &key).unwrap();
+        assert_eq!(&*notes, b"my note");
     }
 
     #[test]

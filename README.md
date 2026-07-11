@@ -128,7 +128,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash import <path/to/backup_file>
   ```
-  *(Detects and imports unencrypted formats: Bitwarden JSON, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV)*
+  *(Detects and imports unencrypted formats: Bitwarden JSON, KeyStash CSV, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV)*
 * **Export Credentials:**
   ```bash
   keystash export <path/to/output_file.csv>
