@@ -322,14 +322,23 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Deliberately no PRIMARY KEY on the (title, category, username) triple:
+    // sync_uuid is the identity merge steps actually match tombstones on (see
+    // H2), and several distinct records can legitimately share a triple -- the
+    // exact case the dedup screen exists to find. Under the old triple PK,
+    // deleting N >= 3 such duplicates collapsed the N-1 tombstones into one
+    // PK slot via INSERT OR REPLACE, so the lost deletions never propagated
+    // and the deleted records resurrected on other devices. Uniqueness lives
+    // in idx_deleted_secrets_sync_uuid below instead; NULL sync_uuids (legacy
+    // tombstones) are distinct under a UNIQUE index, so they coexist without
+    // colliding and stay inert for uuid-based merge matching as before.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS deleted_secrets (
             title TEXT NOT NULL,
             category TEXT NOT NULL,
             username TEXT NOT NULL,
             deleted_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
-            sync_uuid TEXT,
-            PRIMARY KEY (title, category, username)
+            sync_uuid TEXT
         )",
         [],
     )
@@ -422,6 +431,57 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
         // share the old title/category/username triple.
         let _ = conn.execute("ALTER TABLE deleted_secrets ADD COLUMN sync_uuid TEXT", []);
     }
+
+    // Migration: rebuild a deleted_secrets table still carrying the old
+    // (title, category, username) composite PRIMARY KEY into the PK-less
+    // shape created above -- see the comment on that CREATE TABLE for why
+    // the triple PK destroyed tombstones. Runs after the ALTER above so the
+    // copy always has a sync_uuid column to read. The rare legacy edge of
+    // two rows sharing a non-NULL sync_uuid (a record renamed between
+    // delete/restore cycles, so same uuid under two triples) is collapsed
+    // to the newest tombstone per uuid, since the UNIQUE index below could
+    // not be created over both.
+    let tombstones_keyed_on_triple: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('deleted_secrets') WHERE pk > 0",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .unwrap_or(false);
+    if tombstones_keyed_on_triple {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE deleted_secrets_rebuilt (
+                 title TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 username TEXT NOT NULL,
+                 deleted_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+                 sync_uuid TEXT
+             );
+             INSERT INTO deleted_secrets_rebuilt (title, category, username, deleted_at, sync_uuid)
+                 SELECT title, category, username, MAX(deleted_at), sync_uuid
+                 FROM deleted_secrets WHERE sync_uuid IS NOT NULL GROUP BY sync_uuid;
+             INSERT INTO deleted_secrets_rebuilt (title, category, username, deleted_at, sync_uuid)
+                 SELECT title, category, username, deleted_at, NULL
+                 FROM deleted_secrets WHERE sync_uuid IS NULL;
+             DROP TABLE deleted_secrets;
+             ALTER TABLE deleted_secrets_rebuilt RENAME TO deleted_secrets;
+             COMMIT;",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Enforced regardless of whether the table was just created, just
+    // rebuilt, or already in the new shape -- same as the secrets index
+    // above being safe to re-run every open. INSERT OR REPLACE at the
+    // delete/merge call sites keys on this.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_deleted_secrets_sync_uuid ON deleted_secrets(sync_uuid)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
 
     // Stamp the current compatibility floor if it's not already recorded.
     // Only ever written here if missing -- never overwritten -- so a vault
@@ -1207,6 +1267,110 @@ mod sqlcipher_tests {
         assert!(open_vault(&db_path, "legacy-master-pw").is_ok());
 
         let _ = std::fs::remove_file(db_path.with_file_name("vault.db.pre-sqlcipher-backup"));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn deleting_duplicates_sharing_a_triple_keeps_every_tombstone() {
+        let db_path = temp_db_path("tombstone-collapse");
+        let (conn, key) = create_vault(&db_path, "some-password").unwrap();
+
+        // Three records sharing the exact (title, category, username) triple
+        // -- the case the dedup screen exists to find. Under the old triple
+        // PRIMARY KEY, deleting two of them collapsed both tombstones into
+        // one PK slot via INSERT OR REPLACE, and the lost deletion silently
+        // resurrected on other devices at the next merge.
+        for pw in ["dup-v1", "dup-v2", "dup-v3"] {
+            add_secret(&conn, "Dup", "Cat", "user", "", pw, None, &key).unwrap();
+        }
+        let secrets = get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 3);
+
+        delete_secret(&conn, secrets[0].id).unwrap();
+        delete_secret(&conn, secrets[1].id).unwrap();
+
+        let tombstones: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT title, sync_uuid FROM deleted_secrets")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(
+            tombstones.len(),
+            2,
+            "both deletions must leave their own tombstone, got: {:?}",
+            tombstones
+        );
+        let tombstone_uuids: std::collections::HashSet<Option<String>> =
+            tombstones.into_iter().map(|(_, uuid)| uuid).collect();
+        assert!(tombstone_uuids.contains(&Some(secrets[0].sync_uuid.clone())));
+        assert!(tombstone_uuids.contains(&Some(secrets[1].sync_uuid.clone())));
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn legacy_triple_keyed_tombstone_table_is_rebuilt_on_open() {
+        let db_path = temp_db_path("tombstone-rebuild");
+        let (conn, _key) = create_vault(&db_path, "some-password").unwrap();
+
+        // Swap in the old-format table: composite triple PK, holding one
+        // uuid-carrying tombstone and one legacy NULL-uuid tombstone.
+        conn.execute_batch(
+            "DROP TABLE deleted_secrets;
+             CREATE TABLE deleted_secrets (
+                 title TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 username TEXT NOT NULL,
+                 deleted_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+                 sync_uuid TEXT,
+                 PRIMARY KEY (title, category, username)
+             );
+             INSERT INTO deleted_secrets (title, category, username, deleted_at, sync_uuid)
+                 VALUES ('A', 'Cat', 'user', '2026-01-01 00:00:00.000', 'uuid-a');
+             INSERT INTO deleted_secrets (title, category, username, deleted_at, sync_uuid)
+                 VALUES ('B', 'Cat', 'user', '2026-01-02 00:00:00.000', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reopening runs ensure_schema, which must rebuild the table.
+        let (conn2, _) = open_vault(&db_path, "some-password").unwrap();
+        let pk_columns: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deleted_secrets') WHERE pk > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pk_columns, 0, "the triple PRIMARY KEY must be gone after the rebuild");
+
+        let rows: Vec<(String, Option<String>)> = {
+            let mut stmt = conn2
+                .prepare("SELECT title, sync_uuid FROM deleted_secrets ORDER BY title")
+                .unwrap();
+            let r = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            r.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(rows.len(), 2, "both tombstones must survive the rebuild, got: {:?}", rows);
+        assert_eq!(rows[0], ("A".to_string(), Some("uuid-a".to_string())));
+        assert_eq!(rows[1], ("B".to_string(), None));
+
+        // The uuid uniqueness the merge steps rely on must now be enforced.
+        let index_exists: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_deleted_secrets_sync_uuid'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
         cleanup(&db_path);
     }
 

@@ -2977,11 +2977,14 @@ fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 // ─────────────────────────────────────────────
 
 /// Re-stamps a record's `updated_at` to now. Must be called *after* deleting
-/// its duplicates, not before: `delete_secret` writes a tombstone keyed on
-/// the shared (title, category, username) triple, and if the kept record's
-/// timestamp predates that tombstone, the ordinary last-write-wins sync merge
-/// treats the kept record as older than its own tombstone and deletes it on
-/// the next sync -- silently destroying the entry the user just chose to keep.
+/// its duplicates, not before: each duplicate's tombstone carries that
+/// duplicate's own sync_uuid, so the uuid-keyed merge can never mistake one
+/// for the kept record -- but the legacy fallback merge (against a remote
+/// still on the pre-sync_uuid format) matches tombstones by the shared
+/// (title, category, username) triple, and if the kept record's timestamp
+/// predates a duplicate's tombstone there, that merge treats the kept record
+/// as deleted and destroys it on the next sync -- silently losing the entry
+/// the user just chose to keep.
 fn restamp_record(conn: &rusqlite::Connection, id: i64) {
     if let Ok(now) = crate::db::now_timestamp(conn) {
         if let Ok(Some(r)) = crate::db::get_secret_by_id(conn, id) {

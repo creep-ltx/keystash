@@ -255,9 +255,22 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                            AND r.updated_at > main.secrets.updated_at
                      )",
 
-                    // Sync deleted_secrets tombstones from remote to local
+                    // Sync deleted_secrets tombstones from remote to local.
+                    // OR REPLACE keys on the UNIQUE sync_uuid index, so a
+                    // re-deleted record refreshes its tombstone rather than
+                    // duplicating it. NULL-uuid legacy tombstones never
+                    // conflict under that index (NULLs are distinct), so they
+                    // need the explicit triple-match guard below or every
+                    // sync would re-insert all of them.
                     "INSERT OR REPLACE INTO main.deleted_secrets (title, category, username, sync_uuid, deleted_at)
-                     SELECT title, category, username, sync_uuid, deleted_at FROM remote_db.deleted_secrets"
+                     SELECT rd.title, rd.category, rd.username, rd.sync_uuid, rd.deleted_at
+                     FROM remote_db.deleted_secrets rd
+                     WHERE rd.sync_uuid IS NOT NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM main.deleted_secrets ld
+                            WHERE ld.sync_uuid IS NULL
+                              AND ld.title = rd.title AND ld.category = rd.category AND ld.username = rd.username
+                        )"
                 ]
             } else {
                 // Remote predates sync_uuid entirely (last pushed by an older
@@ -307,8 +320,19 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                            AND r.updated_at > main.secrets.updated_at
                      )",
 
-                    "INSERT OR REPLACE INTO main.deleted_secrets (title, category, username, deleted_at)
-                     SELECT title, category, username, deleted_at FROM remote_db.deleted_secrets"
+                    // A pre-sync_uuid remote's tombstones all arrive with a
+                    // NULL sync_uuid, which never conflicts under the UNIQUE
+                    // index (NULLs are distinct) -- guard on the triple so
+                    // repeated syncs against the same legacy remote don't
+                    // re-insert them every time.
+                    "INSERT INTO main.deleted_secrets (title, category, username, deleted_at)
+                     SELECT rd.title, rd.category, rd.username, rd.deleted_at
+                     FROM remote_db.deleted_secrets rd
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM main.deleted_secrets ld
+                         WHERE ld.sync_uuid IS NULL
+                           AND ld.title = rd.title AND ld.category = rd.category AND ld.username = rd.username
+                     )"
                 ]
             };
 
@@ -919,6 +943,115 @@ mod tests {
 
         // And their sync_uuids are genuinely distinct -- the whole point.
         assert_ne!(dup_rows[0].sync_uuid, dup_rows[1].sync_uuid);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression test for the tombstone PK collapse: deduping N >= 3 records
+    /// sharing a (title, category, username) triple used to collapse the N-1
+    /// tombstones into one slot (the old composite PRIMARY KEY plus INSERT OR
+    /// REPLACE), so one deletion never propagated and the deleted duplicate
+    /// resurrected on the other device at the next merge.
+    #[test]
+    fn dedup_deletions_of_shared_triple_records_propagate_to_other_devices() {
+        let root = scratch_root("dedup_tombstones");
+        let origin = init_bare_origin(&root);
+
+        // --- Device A: three records sharing the same triple, pushed. ---
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        for pw in ["dup-v1", "dup-v2", "dup-keep"] {
+            crate::db::add_secret(&conn_a, "Dup", "Cat", "user", "", pw, None, &key_a).unwrap();
+        }
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db", "vault.salt"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // --- Device B: clones all three. ---
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_b).unwrap().len(), 3);
+        drop(conn_b);
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // --- Device A dedups: keep "dup-keep", delete the other two, then
+        // re-stamp the kept record -- exactly what the TUI's dedup screen
+        // does (delete_secret per loser, restamp_record on the winner). ---
+        let a_sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_a);
+        let keep_uuid;
+        {
+            let conn_a = crate::db::open_keyed_connection(&device_a.vault_path, &a_sqlcipher_key).unwrap();
+            let secrets = crate::db::get_secrets(&conn_a).unwrap();
+            let keep = secrets
+                .iter()
+                .find(|s| crate::crypto::decrypt(&s.encrypted_password, &key_a).unwrap().as_slice() == b"dup-keep")
+                .unwrap();
+            keep_uuid = keep.sync_uuid.clone();
+            let losers: Vec<i64> = secrets.iter().filter(|s| s.id != keep.id).map(|s| s.id).collect();
+            for id in &losers {
+                crate::db::delete_secret(&conn_a, *id).unwrap();
+            }
+            let now = crate::db::now_timestamp(&conn_a).unwrap();
+            crate::db::update_secret_raw(
+                &conn_a,
+                keep.id,
+                &keep.url,
+                &keep.encrypted_password,
+                keep.encrypted_notes.as_deref(),
+                &now,
+            )
+            .unwrap();
+        }
+
+        let push_a = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(push_a.is_ok(), "Device A's post-dedup sync failed: {:?}", push_a);
+
+        // --- Device B merges. Both deletions must land; the kept record
+        // must survive. ---
+        let sync_b = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(sync_b.is_ok(), "Device B's merge failed: {:?}", sync_b);
+
+        let count_tombstones = |vault_path: &PathBuf, key: &[u8; 32]| -> Vec<Option<String>> {
+            let conn = crate::db::open_keyed_connection(vault_path, &crate::crypto::derive_sqlcipher_key(key)).unwrap();
+            let mut stmt = conn.prepare("SELECT sync_uuid FROM deleted_secrets").unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+
+        let conn_b_final = crate::db::open_keyed_connection(&device_b.vault_path, &crate::crypto::derive_sqlcipher_key(&key_b)).unwrap();
+        let final_secrets = crate::db::get_secrets(&conn_b_final).unwrap();
+        assert_eq!(
+            final_secrets.len(),
+            1,
+            "the two deduped duplicates must not resurrect on Device B, got: {:?}",
+            final_secrets.iter().map(|s| (&s.title, &s.sync_uuid)).collect::<Vec<_>>()
+        );
+        assert_eq!(final_secrets[0].sync_uuid, keep_uuid);
+        assert_eq!(
+            &*crate::crypto::decrypt(&final_secrets[0].encrypted_password, &key_b).unwrap(),
+            b"dup-keep"
+        );
+        drop(conn_b_final);
+
+        // All N-1 tombstones exist on both sides, each with its own uuid.
+        for (label, vault_path, key) in [
+            ("Device A", &device_a.vault_path, &key_a),
+            ("Device B", &device_b.vault_path, &key_b),
+        ] {
+            let uuids = count_tombstones(vault_path, key);
+            assert_eq!(uuids.len(), 2, "{}: expected both tombstones, got {:?}", label, uuids);
+            assert!(uuids.iter().all(|u| u.is_some()), "{}: tombstones must carry sync_uuids", label);
+            assert_ne!(uuids[0], uuids[1], "{}: tombstones must be distinct", label);
+            assert!(!uuids.contains(&Some(keep_uuid.clone())), "{}: the kept record must not have a tombstone", label);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
