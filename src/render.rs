@@ -547,7 +547,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(4)
@@ -604,7 +604,7 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 /// process should touch), so this just surfaces the recovery instructions and
 /// waits for the user to quit, fix it from a shell, and relaunch.
 fn draw_interrupted_migration_screen(f: &mut ratatui::Frame) {
-    let size = f.size();
+    let size = f.area();
     f.render_widget(Clear, size);
 
     let block = Block::default()
@@ -630,7 +630,7 @@ pub(crate) fn handle_interrupted_migration_input(code: KeyCode) -> bool {
 /// Same reasoning as `draw_interrupted_migration_screen`, for an interrupted
 /// `change_master_password` run instead.
 fn draw_interrupted_rotation_screen(f: &mut ratatui::Frame) {
-    let size = f.size();
+    let size = f.area();
     f.render_widget(Clear, size);
 
     let block = Block::default()
@@ -650,7 +650,7 @@ fn draw_interrupted_rotation_screen(f: &mut ratatui::Frame) {
 
 
 fn draw_setup_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(4)
@@ -710,7 +710,7 @@ fn draw_setup_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     
     // Main vertical division: Body, Status Bar
     let main_layout = Layout::default()

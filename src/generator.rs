@@ -50,27 +50,27 @@ pub fn generate_password(options: &GeneratorOptions) -> Result<String, String> {
 
     let mut char_pool = Vec::new();
     let mut guaranteed_chars = Vec::new();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     if options.use_lowercase {
         let chars = b"abcdefghijkmnopqrstuvwxyz";
         char_pool.extend_from_slice(chars);
-        guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
+        guaranteed_chars.push(chars[rng.random_range(0..chars.len())]);
     }
     if options.use_uppercase {
         let chars = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
         char_pool.extend_from_slice(chars);
-        guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
+        guaranteed_chars.push(chars[rng.random_range(0..chars.len())]);
     }
     if options.use_numbers {
         let chars = b"23456789";
         char_pool.extend_from_slice(chars);
-        guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
+        guaranteed_chars.push(chars[rng.random_range(0..chars.len())]);
     }
     if options.use_symbols {
         let chars = b"!@#$%^&*()_+-=[]{};:,.<>?";
         char_pool.extend_from_slice(chars);
-        guaranteed_chars.push(chars[rng.gen_range(0..chars.len())]);
+        guaranteed_chars.push(chars[rng.random_range(0..chars.len())]);
     }
 
     if char_pool.is_empty() {
@@ -88,7 +88,7 @@ pub fn generate_password(options: &GeneratorOptions) -> Result<String, String> {
 
     // Fill the rest of the length with random characters from the pool
     while password.len() < length {
-        let idx = rng.gen_range(0..char_pool.len());
+        let idx = rng.random_range(0..char_pool.len());
         password.push(char_pool[idx]);
     }
 

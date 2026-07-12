@@ -207,7 +207,7 @@ pub(crate) fn handle_export_input(app: &mut TuiApp, code: KeyCode) {
 
 
 pub(crate) fn draw_error_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Error")
@@ -234,7 +234,7 @@ pub(crate) fn draw_error_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_confirmation_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Confirmation Required")
@@ -265,7 +265,7 @@ pub(crate) fn draw_confirmation_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let area = centered_rect(70, 85, size);
     f.render_widget(Clear, area);
 
@@ -448,7 +448,7 @@ pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_import_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Import Credentials")
@@ -498,7 +498,7 @@ pub(crate) fn draw_import_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_export_type_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Export Vault")
@@ -545,7 +545,7 @@ pub(crate) fn draw_export_type_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_export_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if app.export_only_marked { "Export Selected Credentials" } else { "Export All Credentials" })
@@ -759,7 +759,7 @@ pub(crate) fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
 
 
 pub(crate) fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -901,7 +901,7 @@ pub(crate) fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 // ─────────────────────────────────────────────
 
 pub(crate) fn draw_hibp_progress_dialog(f: &mut ratatui::Frame, checked: usize, total: usize) {
-    let size = f.size();
+    let size = f.area();
     let area = centered_rect(60, 25, size);
     f.render_widget(Clear, area);
 
@@ -1091,7 +1091,7 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
 
 
 pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     f.render_widget(Clear, size);
 
     let main_block = Block::default()
@@ -1100,7 +1100,7 @@ pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         .border_style(Style::default().fg(Color::LightRed));
     f.render_widget(main_block, size);
 
-    let inner_area = size.inner(&ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+    let inner_area = size.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
 
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)

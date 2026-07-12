@@ -19,14 +19,9 @@ ignore = [
     # (arboard's Wayland backend) bumps past wayland-scanner 0.31.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml is a wayland-scanner build-time-only dependency (proc-macro codegen from bundled protocol XML), not linked into the runtime binary or reachable via any external input" },
     { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194 -- build-time-only via wayland-scanner, not runtime-reachable" },
-    # Transitive via ratatui 0.26's own dependency choice, not something
-    # KeyStash can move independently of a ratatui upgrade. Tracked as a
-    # future item, not blocking every CI run until then. (lru's separate
-    # RUSTSEC-2026-0002 "unsound" advisory is also transitive via ratatui,
-    # but cargo-deny doesn't hard-fail on the "unsound" category by default,
-    # so it needs no explicit ignore entry here -- ratatui bumping fixes
-    # both at once when it happens.)
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but has no known vulnerability; pulled in by ratatui 0.26, not fixable without a ratatui upgrade" },
+    # (The ratatui-0.26-era ignores for `paste` / RUSTSEC-2024-0436 and the
+    # lru unsoundness note were removed with the ratatui 0.30 upgrade, which
+    # dropped both dependencies.)
 ]
 
 [licenses]
@@ -42,6 +37,11 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    # webpki-root-certs (Mozilla's CA-certificate *data*, carried by ureq 3;
+    # the TLS implementation itself remains the vendored OpenSSL via
+    # native-tls). CDLA-Permissive-2.0 is a permissive data license -- no
+    # copyleft, no attribution burden on binaries.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

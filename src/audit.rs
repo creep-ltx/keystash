@@ -281,29 +281,35 @@ pub fn check_hibp(password: &str) -> Result<u64, String> {
     // ureq's `native-tls` feature (see Cargo.toml -- reuses the OpenSSL
     // already vendored for SQLCipher instead of statically linking a second,
     // separate rustls/ring/webpki-roots TLS stack for this one HTTPS call)
-    // is deliberately never auto-selected by the ureq::get() shortcut, per
-    // its own docs -- it has to be wired up explicitly via an Agent.
-    let agent = ureq::AgentBuilder::new()
-        .tls_connector(std::sync::Arc::new(
-            ureq::native_tls::TlsConnector::new().map_err(|e| format!("TLS init failed: {}", e))?,
-        ))
-        .build();
-
-    // ureq's default agent has no timeout at all, so a stalled response
-    // (dead connection, misbehaving proxy) could hang the calling thread
+    // is deliberately never auto-selected, per ureq's own docs -- the
+    // provider has to be chosen explicitly in the agent's TLS config.
+    //
+    // The global timeout matters too: a stalled response (dead connection,
+    // misbehaving proxy) would otherwise hang the calling thread
     // indefinitely -- including the abortable background scan, whose abort
     // flag is only checked *between* requests. `Add-Padding` asks the API
     // to pad response sizes, blunting traffic analysis of which bucket
     // (and therefore roughly which password) was queried.
-    let response = agent.get(&url)
-        .set("User-Agent", "keystash-password-manager")
-        .set("Add-Padding", "true")
-        .timeout(std::time::Duration::from_secs(10))
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+
+    let mut response = agent
+        .get(&url)
+        .header("User-Agent", "keystash-password-manager")
+        .header("Add-Padding", "true")
         .call()
         .map_err(|e| format!("HIBP request failed: {}", e))?;
 
     let body = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| format!("HIBP response read error: {}", e))?;
 
     for line in body.lines() {

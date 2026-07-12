@@ -1040,7 +1040,13 @@ fn run_loop<B: ratatui::backend::Backend>(
                 app.lock_vault();
             }
         
-        terminal.draw(|f| draw_ui(f, app))?;
+        // ratatui 0.30's Backend::Error is an associated type with no
+        // Send/Sync bound, so it can't convert into io::Error directly --
+        // stringify it (the concrete crossterm backend's error is io-based
+        // anyway; this generic signature only exists for the TestBackend).
+        terminal
+            .draw(|f| draw_ui(f, app))
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Execute a deferred key derivation right after the frame that
         // shows its "Deriving key..." notice -- and before the event poll,

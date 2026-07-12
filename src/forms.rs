@@ -63,7 +63,7 @@ mod form_integration_tests {
         let mut out = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
-                out.push_str(buffer.get(x, y).symbol());
+                out.push_str(buffer[(x, y)].symbol());
             }
             out.push('\n');
         }
@@ -439,7 +439,7 @@ fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
 
 
 pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let is_edit = app.screen == Screen::EditSecret;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -595,7 +595,7 @@ pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 pub(crate) fn draw_change_password_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Change Master Password")
@@ -747,7 +747,7 @@ fn regenerate_in_place(app: &mut TuiApp) {
 
 
 pub(crate) fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let area = centered_rect(64, 50, size);
     f.render_widget(Clear, area);
 
@@ -1035,7 +1035,7 @@ fn settings_grid_scroll(area_height: u16, active_settings_field: usize) -> (usiz
 
 
 pub(crate) fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let area = centered_rect(85, 90, size);
     f.render_widget(Clear, area);
 

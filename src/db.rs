@@ -133,9 +133,9 @@ pub fn record_has_tag(stored: &str, tag: &str) -> bool {
 /// thread-local CSPRNG is what's already used elsewhere in this codebase
 /// (`generator.rs`) so there's no reason to reach for anything weaker.
 pub fn new_uuid() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant
     format!(
