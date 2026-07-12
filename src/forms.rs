@@ -867,6 +867,15 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
                         app.settings_gen_length.push(c);
                     }
                 }
+                8 => {
+                    if c.is_ascii_digit() {
+                        if !app.settings_field_touched {
+                            app.settings_history_retention.clear();
+                            app.settings_field_touched = true;
+                        }
+                        app.settings_history_retention.push(c);
+                    }
+                }
                 2 | 4 | 5 | 6 | 7
                     if c == ' ' => {
                         match app.active_settings_field {
@@ -897,6 +906,9 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
                 3 => {
                     if app.settings_field_touched { app.settings_gen_length.pop(); } else { app.settings_gen_length.clear(); }
                 }
+                8 => {
+                    if app.settings_field_touched { app.settings_history_retention.pop(); } else { app.settings_history_retention.clear(); }
+                }
                 _ => {}
             }
             app.settings_field_touched = true;
@@ -910,10 +922,16 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
             let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300).max(10);
             let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(5).clamp(1, 3600);
             let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20).clamp(4, 256);
+            // 0 = unlimited history; any enabled value is floored at 10 so
+            // the recent snapshots that conflict detection's 3-way base
+            // (and plain rollback) rely on can't be configured away.
+            let retention = app.settings_history_retention.parse::<u64>().unwrap_or(0);
+            let retention = if retention == 0 { 0 } else { retention.max(10) };
 
             app.config.idle_timeout_seconds = timeout;
             app.config.clipboard_clear_seconds = clip;
             app.config.auto_sync = app.settings_auto_sync;
+            app.config.history_retention = retention;
             app.config.generator.length = gen_len;
             app.config.generator.use_lowercase = app.settings_gen_lowercase;
             app.config.generator.use_uppercase = app.settings_gen_uppercase;
@@ -927,30 +945,51 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
     }
 }
 
+/// Total number of settings fields, laid out row-major 2-per-row. Odd, so
+/// the last grid row holds a single field in the left column.
+const SETTINGS_FIELD_COUNT: usize = 9;
+
 /// Where a settings-screen key press moves the active field, given the
-/// 2-column grid layout (fields 0..7, laid out row-major 2-per-row -- see
-/// draw_settings_screen). Up/Down move by a full grid row (index +/- 2,
-/// wrapping); Left/Right move within the row by toggling the low bit
-/// (0<->1, 2<->3, ...); Tab/Shift+Tab are unchanged from before the grid
-/// existed -- a plain linear cycle through all 8, independent of the grid
-/// shape, since that's the "just cycle through" behavior already relied on.
+/// 2-column grid layout (fields 0..8, laid out row-major 2-per-row -- see
+/// draw_settings_screen; row 4 has only field 8 on the left). Up/Down move
+/// by a full grid row, wrapping within the same column (a column with no
+/// cell in the last row wraps past it); Left/Right toggle within the row
+/// (field 8 has no right-hand neighbor and stays put); Tab/Shift+Tab remain
+/// the plain linear cycle through all 9, independent of the grid shape.
 fn settings_field_step(field: usize, key: KeyCode) -> usize {
+    let last = SETTINGS_FIELD_COUNT - 1; // 8, the lone field on the last row
     match key {
-        KeyCode::Up => (field + 6) % 8,
-        KeyCode::Down => (field + 2) % 8,
-        KeyCode::Left | KeyCode::Right => field ^ 1,
-        KeyCode::Tab => if field < 7 { field + 1 } else { 0 },
-        KeyCode::BackTab => if field > 0 { field - 1 } else { 7 },
+        KeyCode::Up => {
+            if field >= 2 {
+                field - 2
+            } else if field.is_multiple_of(2) {
+                last // column 0 wraps to the bottom row's lone field
+            } else {
+                last - 1 // column 1's bottom-most cell is on the row above
+            }
+        }
+        KeyCode::Down => {
+            if field + 2 < SETTINGS_FIELD_COUNT {
+                field + 2
+            } else {
+                field % 2 // wrap to the top of the same column
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if field == last { field } else { field ^ 1 }
+        }
+        KeyCode::Tab => (field + 1) % SETTINGS_FIELD_COUNT,
+        KeyCode::BackTab => (field + SETTINGS_FIELD_COUNT - 1) % SETTINGS_FIELD_COUNT,
         _ => field,
     }
 }
 
-/// Number of on-screen grid rows the 8 settings fields occupy at 2 fields
-/// per row. Kept as a named constant since draw_settings_screen and
+/// Number of on-screen grid rows the settings fields occupy at 2 per row.
+/// Kept as a named constant since draw_settings_screen and
 /// settings_grid_scroll both need to agree on it.
-const SETTINGS_GRID_ROWS: usize = 4;
+const SETTINGS_GRID_ROWS: usize = SETTINGS_FIELD_COUNT.div_ceil(2);
 
-/// How many of the 4 field-grid rows actually fit in a settings box this
+/// How many of the field-grid rows actually fit in a settings box this
 /// tall, and which row to start drawing from so `active_settings_field`'s
 /// row is always among the visible ones. Pure function of height and the
 /// active field, not app state, so there's nothing to keep in sync -- the
@@ -995,7 +1034,7 @@ pub(crate) fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
     // 80x24 terminal. Even the 2-column grid additionally scrolls (see
     // settings_grid_scroll) so no terminal size, however small, can hide
     // a field's value entirely; it'll just take more Tab presses to reach.
-    let fields: [(&str, String, bool); 8] = [
+    let fields: [(&str, String, bool); SETTINGS_FIELD_COUNT] = [
         ("1. Idle Timeout (s)", app.settings_idle_timeout.clone(), app.active_settings_field == 0),
         ("2. Clipboard Delay (s)", app.settings_clipboard_clear.clone(), app.active_settings_field == 1),
         ("3. Auto Sync (Y/N)", if app.settings_auto_sync { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 2),
@@ -1004,6 +1043,7 @@ pub(crate) fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         ("6. Gen Uppercase (Y/N)", if app.settings_gen_uppercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 5),
         ("7. Gen Numbers (Y/N)", if app.settings_gen_numbers { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 6),
         ("8. Gen Symbols (Y/N)", if app.settings_gen_symbols { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 7),
+        ("9. History Keep (0 = all)", app.settings_history_retention.clone(), app.active_settings_field == 8),
     ];
 
     let (rows_that_fit, scroll_offset) = settings_grid_scroll(area.height, app.active_settings_field);
@@ -1073,7 +1113,7 @@ mod settings_layout_tests {
     // eventually be reachable and, once reachable, fully visible.
 
     #[test]
-    fn all_four_rows_fit_on_a_generously_sized_terminal() {
+    fn all_grid_rows_fit_on_a_generously_sized_terminal() {
         let (rows_that_fit, scroll_offset) = settings_grid_scroll(40, 0);
         assert_eq!(rows_that_fit, SETTINGS_GRID_ROWS);
         assert_eq!(scroll_offset, 0);
@@ -1095,7 +1135,7 @@ mod settings_layout_tests {
         // nothing, same failure mode as the original bug) and the active
         // field's row must always fall inside the visible window.
         for height in 0..=60u16 {
-            for active_field in 0..8usize {
+            for active_field in 0..SETTINGS_FIELD_COUNT {
                 let (rows_that_fit, scroll_offset) = settings_grid_scroll(height, active_field);
                 assert!(rows_that_fit >= 1, "height={height}: rows_that_fit must never be 0");
 
@@ -1124,38 +1164,43 @@ mod settings_layout_tests {
         assert_eq!(rows_that_fit, 1, "test assumes a height that only fits one row -- adjust tiny_height if settings_grid_scroll's constants change");
 
         let mut rows_seen = std::collections::HashSet::new();
-        for active_field in 0..8usize {
+        for active_field in 0..SETTINGS_FIELD_COUNT {
             let (fit, offset) = settings_grid_scroll(tiny_height, active_field);
             for r in offset..offset + fit {
                 rows_seen.insert(r);
             }
         }
-        assert_eq!(rows_seen, (0..SETTINGS_GRID_ROWS).collect(), "every grid row must be reachable by tabbing through all 8 fields");
+        assert_eq!(rows_seen, (0..SETTINGS_GRID_ROWS).collect(), "every grid row must be reachable by tabbing through all fields");
     }
 
     #[test]
     fn settings_field_step_matches_the_grid_layout() {
-        // Fields are laid out row-major, 2 per row:
-        //   row 0: 0 1      row 1: 2 3      row 2: 4 5      row 3: 6 7
+        // Fields are laid out row-major, 2 per row, with a lone field on
+        // the last row:
+        //   row 0: 0 1   row 1: 2 3   row 2: 4 5   row 3: 6 7   row 4: 8 -
         // (field, key, expected_next)
         let cases = [
             // Down moves one full row, wrapping within the same column.
             (1usize, KeyCode::Down, 3usize),
             (3, KeyCode::Down, 5),
-            (7, KeyCode::Down, 1),
-            (6, KeyCode::Down, 0),
+            (6, KeyCode::Down, 8),
+            (8, KeyCode::Down, 0),  // bottom of column 0 wraps to its top
+            (7, KeyCode::Down, 1),  // column 1 has no row-4 cell -- wraps past it
             // Up is the mirror image.
             (3, KeyCode::Up, 1),
-            (0, KeyCode::Up, 6),
-            (1, KeyCode::Up, 7),
-            // Left/Right toggle within the row (both directions do the same
-            // thing on a 2-column grid -- there's only one other cell to go to).
+            (8, KeyCode::Up, 6),
+            (0, KeyCode::Up, 8),    // top of column 0 wraps to the lone bottom field
+            (1, KeyCode::Up, 7),    // top of column 1 wraps to its bottom-most cell
+            // Left/Right toggle within the row; the lone last field has no
+            // neighbor and stays put.
             (2, KeyCode::Left, 3),
             (1, KeyCode::Left, 0),
             (7, KeyCode::Right, 6),
+            (8, KeyCode::Left, 8),
+            (8, KeyCode::Right, 8),
             // Tab/Shift+Tab: unchanged linear cycle, independent of the grid.
-            (7, KeyCode::Tab, 0),
-            (0, KeyCode::BackTab, 7),
+            (8, KeyCode::Tab, 0),
+            (0, KeyCode::BackTab, 8),
             (3, KeyCode::Tab, 4),
             (4, KeyCode::BackTab, 3),
         ];
@@ -1171,9 +1216,9 @@ mod settings_layout_tests {
 
     #[test]
     fn settings_field_step_never_leaves_the_valid_range() {
-        for field in 0..8usize {
+        for field in 0..SETTINGS_FIELD_COUNT {
             for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right, KeyCode::Tab, KeyCode::BackTab] {
-                assert!(settings_field_step(field, key) < 8);
+                assert!(settings_field_step(field, key) < SETTINGS_FIELD_COUNT);
             }
         }
     }

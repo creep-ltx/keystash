@@ -237,13 +237,126 @@ fn vault_paths_dirty(dir: &Path) -> Result<bool, String> {
     Ok(!status_output.stdout.is_empty())
 }
 
+/// `git_sync_vault` without history retention -- what tests and callers
+/// that don't carry a config use. Production call sites (TUI triggers, CLI
+/// commands) go through `git_sync_vault_with_retention` with the configured
+/// value instead.
+pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<String, String> {
+    git_sync_vault_with_retention(db_path, key, 0)
+}
+
+/// Squashes history older than the newest `keep` snapshots into a single
+/// root commit and force-pushes the rewritten (still linear) history.
+/// Returns a note to append to the sync message: what happened, or a plain
+/// warning on failure -- retention must never turn a *successful* sync into
+/// an error, since the push itself already landed.
+///
+/// Safe by construction for the other devices: every sync fetches and then
+/// `git reset origin/main`s before committing on top, so rewritten history
+/// is transparent to the data flow. A device that last synced *before* the
+/// squash horizon merely loses its 3-way merge base (`has_base = false`,
+/// already handled -- more conservative conflict prompts, never data loss).
+/// The rebuild uses commit-tree plumbing rather than rebase: every commit
+/// here is a whole-file snapshot of vault.db, so the new chain just re-parents
+/// the kept snapshots' trees verbatim -- no patch application, no working-
+/// tree involvement, byte-identical content guaranteed.
+fn maybe_squash_history(dir: &Path, keep: u64) -> Option<String> {
+    if keep == 0 {
+        return None;
+    }
+
+    let git_out = |args: &[&str]| -> Option<String> {
+        git_command(dir)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+
+    let count: u64 = git_out(&["rev-list", "--count", "HEAD"])?.parse().ok()?;
+    if count <= keep {
+        return None;
+    }
+
+    let old_head = git_out(&["rev-parse", "HEAD"])?;
+    // The oldest snapshot to keep; everything before it collapses into the
+    // new root, which carries this commit's own tree -- so the kept window
+    // still starts from a complete vault state, not a diff.
+    let horizon = git_out(&["rev-parse", &format!("HEAD~{}", keep - 1)])?;
+
+    let mut parent = git_out(&[
+        "commit-tree",
+        &format!("{}^{{tree}}", horizon),
+        "-m",
+        &format!("keystash: history squashed by retention policy (keeping last {} snapshots)", keep),
+    ])?;
+    let newer = git_out(&["rev-list", "--reverse", &format!("{}..HEAD", horizon)])?;
+    for commit in newer.lines() {
+        let msg = git_out(&["log", "-1", "--format=%s", commit]).unwrap_or_else(|| "sync: auto-merge vault updates".to_string());
+        parent = git_out(&["commit-tree", &format!("{}^{{tree}}", commit), "-p", &parent, "-m", &msg])?;
+    }
+
+    // The final rebuilt commit has the exact tree of the old HEAD, so a
+    // soft reset moves the branch without disturbing index or working tree.
+    let reset_ok = git_command(dir)
+        .args(["reset", "--soft", &parent])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !reset_ok {
+        return Some(" (History retention: local branch reset failed; history left unchanged.)".to_string());
+    }
+
+    // --force-with-lease, never plain force: if another device pushed
+    // between our push moments ago and now, its commit wins and this squash
+    // simply doesn't happen this time.
+    let push_ok = git_command(dir)
+        .args(["push", "--force-with-lease", "origin", "main"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !push_ok {
+        // Undo the local rewrite so local and remote histories stay in step.
+        let _ = git_command(dir)
+            .args(["reset", "--soft", &old_head])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return Some(
+            " (History retention: the remote refused the rewritten history -- a protected branch \
+             blocks force-pushes, or another device pushed concurrently. Vault sync itself \
+             succeeded; retention will retry next sync.)"
+                .to_string(),
+        );
+    }
+
+    // Local housekeeping only; the remote reclaims space on its own
+    // schedule (or via a server-side `git gc` for self-hosted bare repos).
+    let _ = git_command(dir)
+        .args(["gc", "--auto", "--quiet"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    Some(format!(" History squashed to the most recent {} snapshots.", keep))
+}
+
 /// Perform a full git pull, logical SQLite database merge, auto-commit, and git push.
 ///
 /// `key` is the master key (the same one returned by `db::open_vault` et al.) --
 /// this derives the independent SQLCipher key from it internally wherever a
 /// connection needs to be opened or attached, since the vault is now a
-/// whole-database-encrypted file.
-pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<String, String> {
+/// whole-database-encrypted file. `history_retention` (0 = unlimited) is
+/// the configured snapshot-retention setting, applied after a successful
+/// push -- see `maybe_squash_history`.
+pub fn git_sync_vault_with_retention<P: AsRef<Path>>(db_path: P, key: &[u8; 32], history_retention: u64) -> Result<String, String> {
     let db_ref = db_path.as_ref();
     let dir = db_ref.parent().ok_or("Invalid database directory")?;
     let sqlcipher_key = crate::crypto::derive_sqlcipher_key(key);
@@ -303,7 +416,14 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     if skip_merge {
         prune_and_checkpoint(db_ref, &sqlcipher_key);
         if !vault_paths_dirty(dir)? {
-            return Ok("Sync complete: Vault is already up-to-date with remote.".to_string());
+            // Retention still runs on the up-to-date path -- otherwise a
+            // vault that stopped changing would never get its history
+            // squashed after the user enables the setting.
+            let mut msg = "Sync complete: Vault is already up-to-date with remote.".to_string();
+            if let Some(note) = maybe_squash_history(dir, history_retention) {
+                msg.push_str(&note);
+            }
+            return Ok(msg);
         }
         // Local-only changes on top of a remote we're already level with:
         // nothing to merge, fall through directly to stage/commit/push.
@@ -876,21 +996,25 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         return Err("Git push failed. You might have conflicts or remote changes that couldn't rebase automatically.".to_string());
     }
 
-    if let Some((backup_path, remote_was_plaintext)) = unmerged_remote_backup {
+    let mut msg = if let Some((backup_path, remote_was_plaintext)) = unmerged_remote_backup {
         let reason = if remote_was_plaintext {
             "an outdated pre-encryption copy"
         } else {
             "unreadable under the current key despite carrying the same salt -- most likely corrupted"
         };
-        Ok(format!(
+        format!(
             "Sync complete: the remote vault was {} and could not be merged. Your local vault was pushed as the new source of truth; the old remote copy was saved to {:?} in case you need anything from it.",
             reason, backup_path
-        ))
+        )
     } else if committed {
-        Ok("Sync complete: Local and remote vaults merged and updated!".to_string())
+        "Sync complete: Local and remote vaults merged and updated!".to_string()
     } else {
-        Ok("Sync complete: Vault is already up-to-date with remote.".to_string())
+        "Sync complete: Vault is already up-to-date with remote.".to_string()
+    };
+    if let Some(note) = maybe_squash_history(dir, history_retention) {
+        msg.push_str(&note);
     }
+    Ok(msg)
 }
 
 #[derive(Debug, Clone)]
@@ -1598,6 +1722,98 @@ mod tests {
         assert_eq!(
             &*crate::crypto::decrypt(&secrets[0].encrypted_password, &key_b2).unwrap(),
             b"alpha-v1"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// History retention: after each push, history older than the newest
+    /// `keep` snapshots collapses into a squash root and the rewritten
+    /// (still linear) history is force-pushed with lease. Verified from the
+    /// outside: origin's commit count stays bounded, content stays intact,
+    /// and -- the part that must never break -- a device whose clone
+    /// predates the squash (its HEAD no longer exists anywhere in the
+    /// rewritten history) still merges and pushes without data loss.
+    #[test]
+    fn history_retention_bounds_origin_and_keeps_old_devices_working() {
+        let root = scratch_root("retention");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Base", "Cat", "user", "", "base-v1", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // Device B clones NOW -- before any squash -- so its history later
+        // shares no commit with the rewritten one.
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (_conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+
+        let origin_commits = |dir: &Path| -> u64 {
+            let out = Command::new("git")
+                .args(["rev-list", "--count", "origin/main"])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+
+        // Five more snapshots with keep=3 (the config floor is 10; the
+        // function takes any value, and 3 keeps the test fast). Count can
+        // never exceed keep+1 before the squash runs, and lands on keep.
+        let a_key_sql = crate::crypto::derive_sqlcipher_key(&key_a);
+        for i in 0..5 {
+            {
+                let conn = crate::db::open_keyed_connection(&device_a.vault_path, &a_key_sql).unwrap();
+                crate::db::add_secret(&conn, &format!("Item{}", i), "Cat", "user", "", &format!("pw-{}", i), None, &key_a).unwrap();
+            }
+            let msg = super::git_sync_vault_with_retention(&device_a.vault_path, &key_a, 3).unwrap();
+            if origin_commits(&device_a.dir) > 3 {
+                panic!("origin exceeded the retention bound after: {}", msg);
+            }
+        }
+        assert_eq!(origin_commits(&device_a.dir), 3, "history must be squashed to the keep window");
+
+        // The squash root's snapshot is complete: a fresh clone holds all 6
+        // records even though only 3 commits exist.
+        let device_c = init_device(&root, "device_c", &origin);
+        pull(&device_c);
+        let (conn_c, _key_c) = crate::db::open_vault(&device_c.vault_path, "shared-master-password").unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_c).unwrap().len(), 6);
+        drop(conn_c);
+
+        // Device B -- whose entire local history predates the squash --
+        // edits and syncs. Its merge base is gone (has_base = false is the
+        // designed degradation); the sync itself must still merge and push
+        // with nothing lost.
+        {
+            let conn_b = crate::db::open_keyed_connection(
+                &device_b.vault_path,
+                &crate::crypto::derive_sqlcipher_key(&key_b),
+            )
+            .unwrap();
+            crate::db::add_secret(&conn_b, "FromOldB", "Cat", "user", "", "old-b-v1", None, &key_b).unwrap();
+        }
+        let sync_b = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(sync_b.is_ok(), "a pre-squash device must still sync: {:?}", sync_b);
+        let conn_b2 = crate::db::open_keyed_connection(
+            &device_b.vault_path,
+            &crate::crypto::derive_sqlcipher_key(&key_b),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::db::get_secrets(&conn_b2).unwrap().len(),
+            7,
+            "B must end with all 6 remote records plus its own -- nothing resurrected, nothing lost"
         );
 
         let _ = std::fs::remove_dir_all(&root);

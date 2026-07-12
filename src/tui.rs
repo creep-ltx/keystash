@@ -186,6 +186,7 @@ pub struct TuiApp {
     pub settings_gen_uppercase: bool,
     pub settings_gen_numbers: bool,
     pub settings_gen_symbols: bool,
+    pub settings_history_retention: String,
     pub active_settings_field: usize,
     /// True once the current numeric field (Idle Timeout, Clipboard Delay,
     /// Gen Length) has actually been edited since navigating to it. False
@@ -329,6 +330,7 @@ impl TuiApp {
             settings_gen_uppercase: true,
             settings_gen_numbers: true,
             settings_gen_symbols: true,
+            settings_history_retention: String::new(),
             active_settings_field: 0,
             settings_field_touched: false,
             hibp_progress: Arc::new(Mutex::new(None)),
@@ -786,6 +788,7 @@ impl TuiApp {
             None => return,
         };
         let db_path = crate::get_db_path();
+        let retention = self.config.history_retention;
         let detected_clone = Arc::clone(&self.sync_conflicts_detected);
         let result_clone = Arc::clone(&self.sync_result);
         // Take the previous handle out and hand it to the new thread so the
@@ -806,7 +809,7 @@ impl TuiApp {
                     *detected_clone.lock().unwrap() = Some(conflicts);
                     return;
                 }
-            let result = crate::sync::git_sync_vault(&db_path, &key);
+            let result = crate::sync::git_sync_vault_with_retention(&db_path, &key, retention);
             if let Ok(mut slot) = result_clone.lock() {
                 *slot = Some(result);
             }
@@ -840,6 +843,7 @@ impl TuiApp {
             None => return,
         };
         let db_path = crate::get_db_path();
+        let retention = self.config.history_retention;
         let result_clone = Arc::clone(&self.sync_result);
         // See trigger_postunlock_sync: join the previous handle inside the
         // new thread, before it touches any files, rather than after spawning.
@@ -848,7 +852,7 @@ impl TuiApp {
             if let Some(prev) = previous {
                 let _ = prev.join();
             }
-            let result = crate::sync::git_sync_vault(&db_path, &key);
+            let result = crate::sync::git_sync_vault_with_retention(&db_path, &key, retention);
             if let Ok(mut slot) = result_clone.lock() {
                 *slot = Some(result);
             }
@@ -922,7 +926,7 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
             let db_path = crate::get_db_path();
             if crate::sync::is_git_configured(&db_path) {
                 println!("Syncing vault updates on exit...");
-                match crate::sync::git_sync_vault(&db_path, &key) {
+                match crate::sync::git_sync_vault_with_retention(&db_path, &key, app.config.history_retention) {
                     Ok(msg) => println!("{}", msg),
                     Err(err) => eprintln!("Sync Warning: {}", err),
                 }

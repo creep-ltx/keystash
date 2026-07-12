@@ -6,6 +6,16 @@ pub struct AppConfig {
     pub idle_timeout_seconds: u64,
     pub clipboard_clear_seconds: u64,
     pub auto_sync: bool,
+    /// Keep only the last N vault snapshots in git history, squashing older
+    /// commits after each successful push. 0 (the default) keeps everything.
+    /// Encrypted vaults don't delta-compress, so every push stores a full
+    /// copy -- unlimited history means the remote grows forever; the
+    /// tradeoff is that squashed-away snapshots are no longer available for
+    /// rollback, which is why this is opt-in. `#[serde(default)]` so
+    /// config.json files written before this field existed keep parsing
+    /// instead of being quarantined as corrupt.
+    #[serde(default)]
+    pub history_retention: u64,
     pub generator: GeneratorOptions,
 }
 
@@ -15,6 +25,7 @@ impl Default for AppConfig {
             idle_timeout_seconds: 300,
             clipboard_clear_seconds: 5,
             auto_sync: true,
+            history_retention: 0,
             generator: GeneratorOptions::default(),
         }
     }
@@ -33,6 +44,13 @@ impl AppConfig {
                     // relock loop on every tick).
                     config.idle_timeout_seconds = config.idle_timeout_seconds.max(10);
                     config.clipboard_clear_seconds = config.clipboard_clear_seconds.clamp(1, 3600);
+                    // 0 = unlimited; any enabled value is floored at 10 so a
+                    // hand-edited config can't squash away the recent
+                    // snapshots that conflict detection's 3-way base (and
+                    // plain rollback) depend on.
+                    if config.history_retention != 0 {
+                        config.history_retention = config.history_retention.max(10);
+                    }
                     return config;
                 }
                 Ok(Err(e)) => Self::warn_and_quarantine(&path, &e.to_string()),

@@ -141,6 +141,8 @@ The settings screen's Auto Sync toggle controls only the automatic sync actions 
 .PP
 Syncs are cheap when nothing changed: after the fetch, if the remote's commit equals the local one and the vault file is untouched, the sync ends there -- no merge work, no push -- and quitting a session that modified nothing skips the exit-time sync entirely. The .gitignore written in the setup steps below is created automatically on the first sync if missing (an existing customized one is never touched).
 .PP
+Optional history retention: encrypted vaults do not delta-compress, so every pushed change stores a full copy and the remote grows without bound by default. The settings screen's "History Keep" field (0 = keep everything, minimum 10 when enabled) squashes history older than the newest N snapshots after each push and force-pushes with \-\-force\-with\-lease, so a concurrent push from another device always wins. Older snapshots are also the rollback archive -- hence opt-in. A device that last synced before a squash still merges safely; it only loses its 3-way conflict base for that one sync. Branch protection on the vault repo blocks the force-push and must be off if retention is enabled.
+.PP
 .B First-time Setup (Device A):
 .nf
   cd ~/.config/keystash

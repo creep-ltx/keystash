@@ -626,7 +626,7 @@ fn main() {
                     }
                     if sync::is_git_configured(&db_path) {
                         println!("Syncing updates to Git remote...");
-                        let _ = sync::git_sync_vault(&db_path, &key);
+                        let _ = sync::git_sync_vault_with_retention(&db_path, &key, config::AppConfig::load().history_retention);
                     }
                 }
                 Err(e) => eprintln!("Import failed: {}", e),
@@ -727,7 +727,7 @@ fn main() {
                     println!("Success: Master Password changed and vault records re-encrypted!");
                     if sync::is_git_configured(&db_path) {
                         println!("Syncing updates to Git remote...");
-                        let _ = sync::git_sync_vault(&db_path, &new_key);
+                        let _ = sync::git_sync_vault_with_retention(&db_path, &new_key, config::AppConfig::load().history_retention);
                     }
                 }
                 Err(e) => eprintln!("Failed to change Master Password: {}", e),
@@ -743,7 +743,7 @@ fn main() {
                 None => return,
             };
             println!("Syncing vault with Git remote...");
-            match sync::git_sync_vault(&db_path, &key) {
+            match sync::git_sync_vault_with_retention(&db_path, &key, config::AppConfig::load().history_retention) {
                 Ok(msg) => println!("{}", msg),
                 Err(err) => eprintln!("Sync Error: {}", err),
             }
