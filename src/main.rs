@@ -200,7 +200,31 @@ pub fn get_db_path() -> PathBuf {
     path
 }
 
+/// Set by the `--password-stdin` flag: password prompts read one line from
+/// stdin each instead of the terminal, and print no prompt text (a script
+/// parsing stdout doesn't want "Enter Master Password: " mixed in).
+///
+/// This exists for the contrib menu scripts (rofi has no TTY to type into)
+/// and any other scripting: rpassword deliberately reads the controlling
+/// terminal, so piping a password without this flag never worked -- the
+/// read failed and the prompt silently became the empty string (the bug
+/// class the empty-password guards in init/add now catch). The stdin route
+/// is the standard safe channel for this (`docker login --password-stdin`,
+/// `gpg --passphrase-fd`): unlike argv it doesn't show in `ps`, unlike env
+/// it doesn't leak into /proc/<pid>/environ or child processes.
+static PASSWORD_FROM_STDIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
+    if PASSWORD_FROM_STDIN.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut line: Zeroizing<String> = Zeroizing::new(String::new());
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Zeroizing::new(String::new());
+        }
+        while line.ends_with('\n') || line.ends_with('\r') {
+            line.pop();
+        }
+        return line;
+    }
     print!("{}", prompt);
     let _ = io::stdout().flush();
     zeroize::Zeroizing::new(read_password().unwrap_or_default())
@@ -358,9 +382,11 @@ fn print_help() {
     println!("  ~/.config/keystash/vault.db");
     println!();
     println!("Usage:");
-    println!("  keystash [--profile <name>] [--no-sync] [command]");
+    println!("  keystash [--profile <name>] [--no-sync] [--password-stdin] [command]");
     println!("                                            --profile keeps fully separate vaults (own db, config, git remote)");
     println!("                                            under ~/.config/keystash/profiles/<name>/ -- e.g. work, personal");
+    println!("                                            --password-stdin reads passwords from stdin (one line per prompt),");
+    println!("                                            for scripts (see contrib/) -- never pass passwords via argv or env");
     println!("  keystash [tui]                            Start the interactive TUI (default)");
     println!("  keystash init                             Initialize the password vault");
     println!("  keystash add <title> <tags> <user> [url]  Add a new secret (tags: comma-separated, e.g. \"work,email\")");
@@ -413,7 +439,13 @@ fn main() {
         return;
     }
     let no_sync = raw_args.iter().any(|arg| arg == "--no-sync");
-    let mut args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--no-sync").collect();
+    if raw_args.iter().any(|arg| arg == "--password-stdin") {
+        PASSWORD_FROM_STDIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|arg| arg != "--no-sync" && arg != "--password-stdin")
+        .collect();
 
     // --profile must be resolved before the first get_db_path() call below
     // -- every path in the process (vault, config, sync repo) derives from

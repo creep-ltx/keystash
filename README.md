@@ -22,7 +22,10 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 - **First-Time Setup Wizard:** Guides you through setting up a master password on your initial run.
 
 ### ⌨️ CLI Subcommands
-For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` exposes a full CLI module.
+For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` exposes a full CLI module — including `--password-stdin` for safe non-interactive use (password via pipe, never argv or env).
+
+### 🚀 Desktop Quick Access (`contrib/`)
+[`contrib/keystash-menu.sh`](contrib/keystash-menu.sh): bind a key, type your master password into a rofi/fuzzel popup, pick an entry, and the password is copied (with the usual timed auto-clear) or typed into the focused window. See [`contrib/README.md`](contrib/README.md) for setup and the honest security notes.
 
 ---
 

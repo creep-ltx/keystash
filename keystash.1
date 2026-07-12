@@ -16,6 +16,9 @@ without any commands launches the interactive TUI.
 .B \-\-no\-sync
 Bypass all Git synchronization processes (startup pull, database updates thread, and exit push). Useful for offline access or slow connections.
 .TP
+.B \-\-password\-stdin
+Read passwords from standard input (one line per prompt, no prompt text printed) instead of the terminal -- for scripts such as contrib/keystash-menu.sh. Stdin is the safe channel for this: unlike argv the password never appears in ps, unlike environment variables it never leaks into /proc or child processes. Never put passwords in argv or env.
+.TP
 .B \-\-profile \fIname\fR, \-P \fIname\fR
 Use a fully separate vault profile: its own vault.db, config.json, and git repository/remote, stored under ~/.config/keystash/profiles/\fIname\fR/. Works with every command and the TUI (the lock screen shows the active profile). Names are restricted to letters, digits, '-' and '_'. Each profile syncs independently -- run "keystash \-\-profile \fIname\fR sync setup" to configure its remote. The default vault (no flag) is untouched by profiles.
 .SH COMMANDS
