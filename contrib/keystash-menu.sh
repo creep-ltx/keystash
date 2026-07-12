@@ -72,9 +72,12 @@ ask_password() {
         rofi -dmenu -password -p "KeyStash master password" </dev/null
     elif command -v fuzzel >/dev/null 2>&1; then
         fuzzel --dmenu --password --prompt "KeyStash master password: " </dev/null
-    else
+    elif command -v dmenu >/dev/null 2>&1; then
         # dmenu has no masking: the password is briefly VISIBLE on screen.
         dmenu -p "Master password (VISIBLE -- dmenu can't mask!)" </dev/null
+    else
+        echo "keystash-menu: no menu tool found (install fuzzel or rofi -- both mask the password prompt)" >&2
+        exit 1
     fi
 }
 
