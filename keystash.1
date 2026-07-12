@@ -53,6 +53,9 @@ Nuke the local database file after confirming via a verification prompt.
 .B sync
 Force a manual logical merge and synchronization with your configured Git remote.
 .TP
+.B sync setup
+Interactive one-time sync setup. Detects whether this is the first device (a local vault exists and gets pushed as the initial backup) or an additional device (the vault is pulled from the remote), asks for the remote URL, writes the .gitignore, sets a repo-local git identity if none is configured, and verifies the remote is reachable. Works with any git remote: a private GitHub/GitLab repo, an SSH-reachable machine (you@server:vault.git), or a bare repo on a filesystem path such as a NAS mount (/mnt/nas/vault.git). Never needs the master password.
+.TP
 .B change-password
 Change Master Password and re-encrypt all stored vault secrets using a newly derived key.
 .TP

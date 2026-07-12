@@ -157,6 +157,11 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash sync
   ```
   *(Triggers a manual logical merge and push to origin/main, or restores a missing local database)*
+* **One-time Sync Setup (wizard):**
+  ```bash
+  keystash sync setup
+  ```
+  *(Interactively configures the vault directory as a git repo synced to any remote — detects whether this is your first device (pushes the vault) or an additional one (pulls it), writes the `.gitignore`, and verifies the remote is reachable. No master password needed)*
 * **Change Master Password (Key Rotation):**
   ```bash
   keystash change-password
@@ -186,12 +191,23 @@ This section describes the mechanisms. For "given a specific compromise, what do
 > [!NOTE]
 > KeyStash automatically detects if your database configuration folder has a Git repository and remote configured. If no Git repository is present, KeyStash defaults to local-only offline mode without showing any warnings. The `--no-sync` flag is optional and can be used to temporarily disable Git network sync actions even if a remote is configured.
 
-If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging:
+If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging.
+
+> [!TIP]
+> **You don't need GitHub.** Any git remote works, because it only ever stores the encrypted vault file: a private GitHub/GitLab repo, any machine you can SSH into (`you@server:vault.git`), or a plain folder on a NAS mount or USB stick (`/mnt/nas/vault.git`) — create the last two with `git init --bare vault.git` at the destination.
 
 ### 1. One-time Setup
 
+The easy way, on every device:
+```bash
+keystash sync setup
+```
+The wizard detects whether this is your **first device** (a vault already exists locally → it gets pushed as the initial backup) or an **additional device** (no local vault → the existing one is pulled from the remote), asks for the remote URL, verifies it's reachable, and does the rest — including the `.gitignore` and a repo-local git identity if you have none configured. It never needs your master password.
+
+The manual equivalent, if you prefer to see every step:
+
 #### **Device A (Your First/Existing Vault Device)**
-To upload your existing vault database to GitHub for the first time:
+To upload your existing vault database to a private remote for the first time:
 ```bash
 cd ~/.config/keystash
 git init

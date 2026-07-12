@@ -239,6 +239,73 @@ fn open_or_migrate_vault(db_path: &Path) -> Option<(rusqlite::Connection, zeroiz
     }
 }
 
+/// Interactive `keystash sync setup`: figures out which side of the setup
+/// this device is on (a local vault exists -> first device, push it; no
+/// local vault -> additional device, pull from the remote), asks for the
+/// remote URL, shows the plan, and hands off to `sync::setup_sync_repo`.
+/// Needs no master password -- it never opens the vault, only moves the
+/// (encrypted) file around.
+fn run_sync_setup_wizard(db_path: &Path) {
+    let dir = match db_path.parent() {
+        Some(d) => d,
+        None => {
+            eprintln!("Invalid vault directory.");
+            return;
+        }
+    };
+    println!("KeyStash sync setup");
+    println!("-------------------");
+    if dir.join(".git").exists() {
+        println!("This directory is already a git repository: {:?}", dir);
+        println!("To change its remote: git remote set-url origin <url>");
+        println!("To sync now:          keystash sync");
+        return;
+    }
+
+    let first_device = db_path.exists();
+    if first_device {
+        println!("A local vault exists -- setting up as the FIRST device:");
+        println!("  the local vault will be pushed to the remote as the initial backup.");
+    } else {
+        println!("No local vault here -- setting up as an ADDITIONAL device:");
+        println!("  the existing vault will be pulled down from the remote.");
+    }
+    println!();
+    println!("Any git remote works (it only ever stores the encrypted vault file):");
+    println!("  - a private GitHub/GitLab repo:  git@github.com:you/my-vault.git");
+    println!("  - any machine you can SSH into:  you@server:vault.git   (create with `git init --bare vault.git` there)");
+    println!("  - a NAS mount or USB stick:      /mnt/nas/vault.git     (same, `git init --bare`)");
+    println!();
+    print!("Remote URL: ");
+    let _ = io::stdout().flush();
+    let mut url = String::new();
+    let _ = io::stdin().read_line(&mut url);
+    let url = url.trim();
+    if url.is_empty() {
+        eprintln!("No URL entered -- nothing was changed.");
+        return;
+    }
+
+    print!(
+        "Set up {:?} as a git repo synced to '{}' ({} device)? (y/N): ",
+        dir,
+        url,
+        if first_device { "first" } else { "additional" }
+    );
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    let _ = io::stdin().read_line(&mut answer);
+    if answer.trim().to_lowercase() != "y" {
+        println!("Setup cancelled -- nothing was changed.");
+        return;
+    }
+
+    match sync::setup_sync_repo(db_path, url, first_device) {
+        Ok(msg) => println!("{}", msg),
+        Err(e) => eprintln!("Setup failed: {}", e),
+    }
+}
+
 fn print_help() {
     println!("KeyStash 🔑 - Secure Offline Password Manager");
     println!();
@@ -258,6 +325,7 @@ fn print_help() {
     println!("  keystash delete <id>                      Delete a credential by its ID");
     println!("  keystash reset                            Delete/nuke the entire vault file");
     println!("  keystash sync                             Force manual Git sync/merge");
+    println!("  keystash sync setup                       Interactive one-time git sync setup (first or additional device)");
     println!("  keystash audit [--hibp]                   Audit vault (optional HIBP check via --hibp)");
     println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols]");
     println!("                                            Generate a random password (default: 20 chars, all charsets)");
@@ -666,6 +734,10 @@ fn main() {
             }
         }
         "sync" => {
+            if args.get(2).map(|s| s.as_str()) == Some("setup") {
+                run_sync_setup_wizard(&db_path);
+                return;
+            }
             let (_conn, key) = match open_or_migrate_vault(&db_path) {
                 Some(pair) => pair,
                 None => return,

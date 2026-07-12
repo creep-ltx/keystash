@@ -76,6 +76,125 @@ pub fn is_git_configured<P: AsRef<Path>>(db_path: P) -> bool {
     }
 }
 
+/// The testable core behind `keystash sync setup` (main.rs owns the
+/// interactive prompting and mode auto-detection). Turns the config
+/// directory into a ready-to-sync git repository: init, the two-line
+/// `.gitignore`, `origin` remote, `main` branch, a repo-local git identity
+/// if none resolves (sync's auto-commits need one; a missing identity was a
+/// documented commit-failure cause), a connectivity probe -- then either
+/// pushes the existing local vault as the initial backup (`first_device`)
+/// or pulls the existing vault down from the remote. Replaces the
+/// eight-command README incantation and its two traps (the hand-typed
+/// .gitignore, and running `init` on a second device).
+///
+/// Works with any git remote -- a GitHub/GitLab private repo, any
+/// SSH-reachable machine (`user@server:vault.git`), or a plain filesystem
+/// path like a NAS mount or USB stick (`/mnt/nas/vault.git`).
+pub fn setup_sync_repo(db_path: &Path, remote_url: &str, first_device: bool) -> Result<String, String> {
+    let dir = db_path.parent().ok_or("Invalid database directory")?;
+
+    if dir.join(".git").exists() {
+        return Err(
+            "This directory is already a git repository. To point it at a different remote, run \
+             `git remote set-url origin <url>` in it manually -- setup won't touch an existing repo."
+                .to_string(),
+        );
+    }
+    if first_device && !db_path.exists() {
+        return Err(
+            "No local vault found to push. Run `keystash init` (or the TUI first-run setup) to \
+             create one first, then re-run `keystash sync setup`."
+                .to_string(),
+        );
+    }
+    if !first_device && db_path.exists() {
+        return Err(
+            "A local vault already exists here, but additional-device setup expects to pull the \
+             vault from the remote. If this device's vault is the one to keep, choose first-device \
+             setup; otherwise move ~/.config/keystash/vault.db aside and re-run."
+                .to_string(),
+        );
+    }
+
+    let run = |args: &[&str], failure: &str| -> Result<(), String> {
+        let status = git_command(dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("{}: {}", failure, e))?;
+        if !status.success() {
+            return Err(failure.to_string());
+        }
+        Ok(())
+    };
+
+    run(&["init"], "git init failed")?;
+    fs::write(dir.join(".gitignore"), "*\n!vault.db\n")
+        .map_err(|e| format!("Could not write .gitignore: {}", e))?;
+    run(&["remote", "add", "origin", remote_url], "git remote add failed")?;
+    run(&["branch", "-M", "main"], "git branch -M main failed")?;
+
+    // Sync's auto-commits need a resolvable identity; without one, `git
+    // commit` fails. If the user has a global identity it wins; otherwise
+    // set a repo-local placeholder -- these commits are machine-generated
+    // sync snapshots, not authorship anyone reads.
+    let identity_resolves = git_command(dir)
+        .args(["config", "user.email"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !identity_resolves {
+        run(&["config", "user.name", "KeyStash"], "git config user.name failed")?;
+        run(&["config", "user.email", "keystash@localhost"], "git config user.email failed")?;
+    }
+
+    // Reachability probe before doing anything with data: a typo'd URL
+    // should fail here, with the remote named, not three steps later.
+    let probe = git_command(dir)
+        .args(["ls-remote", "origin"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Could not run git ls-remote: {}", e))?;
+    if !probe.success() {
+        return Err(format!(
+            "The remote '{}' is not reachable (check the URL, your SSH keys/credentials, and that \
+             the repository exists). Nothing was pushed or pulled; fix the URL with \
+             `git remote set-url origin <url>` and re-run `keystash sync`.",
+            remote_url
+        ));
+    }
+
+    if first_device {
+        // .gitignore whitelists vault.db, so no -f needed.
+        run(&["add", "vault.db"], "git add vault.db failed")?;
+        run(&["commit", "-m", "Initial vault backup"], "git commit failed")?;
+        run(&["push", "-u", "origin", "main"],
+            "git push failed -- if the remote already contains a vault, this device isn't the \
+             first one: move the local vault aside and re-run setup as an additional device")?;
+        Ok("Sync configured: the local vault was pushed as the initial backup. Other devices can \
+            now run `keystash sync setup` as additional devices."
+            .to_string())
+    } else {
+        run(&["pull", "origin", "main"],
+            "git pull failed -- the remote may be empty (set up the first device before adding \
+             more) or unreachable")?;
+        if !db_path.exists() {
+            return Err(
+                "The remote was pulled but contains no vault.db -- set up the first device (the \
+                 one that already has a vault) before adding this one."
+                    .to_string(),
+            );
+        }
+        Ok("Sync configured: the vault was pulled from the remote. Run `keystash` and unlock with \
+            the vault's master password."
+            .to_string())
+    }
+}
+
 /// The commit hash a ref points at, or `None` if it can't be resolved (fresh
 /// repo with no commits, remote branch that doesn't exist yet, ...).
 fn rev_parse(dir: &Path, reference: &str) -> Option<String> {
@@ -1480,6 +1599,71 @@ mod tests {
             &*crate::crypto::decrypt(&secrets[0].encrypted_password, &key_b2).unwrap(),
             b"alpha-v1"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end for `setup_sync_repo` -- the core behind `keystash sync
+    /// setup`: a first device with an existing vault gets repo+gitignore+
+    /// remote+identity and pushes the initial backup; an additional device
+    /// with an empty directory pulls the vault down and can unlock and sync
+    /// it. Also pins the guard rails: refusing to touch an existing repo,
+    /// and refusing first-device mode with no vault to push.
+    #[test]
+    fn sync_setup_wizard_core_configures_both_device_kinds() {
+        let root = scratch_root("setup_wizard");
+        let origin = init_bare_origin(&root);
+        let origin_url = origin.to_str().unwrap();
+
+        // --- First device: plain directory with a vault, no git anything. ---
+        let dir_a = root.join("device_a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let vault_a = dir_a.join("vault.db");
+        let (conn_a, key_a) = crate::db::create_vault(&vault_a, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        drop(conn_a);
+
+        // First-device mode with no vault must refuse (guard rail).
+        let dir_empty = root.join("device_empty");
+        std::fs::create_dir_all(&dir_empty).unwrap();
+        let err = super::setup_sync_repo(&dir_empty.join("vault.db"), origin_url, true)
+            .expect_err("first-device setup without a vault must refuse");
+        assert!(err.contains("keystash init"), "should point at init, got: {}", err);
+
+        let msg = super::setup_sync_repo(&vault_a, origin_url, true).expect("first-device setup failed");
+        assert!(msg.contains("pushed"), "got: {}", msg);
+        assert_eq!(
+            std::fs::read_to_string(dir_a.join(".gitignore")).unwrap(),
+            "*\n!vault.db\n",
+            "setup must write the two-line .gitignore"
+        );
+
+        // Re-running setup on a configured repo must refuse, not re-init.
+        let err = super::setup_sync_repo(&vault_a, origin_url, true)
+            .expect_err("setup must not touch an existing repo");
+        assert!(err.contains("already a git repository"), "got: {}", err);
+
+        // --- Additional device: empty directory, pulls the vault. ---
+        let dir_b = root.join("device_b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let vault_b = dir_b.join("vault.db");
+        let msg = super::setup_sync_repo(&vault_b, origin_url, false).expect("additional-device setup failed");
+        assert!(msg.contains("pulled"), "got: {}", msg);
+        assert!(vault_b.exists());
+
+        // The pulled vault unlocks with the shared password and syncs.
+        let (conn_b, key_b) = crate::db::open_vault(&vault_b, "shared-master-password")
+            .expect("the pulled vault must unlock with the first device's password");
+        crate::db::add_secret(&conn_b, "FromB", "Cat", "user", "", "b-v1", None, &key_b).unwrap();
+        drop(conn_b);
+        let push_b = super::git_sync_vault(&vault_b, &key_b);
+        assert!(push_b.is_ok(), "post-setup sync failed: {:?}", push_b);
+
+        // And it round-trips back to A through a normal sync.
+        let sync_a = super::git_sync_vault(&vault_a, &key_a);
+        assert!(sync_a.is_ok(), "A's merge failed: {:?}", sync_a);
+        let conn_a2 = crate::db::open_keyed_connection(&vault_a, &crate::crypto::derive_sqlcipher_key(&key_a)).unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_a2).unwrap().len(), 2, "A must see Alpha and FromB");
 
         let _ = std::fs::remove_dir_all(&root);
     }
