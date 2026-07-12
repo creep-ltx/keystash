@@ -721,7 +721,32 @@ pub fn detect_sync_conflicts(
     key: &[u8; 32],
 ) -> Result<Vec<ConflictGroup>, String> {
     let dir = db_path.parent().ok_or("Invalid database directory")?;
-    
+
+    // Fetch first: detection used to compare against whatever ref the
+    // prelock fetch happened to leave behind, while the sync that followed
+    // fetched fresh -- so a conflict landing on the remote between those two
+    // moments bypassed the resolver entirely and got last-write-wins-merged.
+    // Best-effort: if the fetch fails (offline), fall through against the
+    // existing ref; git_sync_vault's own fetch surfaces the real error.
+    let _ = git_command(dir)
+        .arg("fetch")
+        .arg("origin")
+        .arg("main")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    // Same short-circuit as git_sync_vault: origin/main == HEAD means the
+    // remote is this device's own already-merged history -- no divergence,
+    // so no conflicts are possible, and the whole extract-and-compare pass
+    // (which decrypts every record on both sides) can be skipped. Keeps the
+    // manual [s] sync as cheap as the post-unlock one when nothing changed.
+    if let (Some(local), Some(remote)) = (rev_parse(dir, "HEAD"), rev_parse(dir, "origin/main"))
+        && local == remote
+    {
+        return Ok(Vec::new());
+    }
+
     let remote_db_path = dir.join(format!("vault_remote_detect_{}_{}.db", std::process::id(), unique_tmp_suffix()));
     let base_db_path = dir.join(format!("vault_base_detect_{}_{}.db", std::process::id(), unique_tmp_suffix()));
     let _cleanup = TempCleanup(vec![remote_db_path.clone(), base_db_path.clone()]);
@@ -1550,6 +1575,72 @@ mod tests {
         assert!(sync_result.is_err(), "syncing against a remote requiring a newer version should refuse, not merge");
         let err = sync_result.unwrap_err();
         assert!(err.contains("99.0.0"), "error should name the required version, got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// detect_sync_conflicts must find conflicts that landed on the remote
+    /// since the last local fetch -- it fetches for itself now. Previously
+    /// it compared against whatever ref the prelock fetch had left behind
+    /// (note: no manual `git fetch` anywhere in this test's device-B steps),
+    /// so a conflict pushed after that moment bypassed the resolver and got
+    /// silently last-write-wins-merged. This is what makes the manual [s]
+    /// sync's conflict detection real rather than dependent on startup
+    /// timing.
+    #[test]
+    fn detect_sync_conflicts_fetches_the_remote_itself() {
+        let root = scratch_root("detect_fetches");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Common", "Cat", "user", "", "common-v1", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A edits and pushes AFTER B's pull -- from B's point of view this
+        // conflict exists only on the remote, invisible until a fetch.
+        {
+            let conn_a = crate::db::open_keyed_connection(
+                &device_a.vault_path,
+                &crate::crypto::derive_sqlcipher_key(&key_a),
+            )
+            .unwrap();
+            let s = crate::db::get_secrets(&conn_a).unwrap();
+            crate::db::update_secret(&conn_a, s[0].id, "Common", "Cat", "user", "", "common-v2-from-A", None, &key_a).unwrap();
+        }
+        let push_a = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(push_a.is_ok(), "A's push failed: {:?}", push_a);
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // B edits the same record, then detection runs with NO manual fetch.
+        {
+            let s = crate::db::get_secrets(&conn_b).unwrap();
+            crate::db::update_secret(&conn_b, s[0].id, "Common", "Cat", "user", "", "common-v2-from-B", None, &key_b).unwrap();
+        }
+        drop(conn_b);
+
+        let conflicts = super::detect_sync_conflicts(&device_b.vault_path, &key_b).unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "detection must fetch and see the conflict A pushed after B's last fetch, got: {:?}",
+            conflicts.iter().map(|c| &c.title).collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

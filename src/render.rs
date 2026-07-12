@@ -349,18 +349,18 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             app.screen = Screen::Settings;
         }
         KeyCode::Char('s') => {
-            // The help screen has advertised this key since before it was
-            // ever wired up. Reuses trigger_postconflict_sync's machinery
-            // (join the previous pending sync thread, then run the same
-            // full logical merge git_sync_vault does everywhere else) --
-            // there's nothing conflict-specific about it, it's just the
-            // existing "run a sync now" entry point.
+            // The manual sync gets the same detect-then-merge treatment as
+            // the post-unlock sync (it used to run a blind last-write-wins
+            // merge -- the one sync the user explicitly asked for had
+            // weaker protection than the automatic one). Deliberately only
+            // gated on --no-sync, not on the Auto Sync setting: pressing
+            // the key IS the request.
             if app.no_sync {
                 app.copied_message = Some(("Sync is disabled (--no-sync).".to_string(), Instant::now(), StatusType::Normal));
             } else if !crate::sync::is_git_configured(crate::get_db_path()) {
                 app.copied_message = Some(("Sync not configured -- no git remote set up in ~/.config/keystash.".to_string(), Instant::now(), StatusType::Normal));
             } else {
-                app.trigger_postconflict_sync();
+                app.spawn_detect_then_sync();
                 app.copied_message = Some(("Syncing with git remote...".to_string(), Instant::now(), StatusType::Normal));
             }
         }

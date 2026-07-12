@@ -758,11 +758,24 @@ impl TuiApp {
     }
 
     /// Runs right after a successful unlock/setup/migration, once a key exists.
-    /// Detects conflicts against the ref `trigger_prelock_fetch` already updated;
-    /// if none are found, performs the normal full logical merge + push.
+    /// Automatic trigger -- gated on Auto Sync (see trigger_prelock_fetch);
+    /// the manual [s] key calls spawn_detect_then_sync directly instead, so
+    /// an explicit user request works even with Auto Sync switched off.
     pub(crate) fn trigger_postunlock_sync(&mut self) {
-        // Automatic trigger -- gated on Auto Sync, see trigger_prelock_fetch.
         if self.no_sync || !self.config.auto_sync {
+            return;
+        }
+        self.spawn_detect_then_sync();
+    }
+
+    /// The actual work shared by the post-unlock/post-import trigger and the
+    /// manual [s] key: detect conflicts against a freshly fetched
+    /// origin/main (detect_sync_conflicts fetches for itself) and surface
+    /// them in the resolver screen -- otherwise run the full logical
+    /// merge + push. Callers gate this, not the function: the automatic
+    /// trigger on Auto Sync, the manual key only on --no-sync.
+    pub(crate) fn spawn_detect_then_sync(&mut self) {
+        if self.no_sync {
             return;
         }
         // A sync is being spawned for the current state -- see the field's
@@ -811,6 +824,12 @@ impl TuiApp {
     /// else instead, relying on the conflict handlers above having already
     /// re-stamped each resolved record with a fresh "now" timestamp so the
     /// ordinary last-write-wins merge logic doesn't immediately re-clobber them.
+    ///
+    /// Deliberately does NOT go through spawn_detect_then_sync: re-running
+    /// conflict detection immediately after a resolution would re-flag the
+    /// records the user just resolved (their local copy and the remote both
+    /// still differ from the merge base until this push lands), trapping
+    /// them in a resolve-detect-resolve loop.
     pub(crate) fn trigger_postconflict_sync(&mut self) {
         if self.no_sync {
             return;
@@ -891,6 +910,13 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     // the session having actually modified the vault: the exit sync's only
     // job is pushing local edits (pulling is the next unlock's job), so a
     // look-only session skips the exit fetch+push entirely.
+    //
+    // Deliberately plain last-write-wins git_sync_vault, not the
+    // detect-then-resolve path every in-session sync now uses: the terminal
+    // is already restored and the app is exiting -- there's no UI left to
+    // resolve conflicts in. Conflicts that were detected and postponed
+    // during the session re-armed vault_modified_since_sync, so this LWW
+    // push is their documented fallback.
     if !app.no_sync && app.config.auto_sync && app.vault_modified_since_sync
         && let Some(key) = app.key.clone() {
             let db_path = crate::get_db_path();
