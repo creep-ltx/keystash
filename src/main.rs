@@ -1,6 +1,9 @@
 pub mod crypto;
 pub mod db;
 pub mod tui;
+pub mod forms;
+pub mod modals;
+pub mod render;
 pub mod import;
 pub mod sync;
 pub mod generator;

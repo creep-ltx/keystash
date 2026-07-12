@@ -1,0 +1,1076 @@
+use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use zeroize::{Zeroize, Zeroizing};
+use crate::db;
+use crate::tui::{TuiApp, Screen, FormField};
+use crate::render::*;
+
+
+#[cfg(test)]
+mod form_integration_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render_text(app: &TuiApp) -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_form(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer.get(x, y).symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // Excluded from the normal `cargo test` run and run explicitly with
+    // `cargo test -- --ignored`: it overrides the process-wide HOME env var
+    // (via TuiApp::new, which reads it internally with no way to inject a
+    // test path), which would race against any other test reading it if run
+    // concurrently as part of the default parallel suite. Isolated to a
+    // throwaway temp dir, so it never touches a real vault.
+    #[test]
+    #[ignore]
+    fn form_reuse_and_strength_reflect_the_cache_not_live_decrypt() {
+        let tmp = std::env::temp_dir().join(format!("keystash_form_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        let db_path = tmp.join(".config/keystash/vault.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let (conn, key) = db::create_vault(&db_path, "master-pw").unwrap();
+        db::add_secret(&conn, "One", "Cat", "u1", "", "hunter2", None, &key).unwrap();
+        db::add_secret(&conn, "Two", "Cat", "u2", "", "hunter2", None, &key).unwrap();
+        db::add_secret(&conn, "Three", "Cat", "u3", "", "SoloPassword1!", None, &key).unwrap();
+        drop(conn);
+
+        let mut app = TuiApp::new(true);
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        app.conn = db::open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+        app.key = Some(key);
+        app.refresh_secrets();
+
+        // Open the Add form exactly like pressing 'a' does, then type the
+        // password two existing entries already share.
+        handle_dashboard_input(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        app.active_form_field = FormField::Password;
+        for c in "hunter2".chars() {
+            handle_form_input(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let rendered = render_text(&app);
+        println!("{rendered}");
+        assert!(
+            rendered.contains("Reused in 2 other entry(ies)"),
+            "expected reuse warning against the two pre-existing 'hunter2' entries (via the cache computed on form-open), got:\n{rendered}"
+        );
+
+        // Switch to a password no seeded entry uses at all -- the warning
+        // must disappear (and the strength bar must reflect *that* password).
+        app.form_password.clear();
+        for c in "NeverUsedElsewhere99$".chars() {
+            handle_form_input(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let rendered2 = render_text(&app);
+        assert!(
+            !rendered2.contains("Reused in"),
+            "a password used by no other entry must not show a reuse warning, got:\n{rendered2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+
+pub(crate) fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
+    if modifiers.contains(KeyModifiers::CONTROL) && (code == KeyCode::Char('g') || code == KeyCode::Char('G')) {
+        let opts = crate::generator::GeneratorOptions::load();
+        if let Ok(pw) = crate::generator::generate_password(&opts) {
+            app.form_password.zeroize();
+            app.form_password = pw;
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Tab => {
+            app.active_form_field = match app.active_form_field {
+                FormField::Title => FormField::Category,
+                FormField::Category => FormField::Username,
+                FormField::Username => FormField::Url,
+                FormField::Url => FormField::Password,
+                FormField::Password => FormField::Notes,
+                FormField::Notes => FormField::Title,
+            };
+        }
+        KeyCode::BackTab => {
+            app.active_form_field = match app.active_form_field {
+                FormField::Title => FormField::Notes,
+                FormField::Category => FormField::Title,
+                FormField::Username => FormField::Category,
+                FormField::Url => FormField::Username,
+                FormField::Password => FormField::Url,
+                FormField::Notes => FormField::Password,
+            };
+        }
+        KeyCode::Char(c) => {
+            if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+                match app.active_form_field {
+                    FormField::Title => app.form_title.push(c),
+                    FormField::Category => app.form_category.push(c),
+                    FormField::Username => app.form_username.push(c),
+                    FormField::Url => app.form_url.push(c),
+                    FormField::Password => app.form_password.push(c),
+                    FormField::Notes => app.form_notes.push(c),
+                }
+            }
+        },
+        KeyCode::Backspace => match app.active_form_field {
+            FormField::Title => { app.form_title.pop(); }
+            FormField::Category => { app.form_category.pop(); }
+            FormField::Username => { app.form_username.pop(); }
+            FormField::Url => { app.form_url.pop(); }
+            FormField::Password => { app.form_password.pop(); }
+            FormField::Notes => { app.form_notes.pop(); }
+        },
+        KeyCode::Enter => {
+            if app.form_title.trim().is_empty()
+                || app.form_category.trim().is_empty()
+                || app.form_password.trim().is_empty()
+            {
+                app.error_message = "Title, Category and Password are required!".to_string();
+                app.screen = Screen::ErrorDialog;
+                return;
+            }
+
+            if let Some(key) = &app.key {
+                let res = if let Some(id) = app.edit_id {
+                    db::update_secret(
+                        &app.conn,
+                        id,
+                        &app.form_title,
+                        &app.form_category,
+                        &app.form_username,
+                        &app.form_url,
+                        &app.form_password,
+                        if app.form_notes.is_empty() { None } else { Some(&app.form_notes) },
+                        key,
+                    )
+                } else {
+                    db::add_secret(
+                        &app.conn,
+                        &app.form_title,
+                        &app.form_category,
+                        &app.form_username,
+                        &app.form_url,
+                        &app.form_password,
+                        if app.form_notes.is_empty() { None } else { Some(&app.form_notes) },
+                        key,
+                    )
+                };
+
+                match res {
+                    Ok(_) => {
+                        app.form_password.zeroize();
+                        app.form_password.clear();
+                        app.form_notes.zeroize();
+                        app.form_notes.clear();
+                        app.screen = Screen::Dashboard;
+                        app.refresh_secrets();
+                    }
+                    Err(err) => {
+                        app.error_message = err;
+                        app.screen = Screen::ErrorDialog;
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.form_password.zeroize();
+            app.form_password.clear();
+            app.form_notes.zeroize();
+            app.form_notes.clear();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
+
+pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Tab => {
+            app.change_pass_field = (app.change_pass_field + 1) % 3;
+        }
+        KeyCode::BackTab => {
+            app.change_pass_field = if app.change_pass_field == 0 { 2 } else { app.change_pass_field - 1 };
+        }
+        KeyCode::Char(c) => {
+            match app.change_pass_field {
+                0 => app.password_input.push(c),
+                1 => app.password_confirm_input.push(c),
+                _ => app.form_password.push(c),
+            }
+        }
+        KeyCode::Backspace => {
+            match app.change_pass_field {
+                0 => { app.password_input.pop(); }
+                1 => { app.password_confirm_input.pop(); }
+                _ => { app.form_password.pop(); }
+            }
+        }
+        KeyCode::Enter => {
+            if app.password_input.is_empty() || app.password_confirm_input.is_empty() || app.form_password.is_empty() {
+                app.error_message = "All fields are required!".to_string();
+                return;
+            }
+            if app.password_confirm_input != app.form_password {
+                app.error_message = "New passwords do not match!".to_string();
+                return;
+            }
+
+            // Verify old key
+            let old_key = match &app.key {
+                Some(k) => k,
+                None => {
+                    app.error_message = "Vault is locked!".to_string();
+                    return;
+                }
+            };
+
+            // Check if old password matches current active key
+            let db_path = crate::get_db_path();
+            if db::open_vault(&db_path, &app.password_input).is_err() {
+                app.error_message = "Incorrect current password!".to_string();
+                return;
+            }
+
+            // Rotate keys. change_master_password builds the re-keyed vault
+            // at a separate temp path and swaps it into place at db_path, so
+            // app.conn (left open against whatever the pre-rotation backup
+            // path now is) must be replaced with a fresh connection to the
+            // new file on success, not reused.
+            match db::change_master_password(&app.conn, &db_path, old_key, &app.password_confirm_input) {
+                Ok(new_key) => {
+                    match db::open_vault(&db_path, &app.password_confirm_input) {
+                        Ok((new_conn, _)) => {
+                            app.conn = new_conn;
+                            app.key = Some(new_key);
+                            app.password_input.zeroize();
+                            app.password_confirm_input.zeroize();
+                            app.form_password.zeroize();
+                            app.password_input.clear();
+                            app.password_confirm_input.clear();
+                            app.form_password.clear();
+                            app.error_message = String::new();
+                            app.screen = Screen::Dashboard;
+                            app.refresh_secrets();
+                        }
+                        Err(err) => {
+                            // change_master_password already confirmed the new
+                            // vault opens before returning Ok, so this should
+                            // be unreachable -- but surface it loudly rather
+                            // than silently leaving app.conn stale if it ever
+                            // does happen.
+                            app.error_message = format!("Password changed but failed to reopen the vault: {}", err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    app.error_message = err;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.password_input.zeroize();
+            app.password_confirm_input.zeroize();
+            app.form_password.zeroize();
+            app.password_input.clear();
+            app.password_confirm_input.clear();
+            app.form_password.clear();
+            app.error_message = String::new();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
+
+fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
+    if password.is_empty() {
+        return (
+            Span::styled(" [░░░░░░░░░░]", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Empty", Style::default().fg(Color::DarkGray))
+        );
+    }
+
+    let (severity, _issues, score) = crate::audit::check_strength(password);
+    let color = match severity {
+        crate::audit::Severity::Critical => Color::Red,
+        crate::audit::Severity::Weak => Color::Yellow,
+        crate::audit::Severity::Good => Color::Green,
+    };
+    let filled = (score as usize) * 2; // score is 0..=5, bar is 10 chars wide
+    let empty = 10usize.saturating_sub(filled);
+    let bar = format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty));
+
+    (
+        Span::styled(bar, Style::default().fg(color)),
+        Span::styled(format!(" {}", severity.label()), Style::default().fg(color))
+    )
+}
+
+
+pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let is_edit = app.screen == Screen::EditSecret;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if is_edit { "Edit Secret (Enter to save, Esc to cancel)" } else { "Add New Secret (Enter to save, Esc to cancel)" });
+
+    let area = centered_rect(60, 85, size);
+    f.render_widget(Clear, area); // clear background under popup
+
+    let form_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3), // Title
+            Constraint::Length(3), // Category
+            Constraint::Length(3), // Username
+            Constraint::Length(3), // URL
+            Constraint::Length(3), // Password
+            Constraint::Length(1), // Password Strength Indicator
+            Constraint::Length(2), // Audit Warnings (reused/breached)
+            Constraint::Min(2),    // Notes
+        ])
+        .split(area);
+
+    f.render_widget(block, area);
+
+    let get_border_style = |field| {
+        if app.active_form_field == field {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+
+    let title_box = Paragraph::new(app.form_title.as_str()).block(
+        Block::default().borders(Borders::ALL).title("Title*").border_style(get_border_style(FormField::Title))
+    );
+    f.render_widget(title_box, form_layout[0]);
+
+    let category_box = Paragraph::new(app.form_category.as_str()).block(
+        Block::default().borders(Borders::ALL).title("Category*").border_style(get_border_style(FormField::Category))
+    );
+    f.render_widget(category_box, form_layout[1]);
+
+    let username_box = Paragraph::new(app.form_username.as_str()).block(
+        Block::default().borders(Borders::ALL).title("Username").border_style(get_border_style(FormField::Username))
+    );
+    f.render_widget(username_box, form_layout[2]);
+
+    let url_box = Paragraph::new(app.form_url.as_str()).block(
+        Block::default().borders(Borders::ALL).title("URL").border_style(get_border_style(FormField::Url))
+    );
+    f.render_widget(url_box, form_layout[3]);
+
+    let password_title = if app.active_form_field == FormField::Password {
+        "Password* (Press Ctrl+G to generate)"
+    } else {
+        "Password*"
+    };
+    // Masked behind the same [v] toggle the Detail View pane already uses --
+    // the form password used to render in the clear unconditionally, the one
+    // place in the whole TUI a password was ever shown on screen with no way
+    // to hide it (shoulder-surfing, screen-share, screenshot). Zeroizing to
+    // match the Detail View pane's own pattern for this same tradeoff --
+    // ratatui's internal render buffer is out of reach either way, but our
+    // own copy shouldn't drop unwiped on top of that.
+    let password_display: Zeroizing<String> = if app.reveal_password {
+        Zeroizing::new(app.form_password.clone())
+    } else {
+        Zeroizing::new("•".repeat(app.form_password.chars().count()))
+    };
+    let password_box = Paragraph::new(password_display.as_str()).block(
+        Block::default().borders(Borders::ALL).title(password_title).border_style(get_border_style(FormField::Password))
+    );
+    f.render_widget(password_box, form_layout[4]);
+
+    // Password strength indicator
+    let (bar_span, label_span) = get_strength_bar(&app.form_password);
+    let strength_paragraph = Paragraph::new(Line::from(vec![
+        Span::styled("Password Strength:", Style::default().fg(Color::Gray)),
+        bar_span,
+        label_span,
+    ])).wrap(Wrap { trim: true });
+    f.render_widget(strength_paragraph, form_layout[5]);
+
+    // Check reuse against the fingerprints refresh_form_audit_cache computed
+    // once when the form opened, instead of decrypting every other secret
+    // in the vault again on every single render frame (every keystroke,
+    // every 250ms idle-timeout poll tick). The current form password is the
+    // only thing that changes frame to frame, and hashing just that one
+    // value is cheap.
+    let current_fingerprint = app.key.as_ref().and_then(|key| {
+        if app.form_password.is_empty() {
+            None
+        } else {
+            Some(crate::crypto::hibp_cache_fingerprint(app.form_password.as_bytes(), key))
+        }
+    });
+    let reuse_count = current_fingerprint
+        .as_ref()
+        .and_then(|fp| app.form_reuse_fingerprints.get(fp))
+        .copied()
+        .unwrap_or(0);
+
+    // Build Audit Warnings line
+    let mut warning_spans = vec![
+        Span::styled("Audit Warnings:   ", Style::default().fg(Color::Gray))
+    ];
+    let mut has_warnings = false;
+
+    if reuse_count > 0 {
+        warning_spans.push(Span::styled(
+            format!("⚠ Reused in {} other entry(ies)", reuse_count),
+            Style::default().fg(Color::LightRed)
+        ));
+        has_warnings = true;
+    }
+
+    let hibp_lookup = current_fingerprint
+        .as_ref()
+        .and_then(|fp| app.form_hibp_cache.get(fp))
+        .copied()
+        .flatten();
+    if let Some(hibp_count) = hibp_lookup {
+        if hibp_count > 0 {
+            if has_warnings {
+                warning_spans.push(Span::raw(" | "));
+            }
+            warning_spans.push(Span::styled(
+                format!("⚠ Breached ({} times in HIBP database)", hibp_count),
+                Style::default().fg(Color::LightRed)
+            ));
+            has_warnings = true;
+        }
+    }
+
+    if !has_warnings {
+        if app.form_password.is_empty() {
+            warning_spans.push(Span::styled("None", Style::default().fg(Color::DarkGray)));
+        } else {
+            warning_spans.push(Span::styled("✓ Unique & not known pwned (in local cache)", Style::default().fg(Color::Green)));
+        }
+    }
+
+    let warnings_paragraph = Paragraph::new(Line::from(warning_spans)).wrap(Wrap { trim: true });
+    f.render_widget(warnings_paragraph, form_layout[6]);
+
+    let notes_box = Paragraph::new(app.form_notes.as_str()).block(
+        Block::default().borders(Borders::ALL).title("Notes").border_style(get_border_style(FormField::Notes))
+    );
+    f.render_widget(notes_box, form_layout[7]);
+}
+
+
+
+
+pub(crate) fn draw_change_password_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Change Master Password")
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let area = centered_rect(60, 70, size);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let field_0_focused = app.change_pass_field == 0;
+    let field_1_focused = app.change_pass_field == 1;
+    let field_2_focused = app.change_pass_field == 2;
+
+    let mask_current = "*".repeat(app.password_input.len());
+    let current_box = Paragraph::new(mask_current)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Current Master Password")
+                .border_style(if field_0_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(current_box, chunks[0]);
+
+    let mask_new = "*".repeat(app.password_confirm_input.len());
+    let new_box = Paragraph::new(mask_new)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("New Master Password")
+                .border_style(if field_1_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(new_box, chunks[1]);
+
+    let mask_confirm = "*".repeat(app.form_password.len());
+    let confirm_box = Paragraph::new(mask_confirm)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm New Master Password")
+                .border_style(if field_2_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) })
+        );
+    f.render_widget(confirm_box, chunks[2]);
+
+    if !app.error_message.is_empty() {
+        let err = Paragraph::new(&*app.error_message)
+            .style(Style::default().fg(Color::Red));
+        f.render_widget(err, chunks[3]);
+    } else {
+        let hints = Paragraph::new("Use [Tab] / [Shift+Tab] to switch fields | Press [Enter] to Save | [Esc] to Cancel")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hints, chunks[3]);
+    }
+}
+
+
+pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.gen_password.zeroize();
+            app.screen = Screen::Dashboard;
+        }
+        // Toggle options
+        KeyCode::Char('1') => {
+            app.gen_options.use_uppercase = !app.gen_options.use_uppercase;
+            let _ = app.gen_options.save();
+            regenerate_in_place(app);
+        }
+        KeyCode::Char('2') => {
+            app.gen_options.use_numbers = !app.gen_options.use_numbers;
+            let _ = app.gen_options.save();
+            regenerate_in_place(app);
+        }
+        KeyCode::Char('3') => {
+            app.gen_options.use_symbols = !app.gen_options.use_symbols;
+            let _ = app.gen_options.save();
+            regenerate_in_place(app);
+        }
+        // Adjust length
+        KeyCode::Left => {
+            if app.gen_options.length > 4 {
+                app.gen_options.length -= 1;
+                let _ = app.gen_options.save();
+                regenerate_in_place(app);
+            }
+        }
+        KeyCode::Right => {
+            if app.gen_options.length < 128 {
+                app.gen_options.length += 1;
+                let _ = app.gen_options.save();
+                regenerate_in_place(app);
+            }
+        }
+        // Regenerate with same options
+        KeyCode::Char('r') | KeyCode::Enter => {
+            regenerate_in_place(app);
+        }
+        // Copy to clipboard
+        KeyCode::Char('c') => {
+            let pass = Zeroizing::new(app.gen_password.clone());
+            app.copy_to_clipboard(pass, "password");
+        }
+        // Fill current form field (if opened from form — future use)
+        _ => {}
+    }
+}
+
+
+fn regenerate_in_place(app: &mut TuiApp) {
+    // The generator dialog only exposes toggles for uppercase/numbers/symbols
+    // -- lowercase can only be turned off from the Settings screen -- so
+    // reaching all-four-disabled needs both: lowercase off in Settings, then
+    // the other three toggled off here too. When it happens, generate_password
+    // errors, and that error string used to become the displayed "password"
+    // (and what [c] would copy to the clipboard) instead of an actual
+    // password. Falling back to lowercase-only guarantees a real password
+    // either way, and updates gen_options so the fallback is what's actually
+    // shown/used, not a silent mismatch between state and output.
+    if !app.gen_options.use_lowercase
+        && !app.gen_options.use_uppercase
+        && !app.gen_options.use_numbers
+        && !app.gen_options.use_symbols
+    {
+        app.gen_options.use_lowercase = true;
+    }
+    app.gen_password.zeroize();
+    match crate::generator::generate_password(&app.gen_options) {
+        Ok(pass) => app.gen_password = pass,
+        Err(e) => app.gen_password = format!("Error: {e}"),
+    }
+}
+
+
+pub(crate) fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let area = centered_rect(64, 50, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("  🎲 Password Generator  ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3), // Generated password display
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Length row
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Toggle: uppercase
+            Constraint::Length(1), // Toggle: numbers
+            Constraint::Length(1), // Toggle: symbols
+            Constraint::Min(0),    // Key hints
+        ])
+        .split(area);
+
+    // ── Password display ──
+    let pass_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let pass_widget = Paragraph::new(app.gen_password.as_str())
+        .style(pass_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(pass_widget, chunks[0]);
+
+    // ── Length row ──
+    let len_line = Line::from(vec![
+        Span::styled("  Length: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[←]", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {}  ", app.gen_options.length),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("[→]", Style::default().fg(Color::Cyan)),
+    ]);
+    f.render_widget(Paragraph::new(len_line), chunks[2]);
+
+    // ── Toggle rows ──
+    let toggle = |enabled: bool, label: &str, key: &str| -> Line {
+        let (icon, color) = if enabled {
+            ("✓ ON ", Color::Green)
+        } else {
+            ("✗ OFF", Color::Red)
+        };
+        Line::from(vec![
+            Span::styled(format!("  [{key}] "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{icon}"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
+        ])
+    };
+
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_uppercase, "Uppercase  (A-Z)", "1")),
+        chunks[4],
+    );
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_numbers, "Numbers    (0-9)", "2")),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new(toggle(app.gen_options.use_symbols, "Symbols    (!@#$…)", "3")),
+        chunks[6],
+    );
+
+    // ── Key hints ──
+    let hints = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[r/Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Regenerate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[c] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Copy  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("Close", Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(hints, chunks[7]);
+}
+
+
+
+// ─────────────────────────────────────────────
+//  Deduplication Screen
+// ─────────────────────────────────────────────
+
+/// Re-stamps a record's `updated_at` to now. Must be called *after* deleting
+/// its duplicates, not before: each duplicate's tombstone carries that
+/// duplicate's own sync_uuid, so the uuid-keyed merge can never mistake one
+/// for the kept record -- but the legacy fallback merge (against a remote
+/// still on the pre-sync_uuid format) matches tombstones by the shared
+/// (title, category, username) triple, and if the kept record's timestamp
+/// predates a duplicate's tombstone there, that merge treats the kept record
+/// as deleted and destroys it on the next sync -- silently losing the entry
+/// the user just chose to keep.
+
+pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            app.active_settings_field = settings_field_step(app.active_settings_field, key);
+        }
+        KeyCode::Char(c) => {
+            match app.active_settings_field {
+                0 => {
+                    if c.is_ascii_digit() {
+                        app.settings_idle_timeout.push(c);
+                    }
+                }
+                1 => {
+                    if c.is_ascii_digit() {
+                        app.settings_clipboard_clear.push(c);
+                    }
+                }
+                3 => {
+                    if c.is_ascii_digit() {
+                        app.settings_gen_length.push(c);
+                    }
+                }
+                2 | 4 | 5 | 6 | 7 => {
+                    if c == ' ' {
+                        match app.active_settings_field {
+                            2 => app.settings_auto_sync = !app.settings_auto_sync,
+                            4 => app.settings_gen_lowercase = !app.settings_gen_lowercase,
+                            5 => app.settings_gen_uppercase = !app.settings_gen_uppercase,
+                            6 => app.settings_gen_numbers = !app.settings_gen_numbers,
+                            7 => app.settings_gen_symbols = !app.settings_gen_symbols,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Backspace => {
+            match app.active_settings_field {
+                0 => { app.settings_idle_timeout.pop(); }
+                1 => { app.settings_clipboard_clear.pop(); }
+                3 => { app.settings_gen_length.pop(); }
+                _ => {}
+            }
+        }
+        KeyCode::Enter => {
+            // Clamped rather than accepted as-typed: an idle timeout of 0 makes
+            // `last_activity.elapsed() >= Duration::from_secs(0)` always true,
+            // locking the vault on the very next tick -- including right after
+            // this save, soft-locking the user out of the TUI (settings screen
+            // included) until they hand-edit config.json.
+            let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300).max(10);
+            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(5).clamp(1, 3600);
+            let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20).clamp(4, 256);
+
+            app.config.idle_timeout_seconds = timeout;
+            app.config.clipboard_clear_seconds = clip;
+            app.config.auto_sync = app.settings_auto_sync;
+            app.config.generator.length = gen_len;
+            app.config.generator.use_lowercase = app.settings_gen_lowercase;
+            app.config.generator.use_uppercase = app.settings_gen_uppercase;
+            app.config.generator.use_numbers = app.settings_gen_numbers;
+            app.config.generator.use_symbols = app.settings_gen_symbols;
+
+            let _ = app.config.save();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
+
+/// Where a settings-screen key press moves the active field, given the
+/// 2-column grid layout (fields 0..7, laid out row-major 2-per-row -- see
+/// draw_settings_screen). Up/Down move by a full grid row (index +/- 2,
+/// wrapping); Left/Right move within the row by toggling the low bit
+/// (0<->1, 2<->3, ...); Tab/Shift+Tab are unchanged from before the grid
+/// existed -- a plain linear cycle through all 8, independent of the grid
+/// shape, since that's the "just cycle through" behavior already relied on.
+
+fn settings_field_step(field: usize, key: KeyCode) -> usize {
+    match key {
+        KeyCode::Up => (field + 6) % 8,
+        KeyCode::Down => (field + 2) % 8,
+        KeyCode::Left | KeyCode::Right => field ^ 1,
+        KeyCode::Tab => if field < 7 { field + 1 } else { 0 },
+        KeyCode::BackTab => if field > 0 { field - 1 } else { 7 },
+        _ => field,
+    }
+}
+
+/// Number of on-screen grid rows the 8 settings fields occupy at 2 fields
+/// per row. Kept as a named constant since draw_settings_screen and
+/// settings_grid_scroll both need to agree on it.
+const SETTINGS_GRID_ROWS: usize = 4;
+
+/// How many of the 4 field-grid rows actually fit in a settings box this
+/// tall, and which row to start drawing from so `active_settings_field`'s
+/// row is always among the visible ones. Pure function of height and the
+/// active field, not app state, so there's nothing to keep in sync -- the
+/// scroll position just falls out of "what's focused" on every frame.
+
+fn settings_grid_scroll(area_height: u16, active_settings_field: usize) -> (usize, usize) {
+    const ROW_HEIGHT: u16 = 3;
+    const RESERVED_FOR_HINTS: u16 = 3;
+
+    // Mirrors the margin(2) applied to `area` below.
+    let usable_height = area_height.saturating_sub(4);
+    let rows_that_fit = ((usable_height.saturating_sub(RESERVED_FOR_HINTS)) / ROW_HEIGHT)
+        .max(1)
+        .min(SETTINGS_GRID_ROWS as u16) as usize;
+
+    let active_row = active_settings_field / 2;
+    let max_scroll = SETTINGS_GRID_ROWS.saturating_sub(rows_that_fit);
+    let scroll_offset = active_row
+        .saturating_sub(rows_that_fit.saturating_sub(1))
+        .min(max_scroll);
+
+    (rows_that_fit, scroll_offset)
+}
+
+
+pub(crate) fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.size();
+    let area = centered_rect(85, 90, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" KeyStash Settings ")
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block, area);
+
+    // Laid out 2 fields per grid row (4 rows for 8 fields) rather than the
+    // old 1-per-row stack: a single column of 8 individually-bordered
+    // fields needed 24+ rows just for the boxes, which silently lost
+    // content rows -- ratatui's constraint solver shrinks Length(3) boxes
+    // to fit when there isn't room, and a box shrunk to 2 rows has nowhere
+    // left to draw its value line -- on anything close to a standard
+    // 80x24 terminal. Even the 2-column grid additionally scrolls (see
+    // settings_grid_scroll) so no terminal size, however small, can hide
+    // a field's value entirely; it'll just take more Tab presses to reach.
+    let fields: [(&str, String, bool); 8] = [
+        ("1. Idle Timeout (s)", app.settings_idle_timeout.clone(), app.active_settings_field == 0),
+        ("2. Clipboard Delay (s)", app.settings_clipboard_clear.clone(), app.active_settings_field == 1),
+        ("3. Auto Sync (Y/N)", if app.settings_auto_sync { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 2),
+        ("4. Gen Length", app.settings_gen_length.clone(), app.active_settings_field == 3),
+        ("5. Gen Lowercase (Y/N)", if app.settings_gen_lowercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 4),
+        ("6. Gen Uppercase (Y/N)", if app.settings_gen_uppercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 5),
+        ("7. Gen Numbers (Y/N)", if app.settings_gen_numbers { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 6),
+        ("8. Gen Symbols (Y/N)", if app.settings_gen_symbols { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 7),
+    ];
+
+    let (rows_that_fit, scroll_offset) = settings_grid_scroll(area.height, app.active_settings_field);
+    let max_scroll = SETTINGS_GRID_ROWS.saturating_sub(rows_that_fit);
+
+    let mut constraints: Vec<Constraint> = (0..rows_that_fit).map(|_| Constraint::Length(3)).collect();
+    constraints.push(Constraint::Min(2)); // hints (+ scroll indicator)
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints(constraints)
+        .split(area);
+
+    let render_field = |label: &str, value: &str, active: bool, frame: &mut ratatui::Frame, rect: Rect| {
+        let border_color = if active { Color::Green } else { Color::DarkGray };
+        let text_style = if active { Style::default().fg(Color::Green) } else { Style::default().fg(Color::White) };
+        let p = Paragraph::new(Span::styled(value, text_style))
+            .block(Block::default().borders(Borders::ALL).title(label).border_style(Style::default().fg(border_color)));
+        frame.render_widget(p, rect);
+    };
+
+    for visible_idx in 0..rows_that_fit {
+        let row_idx = scroll_offset + visible_idx;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[visible_idx]);
+
+        if let Some((label, value, active)) = fields.get(row_idx * 2) {
+            render_field(label, value, *active, f, cols[0]);
+        }
+        if let Some((label, value, active)) = fields.get(row_idx * 2 + 1) {
+            render_field(label, value, *active, f, cols[1]);
+        }
+    }
+
+    let mut hint_spans = vec![
+        Span::styled(" Tab/Arrows ", Style::default().fg(Color::Cyan)),
+        Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Enter ", Style::default().fg(Color::Green)),
+        Span::styled("Save & Exit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Esc ", Style::default().fg(Color::Red)),
+        Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+    ];
+    if max_scroll > 0 {
+        hint_spans.push(Span::styled(
+            format!("  (row {}/{}, scroll with Tab/Arrows)", scroll_offset + 1, SETTINGS_GRID_ROWS),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[rows_that_fit]);
+}
+
+
+#[cfg(test)]
+mod settings_layout_tests {
+    use super::*;
+
+    // The original bug (some settings fields rendered with no value
+    // visible at all) came from a single-column layout needing 32
+    // rows minimum while a standard terminal offers 24 -- ratatui's
+    // constraint solver silently shrinks some Length(3) boxes down to 2
+    // rows, which have no room left for the value line. These tests pin
+    // down the 2-column, scrolling replacement so that regression can't
+    // come back quietly: whatever the terminal height, every field must
+    // eventually be reachable and, once reachable, fully visible.
+
+    #[test]
+    fn all_four_rows_fit_on_a_generously_sized_terminal() {
+        let (rows_that_fit, scroll_offset) = settings_grid_scroll(40, 0);
+        assert_eq!(rows_that_fit, SETTINGS_GRID_ROWS);
+        assert_eq!(scroll_offset, 0);
+    }
+
+    #[test]
+    fn a_standard_80x24_terminal_shows_at_least_one_full_row() {
+        // area.height here is centered_rect(85, 90, 24)'s output, but the
+        // function only needs the resulting height -- exercise it directly
+        // at the kind of height a 24-row terminal actually yields.
+        let (rows_that_fit, _) = settings_grid_scroll(21, 0);
+        assert!(rows_that_fit >= 1, "must always show at least one full row, never a half-visible one");
+    }
+
+    #[test]
+    fn scroll_never_leaves_less_than_a_full_row_visible() {
+        // Across every plausible height and every field a user could have
+        // focused, rows_that_fit must never be 0 (a 0-height row shows
+        // nothing, same failure mode as the original bug) and the active
+        // field's row must always fall inside the visible window.
+        for height in 0..=60u16 {
+            for active_field in 0..8usize {
+                let (rows_that_fit, scroll_offset) = settings_grid_scroll(height, active_field);
+                assert!(rows_that_fit >= 1, "height={height}: rows_that_fit must never be 0");
+
+                let active_row = active_field / 2;
+                assert!(
+                    active_row >= scroll_offset && active_row < scroll_offset + rows_that_fit,
+                    "height={height} active_field={active_field}: active row {active_row} not in visible window [{scroll_offset}, {})",
+                    scroll_offset + rows_that_fit
+                );
+                assert!(
+                    scroll_offset + rows_that_fit <= SETTINGS_GRID_ROWS,
+                    "height={height} active_field={active_field}: visible window runs past the last row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tabbing_through_every_field_on_a_tiny_terminal_eventually_shows_each_one() {
+        // Simulates a terminal too short to show all 4 rows at once (only
+        // 1 fits) and confirms Tab-ing through every field (0..8, matching
+        // handle_settings_input's linear navigation) brings each field's
+        // row into view at some point -- nothing is permanently unreachable.
+        let tiny_height = 10; // rows_that_fit == 1 at this height
+        let (rows_that_fit, _) = settings_grid_scroll(tiny_height, 0);
+        assert_eq!(rows_that_fit, 1, "test assumes a height that only fits one row -- adjust tiny_height if settings_grid_scroll's constants change");
+
+        let mut rows_seen = std::collections::HashSet::new();
+        for active_field in 0..8usize {
+            let (fit, offset) = settings_grid_scroll(tiny_height, active_field);
+            for r in offset..offset + fit {
+                rows_seen.insert(r);
+            }
+        }
+        assert_eq!(rows_seen, (0..SETTINGS_GRID_ROWS).collect(), "every grid row must be reachable by tabbing through all 8 fields");
+    }
+
+    #[test]
+    fn settings_field_step_matches_the_grid_layout() {
+        // Fields are laid out row-major, 2 per row:
+        //   row 0: 0 1      row 1: 2 3      row 2: 4 5      row 3: 6 7
+        // (field, key, expected_next)
+        let cases = [
+            // Down moves one full row, wrapping within the same column.
+            (1usize, KeyCode::Down, 3usize),
+            (3, KeyCode::Down, 5),
+            (7, KeyCode::Down, 1),
+            (6, KeyCode::Down, 0),
+            // Up is the mirror image.
+            (3, KeyCode::Up, 1),
+            (0, KeyCode::Up, 6),
+            (1, KeyCode::Up, 7),
+            // Left/Right toggle within the row (both directions do the same
+            // thing on a 2-column grid -- there's only one other cell to go to).
+            (2, KeyCode::Left, 3),
+            (1, KeyCode::Left, 0),
+            (7, KeyCode::Right, 6),
+            // Tab/Shift+Tab: unchanged linear cycle, independent of the grid.
+            (7, KeyCode::Tab, 0),
+            (0, KeyCode::BackTab, 7),
+            (3, KeyCode::Tab, 4),
+            (4, KeyCode::BackTab, 3),
+        ];
+
+        for (field, key, expected) in cases {
+            let actual = settings_field_step(field, key);
+            assert_eq!(
+                actual, expected,
+                "field {field} + {key:?} should move to {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_field_step_never_leaves_the_valid_range() {
+        for field in 0..8usize {
+            for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right, KeyCode::Tab, KeyCode::BackTab] {
+                assert!(settings_field_step(field, key) < 8);
+            }
+        }
+    }
+}
+
+
