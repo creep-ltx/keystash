@@ -349,6 +349,15 @@ pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                             app.screen = Screen::Dashboard;
                             app.vault_modified_since_sync = true;
                             app.refresh_secrets();
+                            // Push the rotation out immediately (the CLI's
+                            // change-password already does) instead of
+                            // letting it sit local until exit -- every
+                            // minute it stays unpushed widens the window in
+                            // which another device's ordinary edit turns
+                            // into the rotation-race refusal. Auto Sync off
+                            // still means no automatic push, same contract
+                            // as every other trigger.
+                            app.trigger_postunlock_sync();
                         }
                         Err(err) => {
                             // change_master_password already confirmed the new

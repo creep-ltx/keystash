@@ -538,7 +538,75 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                     .unwrap_or(false);
 
                 if !remote_is_ancestor {
-                    return Err(
+                    // Refusing is settled -- but *whose* rotation this is
+                    // decides the recovery instructions, and getting that
+                    // wrong is worse than it sounds: the message used to
+                    // assume the rotation always happened elsewhere, so a
+                    // device that had just rotated *itself* (and lost the
+                    // race with an ordinary edit pushed from another device)
+                    // was told to delete its own freshly-rotated vault and
+                    // unlock the remote "with the NEW master password" --
+                    // when the remote actually holds the OLD one. Following
+                    // that quietly un-rotates the vault while the user
+                    // believes the password was changed.
+                    //
+                    // The salt in HEAD:vault.db is the state this device
+                    // last synced, so it arbitrates: whichever side no
+                    // longer matches it is the side that rotated.
+                    let head_salt: Option<[u8; crate::crypto::SALT_LEN]> = git_command(dir)
+                        .arg("show")
+                        .arg("HEAD:vault.db")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success() && o.stdout.len() >= crate::crypto::SALT_LEN)
+                        .map(|o| {
+                            let mut s = [0u8; crate::crypto::SALT_LEN];
+                            s.copy_from_slice(&o.stdout[..crate::crypto::SALT_LEN]);
+                            s
+                        });
+                    let local_rotated = head_salt.map(|h| h != local_salt).unwrap_or(false);
+                    let remote_rotated = head_salt.map(|h| h != remote_salt).unwrap_or(true);
+
+                    let message = if local_rotated && !remote_rotated {
+                        // This device rotated; the remote gained ordinary
+                        // edits (old salt) in the meantime. The local vault
+                        // must NOT be deleted-and-forgotten -- it holds the
+                        // rotation -- and the remote unlocks with the OLD
+                        // password, not a new one.
+                        "Sync refused: this device recently changed its master password, but the remote \
+                         has since received other changes still encrypted under the OLD master password \
+                         -- pushing now would erase them.\n\n\
+                         To combine both safely:\n\
+                         1. Back up this device's vault:   keystash export ~/keystash-backup.csv\n\
+                         2. Delete the local vault file:   ~/.config/keystash/vault.db\n\
+                         3. Run `keystash sync` to restore the remote vault, and unlock it with the \
+                         OLD master password.\n\
+                         4. Re-import the backup, then run `keystash change-password` to redo the \
+                         rotation -- it will push to all devices this time.\n\
+                         5. Delete the backup file securely.\n\n\
+                         Nothing was pushed."
+                    } else if local_rotated && remote_rotated {
+                        // Both sides rotated independently -- rare, but the
+                        // instructions must not pretend otherwise.
+                        "Sync refused: the master password was changed on this device AND on another \
+                         device independently -- the two vaults are now encrypted under different new \
+                         passwords, and pushing either would erase the other's rotation.\n\n\
+                         Pick which rotation wins (the remote's is what other devices will pull), then \
+                         on this device:\n\
+                         1. Back up this device's vault:   keystash export ~/keystash-backup.csv\n\
+                         2. Delete the local vault file:   ~/.config/keystash/vault.db\n\
+                         3. Run `keystash sync` to restore the remote vault, and unlock it with the \
+                         master password set on the OTHER device.\n\
+                         4. Re-import the backup if needed, and rotate again if this device's new \
+                         password is the one you wanted.\n\
+                         5. Delete the backup file securely.\n\n\
+                         Nothing was pushed."
+                    } else {
+                        // The rotation happened elsewhere (or HEAD:vault.db
+                        // was unreadable and this stays the safe default
+                        // assumption): adopt the rotated remote.
                         "Sync refused: the remote vault is encrypted under a different master password \
                          -- it was rotated (or re-initialized) on another device, and pushing this \
                          device's vault would undo that change.\n\n\
@@ -549,8 +617,8 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                          4. Unlock with the NEW master password, re-import the backup if needed, then \
                          delete it securely.\n\n\
                          Nothing was pushed."
-                            .to_string(),
-                    );
+                    };
+                    return Err(message.to_string());
                 }
                 // Own rotation: fall through to the push below. No unmerged
                 // backup either -- the remote copy is this device's own
@@ -1412,6 +1480,96 @@ mod tests {
             &*crate::crypto::decrypt(&secrets[0].encrypted_password, &key_b2).unwrap(),
             b"alpha-v1"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The rotation *race*, distinct from the plain stale-device case: A
+    /// rotates but hasn't pushed yet, B pushes an ordinary edit first, then
+    /// A syncs. Refusing is correct either way, but the refusal used to
+    /// misdiagnose the direction -- telling A the vault "was rotated on
+    /// another device" and to unlock the remote "with the NEW master
+    /// password", when A itself rotated and the remote actually holds the
+    /// OLD one; following those steps quietly un-rotated A's vault. The
+    /// salt recorded in HEAD:vault.db (A's last-synced state) is what
+    /// arbitrates whose salt changed.
+    #[test]
+    fn rotation_race_refusal_names_the_local_rotation() {
+        let root = scratch_root("rotation_race");
+        let origin = init_bare_origin(&root);
+
+        // --- Device A: create, push. ---
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "old-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // --- Device B: clone, then push an ordinary edit (old salt). ---
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "old-master-password").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // --- A rotates but does NOT sync yet (the race window). ---
+        let new_key_a =
+            crate::db::change_master_password(&conn_a, &device_a.vault_path, &key_a, "new-master-password").unwrap();
+        drop(conn_a);
+        let rotated_salt = super::read_file_head(&device_a.vault_path).unwrap();
+
+        // --- B's ordinary edit lands on the remote first. ---
+        crate::db::add_secret(&conn_b, "FromB", "Cat", "user", "", "b-v1", None, &key_b).unwrap();
+        drop(conn_b);
+        let push_b = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(push_b.is_ok(), "B's ordinary push failed: {:?}", push_b);
+
+        // --- A syncs: must refuse, and must name A's OWN rotation. ---
+        let err = super::git_sync_vault(&device_a.vault_path, &new_key_a)
+            .expect_err("A must refuse to push its rotation over B's unseen edit");
+        assert!(
+            err.contains("this device recently changed its master password"),
+            "refusal must name the local rotation, got: {}",
+            err
+        );
+        assert!(
+            err.contains("OLD master password"),
+            "recovery must say the remote unlocks with the OLD password, got: {}",
+            err
+        );
+        assert!(
+            !err.contains("rotated (or re-initialized) on another device"),
+            "must not misattribute the rotation to another device, got: {}",
+            err
+        );
+
+        // Neither side was touched: A still holds its rotated vault, the
+        // remote still holds B's edit under the old salt.
+        assert_eq!(super::read_file_head(&device_a.vault_path).unwrap(), rotated_salt);
+        let fetch = Command::new("git").args(["fetch", "origin", "main"]).current_dir(&device_a.dir).status().unwrap();
+        assert!(fetch.success());
+        let show = Command::new("git")
+            .args(["show", "origin/main:vault.db"])
+            .current_dir(&device_a.dir)
+            .output()
+            .unwrap();
+        assert!(show.status.success());
+        assert_ne!(&show.stdout[..16], &rotated_salt[..], "the remote must still be on the old salt");
+
+        // And the message's recovery procedure genuinely works: restore the
+        // remote, unlock with the OLD password, find B's edit intact.
+        std::fs::remove_file(&device_a.vault_path).unwrap();
+        let restore = super::git_sync_vault(&device_a.vault_path, &new_key_a);
+        assert!(restore.is_ok(), "restore-from-remote failed: {:?}", restore);
+        let (conn_a2, _) = crate::db::open_vault(&device_a.vault_path, "old-master-password")
+            .expect("the restored remote must unlock with the OLD master password, exactly as the refusal says");
+        let titles: Vec<String> = crate::db::get_secrets(&conn_a2).unwrap().iter().map(|s| s.title.clone()).collect();
+        assert!(titles.contains(&"FromB".to_string()), "B's edit must be in the restored vault, got: {:?}", titles);
 
         let _ = std::fs::remove_dir_all(&root);
     }
