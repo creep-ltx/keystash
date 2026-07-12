@@ -388,7 +388,25 @@ pub fn git_sync_vault_with_retention<P: AsRef<Path>>(db_path: P, key: &[u8; 32],
         .map_err(|e| format!("git fetch failed: {}", e))?;
 
     if !fetch_status.success() {
-        return Err("Could not reach git remote 'origin/main'. Check network or SSH configuration.".to_string());
+        // A fetch of origin/main also fails on a remote that is perfectly
+        // reachable but simply has no branch yet -- a brand-new empty repo
+        // awaiting its very first push. Tell the two apart with ls-remote:
+        // reachable + no main ref means "first push", and the normal
+        // stage/commit/push below creates the branch (vault.db is untracked
+        // in a fresh repo, so the dirtiness check sees it). Everything else
+        // stays a hard connectivity error.
+        let empty_remote = git_command(dir)
+            .args(["ls-remote", "origin", "main"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout.is_empty())
+            .unwrap_or(false);
+        if !empty_remote {
+            return Err("Could not reach git remote 'origin/main'. Check network or SSH configuration.".to_string());
+        }
     }
 
     // Short-circuit: the fetch above already answered "did the remote
@@ -1723,6 +1741,35 @@ mod tests {
             &*crate::crypto::decrypt(&secrets[0].encrypted_password, &key_b2).unwrap(),
             b"alpha-v1"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `keystash sync` against a brand-new empty remote must perform the
+    /// very first push itself instead of failing with "could not reach
+    /// origin/main" -- a fetch of a nonexistent branch fails identically to
+    /// a dead network, and the ls-remote probe is what tells them apart.
+    #[test]
+    fn first_sync_to_an_empty_remote_pushes_the_initial_backup() {
+        let root = scratch_root("empty_remote");
+        let origin = init_bare_origin(&root);
+
+        // A device with a vault, git repo and remote configured -- but no
+        // commit, no push, and an origin with no branches at all.
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        drop(conn_a);
+
+        let msg = super::git_sync_vault(&device_a.vault_path, &key_a)
+            .expect("the first sync to an empty remote must push, not fail");
+        assert!(msg.contains("merged and updated"), "got: {}", msg);
+
+        // The branch now exists and a second device can set up from it.
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, _key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_b).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

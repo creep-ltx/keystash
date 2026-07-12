@@ -86,7 +86,12 @@ impl AppConfig {
         let mut path = crate::get_db_path();
         path.set_file_name("config.json");
         let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+        // Write-to-temp + rename, so a crash mid-write can't leave a
+        // truncated config.json behind (which load() would then quarantine
+        // to .bad and silently reset every setting to defaults).
+        let tmp = path.with_file_name("config.json.tmp");
+        std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         Ok(())
     }
 }

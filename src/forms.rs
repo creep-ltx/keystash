@@ -311,29 +311,56 @@ pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                 app.error_message = "New passwords do not match!".to_string();
                 return;
             }
-
-            // Verify old key
-            let old_key = match &app.key {
-                Some(k) => k,
-                None => {
-                    app.error_message = "Vault is locked!".to_string();
-                    return;
-                }
-            };
-
-            // Check if old password matches current active key
-            let db_path = crate::get_db_path();
-            if db::open_vault(&db_path, &app.password_input).is_err() {
-                app.error_message = "Incorrect current password!".to_string();
+            if app.key.is_none() {
+                app.error_message = "Vault is locked!".to_string();
                 return;
             }
+            // Everything slow -- verifying the current password and the
+            // rotation itself are up to three Argon2id derivations plus a
+            // full re-encryption -- is deferred a frame so the notice
+            // renders first. See PendingDerive.
+            app.error_message.clear();
+            app.pending_derive = Some(crate::tui::PendingDerive::ChangePassword);
+        }
+        KeyCode::Esc => {
+            app.password_input.zeroize();
+            app.password_confirm_input.zeroize();
+            app.form_password.zeroize();
+            app.password_input.clear();
+            app.password_confirm_input.clear();
+            app.form_password.clear();
+            app.error_message = String::new();
+            app.screen = Screen::Dashboard;
+        }
+        _ => {}
+    }
+}
 
-            // Rotate keys. change_master_password builds the re-keyed vault
-            // at a separate temp path and swaps it into place at db_path, so
-            // app.conn (left open against whatever the pre-rotation backup
-            // path now is) must be replaced with a fresh connection to the
-            // new file on success, not reused.
-            match db::change_master_password(&app.conn, &db_path, old_key, &app.password_confirm_input) {
+/// The deferred half of the Change Password screen's Enter -- runs from
+/// run_loop, one frame after PendingDerive::ChangePassword was set. The
+/// cheap validations already happened in the handler.
+pub(crate) fn perform_change_password(app: &mut TuiApp) {
+    let old_key = match app.key.clone() {
+        Some(k) => k,
+        None => {
+            app.error_message = "Vault is locked!".to_string();
+            return;
+        }
+    };
+
+    // Check if old password matches current active key
+    let db_path = crate::get_db_path();
+    if db::open_vault(&db_path, &app.password_input).is_err() {
+        app.error_message = "Incorrect current password!".to_string();
+        return;
+    }
+
+    // Rotate keys. change_master_password builds the re-keyed vault
+    // at a separate temp path and swaps it into place at db_path, so
+    // app.conn (left open against whatever the pre-rotation backup
+    // path now is) must be replaced with a fresh connection to the
+    // new file on success, not reused.
+    match db::change_master_password(&app.conn, &db_path, &old_key, &app.password_confirm_input) {
                 Ok(new_key) => {
                     match db::open_vault(&db_path, &app.password_confirm_input) {
                         Ok((new_conn, _)) => {
@@ -373,19 +400,6 @@ pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                     app.error_message = err;
                 }
             }
-        }
-        KeyCode::Esc => {
-            app.password_input.zeroize();
-            app.password_confirm_input.zeroize();
-            app.form_password.zeroize();
-            app.password_input.clear();
-            app.password_confirm_input.clear();
-            app.form_password.clear();
-            app.error_message = String::new();
-            app.screen = Screen::Dashboard;
-        }
-        _ => {}
-    }
 }
 
 
@@ -637,7 +651,11 @@ pub(crate) fn draw_change_password_screen(f: &mut ratatui::Frame, app: &TuiApp) 
         );
     f.render_widget(confirm_box, chunks[2]);
 
-    if !app.error_message.is_empty() {
+    if app.pending_derive.is_some() {
+        let busy = Paragraph::new("Verifying password, deriving new key, and re-encrypting the vault -- please wait...")
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        f.render_widget(busy, chunks[3]);
+    } else if !app.error_message.is_empty() {
         let err = Paragraph::new(&*app.error_message)
             .style(Style::default().fg(Color::Red));
         f.render_widget(err, chunks[3]);
@@ -671,16 +689,18 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
             let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
-        // Adjust length
+        // Adjust length -- same 4..=256 bounds generate_password itself
+        // enforces (see generator::MIN_LENGTH/MAX_LENGTH), so the dialog,
+        // the Settings screen, and the CLI all agree on one rule.
         KeyCode::Left => {
-            if app.gen_options.length > 4 {
+            if app.gen_options.length > crate::generator::MIN_LENGTH {
                 app.gen_options.length -= 1;
                 let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }
         KeyCode::Right => {
-            if app.gen_options.length < 128 {
+            if app.gen_options.length < crate::generator::MAX_LENGTH {
                 app.gen_options.length += 1;
                 let _ = app.gen_options.save();
                 regenerate_in_place(app);

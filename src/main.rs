@@ -333,8 +333,8 @@ fn print_help() {
     println!("  keystash sync                             Force manual Git sync/merge");
     println!("  keystash sync setup                       Interactive one-time git sync setup (first or additional device)");
     println!("  keystash audit [--hibp]                   Audit vault (optional HIBP check via --hibp)");
-    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols]");
-    println!("                                            Generate a random password (default: 20 chars, all charsets)");
+    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols] [--save]");
+    println!("                                            Generate a random password (default: 20 chars, all charsets; length clamped to 4-256; --save persists the options as new defaults)");
     println!("  keystash change-password                  Change Master Password and rotate keys");
     println!("  keystash help                             Show this help message");
 }
@@ -971,9 +971,14 @@ fn main() {
         }
         "generate" | "gen" => {
             let mut options = generator::GeneratorOptions::load();
+            let mut save_as_defaults = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--save" => {
+                        save_as_defaults = true;
+                        i += 1;
+                    }
                     "-l" | "--length" => {
                         if i + 1 < args.len() {
                             if let Ok(l) = args[i + 1].parse::<usize>() {
@@ -1019,7 +1024,16 @@ fn main() {
                 }
             }
 
-            let _ = options.save();
+            // Persisting is opt-in: a one-off `--no-symbols` for some
+            // legacy site must not silently become the permanent default
+            // for every future password (which is what happened before).
+            if save_as_defaults {
+                options.length = options.length.clamp(generator::MIN_LENGTH, generator::MAX_LENGTH);
+                match options.save() {
+                    Ok(()) => println!("Saved these options as your new generator defaults."),
+                    Err(e) => eprintln!("Could not save generator defaults: {}", e),
+                }
+            }
 
             match generator::generate_password(&options) {
                 Ok(pass) => {

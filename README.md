@@ -67,7 +67,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[PgUp]` / `[PgDn]`** | Page up/down (moves selection by 10 items in secrets, 5 items in tags) |
 | **`[Space]`** | Mark / Unmark selected credential |
 | **`[/]`** | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
-| **`[v]`** | Toggle password visibility in detail pane |
+| **`[v]`** | Toggle password & notes visibility in detail pane |
 | **`[c]`** | Copy username to clipboard (clears in configured delay, default 5s) |
 | **`[p]`** | Copy decrypted password to clipboard (clears in configured delay, default 5s) |
 | **`[u]`** | Copy website URL to clipboard (clears in configured delay, default 5s) |
@@ -120,9 +120,9 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   *(Shows detailed fields of a secret; passwords and notes are masked by default unless `--reveal` or `-r` is provided)*
 * **Generate Password:**
   ```bash
-  keystash generate [-l <length>] [--no-uppercase] [--no-numbers] [--no-symbols] [--uppercase] [--numbers] [--symbols]
+  keystash generate [-l <length>] [--no-uppercase] [--no-numbers] [--no-symbols] [--uppercase] [--numbers] [--symbols] [--save]
   ```
-  *(Generates a random secure password, avoiding visually ambiguous characters. Saves choices as your new defaults)*
+  *(Generates a random secure password, avoiding visually ambiguous characters. Length is clamped to 4–256 — the one rule shared by the CLI, the generator dialog, and Settings. Options apply to this run only unless `--save` is passed, which persists them as your new defaults)*
 * **Copy Secret Field to Clipboard:**
   ```bash
   keystash copy <ID> [username|password|url]

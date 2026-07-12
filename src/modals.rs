@@ -311,7 +311,7 @@ pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         ]),
         Line::from(vec![
             Span::styled("  [v]           ", Style::default().fg(Color::Yellow)),
-            Span::styled("Toggle password visibility in Detail Pane", Style::default().fg(Color::White)),
+            Span::styled("Toggle password & notes visibility in Detail Pane", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  [m]           ", Style::default().fg(Color::Yellow)),

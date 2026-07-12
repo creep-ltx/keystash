@@ -12,7 +12,7 @@ use std::{
     sync::atomic::Ordering,
 };
 use crate::db;
-use crate::tui::{TuiApp, Screen, ActiveBlock, ConfirmAction, StatusType, FormField};
+use crate::tui::{TuiApp, Screen, ActiveBlock, ConfirmAction, StatusType, FormField, PendingDerive};
 use crate::forms::*;
 use crate::modals::*;
 
@@ -23,35 +23,11 @@ pub(crate) fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
             app.password_input.pop();
         }
         KeyCode::Enter => {
-            let db_path = crate::get_db_path();
-            let result = if app.needs_migration {
-                db::migrate_legacy_vault(&db_path, &app.password_input)
-            } else {
-                db::open_vault(&db_path, &app.password_input)
-            };
-            match result {
-                Ok((conn, derived_key)) => {
-                    app.conn = conn;
-                    app.needs_migration = false;
-                    app.key = Some(derived_key);
-                    app.screen = Screen::Dashboard;
-                    app.password_input.zeroize();
-                    app.password_input.clear();
-                    // Prune expired tombstones on unlock, not only during
-                    // git sync: an offline-only user (no git configured)
-                    // otherwise keeps deleted credentials' titles/usernames
-                    // in the vault forever -- the exact privacy issue
-                    // pruning exists to fix. Best-effort, like sync's call.
-                    let _ = db::prune_old_tombstones(&app.conn);
-                    app.refresh_secrets();
-                    app.trigger_postunlock_sync();
-                }
-                Err(err) => {
-                    app.error_message = err;
-                    app.password_input.zeroize();
-                    app.password_input.clear();
-                }
-            }
+            // The actual unlock is an Argon2id derivation (deliberately
+            // slow) -- defer it one frame so the "Deriving key..." notice
+            // is on screen while the terminal blocks. See PendingDerive.
+            app.error_message.clear();
+            app.pending_derive = Some(PendingDerive::Unlock);
         }
         KeyCode::Esc => {
             return true;
@@ -59,6 +35,40 @@ pub(crate) fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+/// The deferred half of the Lock screen's Enter -- runs from run_loop, one
+/// frame after PendingDerive::Unlock was set.
+pub(crate) fn perform_unlock(app: &mut TuiApp) {
+    let db_path = crate::get_db_path();
+    let result = if app.needs_migration {
+        db::migrate_legacy_vault(&db_path, &app.password_input)
+    } else {
+        db::open_vault(&db_path, &app.password_input)
+    };
+    match result {
+        Ok((conn, derived_key)) => {
+            app.conn = conn;
+            app.needs_migration = false;
+            app.key = Some(derived_key);
+            app.screen = Screen::Dashboard;
+            app.password_input.zeroize();
+            app.password_input.clear();
+            // Prune expired tombstones on unlock, not only during
+            // git sync: an offline-only user (no git configured)
+            // otherwise keeps deleted credentials' titles/usernames
+            // in the vault forever -- the exact privacy issue
+            // pruning exists to fix. Best-effort, like sync's call.
+            let _ = db::prune_old_tombstones(&app.conn);
+            app.refresh_secrets();
+            app.trigger_postunlock_sync();
+        }
+        Err(err) => {
+            app.error_message = err;
+            app.password_input.zeroize();
+            app.password_input.clear();
+        }
+    }
 }
 
 
@@ -91,24 +101,10 @@ pub(crate) fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
                 app.error_message = "Passwords do not match!".to_string();
                 return false;
             }
-            let db_path = crate::get_db_path();
-            match db::create_vault(&db_path, &app.password_input) {
-                Ok((conn, derived_key)) => {
-                    app.conn = conn;
-                    app.key = Some(derived_key);
-                    app.screen = Screen::Dashboard;
-                    app.password_input.zeroize();
-                    app.password_confirm_input.zeroize();
-                    app.password_input.clear();
-                    app.password_confirm_input.clear();
-                    app.error_message = String::new();
-                    app.refresh_secrets();
-                    app.trigger_postunlock_sync();
-                }
-                Err(err) => {
-                    app.error_message = err;
-                }
-            }
+            // Cheap validation done; the Argon2id derivation inside
+            // create_vault is deferred a frame -- see PendingDerive.
+            app.error_message.clear();
+            app.pending_derive = Some(PendingDerive::Setup);
         }
         KeyCode::Esc => {
             return true;
@@ -116,6 +112,29 @@ pub(crate) fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+/// The deferred half of the Setup screen's Enter -- runs from run_loop, one
+/// frame after PendingDerive::Setup was set.
+pub(crate) fn perform_setup(app: &mut TuiApp) {
+    let db_path = crate::get_db_path();
+    match db::create_vault(&db_path, &app.password_input) {
+        Ok((conn, derived_key)) => {
+            app.conn = conn;
+            app.key = Some(derived_key);
+            app.screen = Screen::Dashboard;
+            app.password_input.zeroize();
+            app.password_confirm_input.zeroize();
+            app.password_input.clear();
+            app.password_confirm_input.clear();
+            app.error_message = String::new();
+            app.refresh_secrets();
+            app.trigger_postunlock_sync();
+        }
+        Err(err) => {
+            app.error_message = err;
+        }
+    }
 }
 
 /// Spawns the background HIBP-scan thread over exactly `records`, wiring up
@@ -556,7 +575,14 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(pass_box, chunks[1]);
 
-    if !app.error_message.is_empty() {
+    if app.pending_derive.is_some() {
+        // Rendered on the one frame before the blocking Argon2id derivation
+        // runs -- without it, the frozen terminal reads as a hang.
+        let busy = Paragraph::new("Deriving key (Argon2id), please wait...")
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(busy, chunks[2]);
+    } else if !app.error_message.is_empty() {
         let err = Paragraph::new(&*app.error_message)
             .style(Style::default().fg(Color::Red));
         f.render_widget(err, chunks[2]);
@@ -665,7 +691,12 @@ fn draw_setup_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         );
     f.render_widget(confirm_box, chunks[2]);
 
-    if !app.error_message.is_empty() {
+    if app.pending_derive.is_some() {
+        let busy = Paragraph::new("Deriving key (Argon2id) and creating the vault, please wait...")
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(busy, chunks[3]);
+    } else if !app.error_message.is_empty() {
         let err = Paragraph::new(&*app.error_message)
             .style(Style::default().fg(Color::Red));
         f.render_widget(err, chunks[3]);
@@ -787,8 +818,15 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
             Zeroizing::new("••••••••••••".to_string())
         };
 
+        // Notes hide behind the same [v] toggle as the password: they're
+        // the other field-layer-encrypted value, and recovery codes live
+        // there -- rendering them unmasked by default undid for notes the
+        // shoulder-surfing protection the password mask provides. Masked
+        // notes aren't even decrypted, so the plaintext never exists.
         let notes_str = if let Some(enc_notes) = &record.encrypted_notes {
-            if let Some(key) = &app.key {
+            if !app.reveal_password {
+                Zeroizing::new("•••••••• (press [v] to reveal)".to_string())
+            } else if let Some(key) = &app.key {
                 crate::crypto::decrypt(enc_notes, key)
                     .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))
                     .unwrap_or_else(|_| Zeroizing::new("<Error Decrypting>".to_string()))

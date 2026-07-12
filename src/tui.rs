@@ -84,6 +84,20 @@ pub enum StatusType {
     Cleared,
 }
 
+/// A blocking key-derivation action deferred by exactly one frame.
+/// Argon2id at 64 MiB is deliberately slow (up to a few seconds), and input
+/// handlers can't repaint mid-keypress -- running the derivation inline
+/// froze the UI with no explanation. Handlers now validate the cheap parts,
+/// set one of these, and let run_loop execute it immediately after the draw
+/// that shows the "Deriving key..." notice. No input can interleave: the
+/// action runs before the next event poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingDerive {
+    Unlock,
+    Setup,
+    ChangePassword,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 
 pub(crate) enum FormField {
@@ -245,6 +259,10 @@ pub struct TuiApp {
     // on next successful password entry (see `handle_lock_input`).
     pub(crate) needs_migration: bool,
 
+    /// See PendingDerive: the slow key-derivation step the next loop tick
+    /// should execute, set by the Lock/Setup/Change-Password handlers.
+    pub(crate) pending_derive: Option<PendingDerive>,
+
     // Handle to whatever background sync thread is currently in flight (from
     // `trigger_postunlock_sync`), if any. `run_tui`'s exit-time sync joins this
     // before running its own git_sync_vault call, so the two can never run
@@ -342,6 +360,7 @@ impl TuiApp {
             vault_modified_since_sync: false,
             sync_conflicts_detected: Arc::new(Mutex::new(None)),
             sync_result: Arc::new(Mutex::new(None)),
+            pending_derive: None,
             pending_sync_thread: Arc::new(Mutex::new(None)),
         };
         app.trigger_prelock_fetch();
@@ -1022,6 +1041,24 @@ fn run_loop<B: ratatui::backend::Backend>(
             }
         
         terminal.draw(|f| draw_ui(f, app))?;
+
+        // Execute a deferred key derivation right after the frame that
+        // shows its "Deriving key..." notice -- and before the event poll,
+        // so no input can interleave with the blocking work.
+        if let Some(action) = app.pending_derive.take() {
+            match action {
+                PendingDerive::Unlock => {
+                    perform_unlock(app);
+                }
+                PendingDerive::Setup => {
+                    perform_setup(app);
+                }
+                PendingDerive::ChangePassword => {
+                    perform_change_password(app);
+                }
+            }
+            continue;
+        }
 
         // Poll for inputs, checking clipboard expiration and idle timeout every 250ms
         if event::poll(Duration::from_millis(250))? {
