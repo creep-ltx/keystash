@@ -37,6 +37,12 @@ pub(crate) fn handle_lock_input(app: &mut TuiApp, code: KeyCode) -> bool {
                     app.screen = Screen::Dashboard;
                     app.password_input.zeroize();
                     app.password_input.clear();
+                    // Prune expired tombstones on unlock, not only during
+                    // git sync: an offline-only user (no git configured)
+                    // otherwise keeps deleted credentials' titles/usernames
+                    // in the vault forever -- the exact privacy issue
+                    // pruning exists to fix. Best-effort, like sync's call.
+                    let _ = db::prune_old_tombstones(&app.conn);
                     app.refresh_secrets();
                     app.trigger_postunlock_sync();
                 }

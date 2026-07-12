@@ -229,7 +229,13 @@ fn open_or_migrate_vault(db_path: &Path) -> Option<(rusqlite::Connection, zeroiz
         db::VaultState::Ready => {
             let master_pass = prompt_password("Enter Master Password: ");
             match db::open_vault(db_path, &master_pass) {
-                Ok(pair) => Some(pair),
+                Ok(pair) => {
+                    // Same unlock-time tombstone pruning as the TUI (see
+                    // handle_lock_input): git-less users need a prune site
+                    // too, and sync's own pre-push prune covers the rest.
+                    let _ = db::prune_old_tombstones(&pair.0);
+                    Some(pair)
+                }
                 Err(e) => {
                     eprintln!("Unlock failed: {}", e);
                     None

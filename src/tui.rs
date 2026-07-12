@@ -403,6 +403,30 @@ impl TuiApp {
         self.gen_password.zeroize();
         self.gen_password.clear();
 
+        // The rest of the vault-derived metadata: none of it renders on the
+        // Lock screen, but "locked" should mean the process no longer holds
+        // the vault's contents in memory at all -- the same principle that
+        // drops the keyed connection above. audit_report carries every
+        // title/category/username; the tag list, search query, marks, and
+        // pending conflict groups all leak record identities; the form
+        // caches hold HMAC fingerprints (unusable without the key, but
+        // there's no reason to keep them either).
+        self.audit_report = None;
+        self.categories = vec!["All".to_string()];
+        self.selected_category_idx = 0;
+        self.selected_secret_idx = 0;
+        self.search_query.clear();
+        self.searching = false;
+        self.marked_secrets.clear();
+        self.sync_conflicts.clear();
+        self.selected_conflict_idx = 0;
+        self.form_reuse_fingerprints.clear();
+        self.form_hibp_cache.clear();
+        self.confirmation_message.clear();
+        self.copied_message = None;
+        self.import_path_input.clear();
+        self.export_path_input.clear();
+
         // Clear active screen states and redirect to lock
         self.screen = Screen::Lock;
     }
