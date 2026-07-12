@@ -41,6 +41,32 @@ fn read_file_head(path: &Path) -> Option<[u8; crate::crypto::SALT_LEN]> {
         .map(|_| head)
 }
 
+/// Builds a `git` `Command` pre-loaded with the flags every invocation in
+/// this file needs: a low-speed abort so a stalled connection doesn't hang
+/// forever (`http.lowSpeedLimit`/`http.lowSpeedTime` -- the actual timeout
+/// knobs; `connection.timeout` isn't a real git config key and silently did
+/// nothing), no credential prompting (`GIT_TERMINAL_PROMPT=0` -- without it,
+/// a credential-prompting HTTPS remote tries to write a prompt wherever git
+/// thinks the controlling terminal is, which for a background sync thread
+/// means hanging forever or garbling a raw-mode TUI screen), a bounded SSH
+/// connect timeout, and a null stdin so nothing can block waiting for input
+/// that will never come. Safe to use for purely local commands (`reset`,
+/// `add`, `commit`, ...) too -- they just ignore the network-only flags.
+///
+/// Every invocation below assumes a single remote named `origin` with a
+/// `main` branch, matching the setup the README walks through; there's no
+/// support (yet) for a differently-named remote or default branch.
+pub(crate) fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-c").arg("http.lowSpeedLimit=1000")
+        .arg("-c").arg("http.lowSpeedTime=5")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=5 -o ConnectionAttempts=1")
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    cmd
+}
+
 /// Check if the database folder is configured as a git repository.
 pub fn is_git_configured<P: AsRef<Path>>(db_path: P) -> bool {
     if let Some(parent) = db_path.as_ref().parent() {
@@ -67,19 +93,10 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     }
 
     // 1. Run git fetch to see if remote changes exist
-    let fetch_status = Command::new("git")
-        .arg("-c")
-        .arg("connection.timeout=5")
-        .arg("-c")
-        .arg("http.lowSpeedLimit=1000")
-        .arg("-c")
-        .arg("http.lowSpeedTime=5")
+    let fetch_status = git_command(dir)
         .arg("fetch")
         .arg("origin")
         .arg("main")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=5 -o ConnectionAttempts=1")
-        .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -98,10 +115,9 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     let mut unmerged_remote_backup: Option<(std::path::PathBuf, bool)> = None;
 
     // Extract remote database to temp file using git show
-    let show_output = Command::new("git")
+    let show_output = git_command(dir)
         .arg("show")
         .arg("origin/main:vault.db")
-        .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -130,10 +146,9 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             // and is a no-op.
             let salt_path = db_ref.with_file_name("vault.salt");
             if !salt_path.exists() {
-                if let Ok(salt_output) = Command::new("git")
+                if let Ok(salt_output) = git_command(dir)
                     .arg("show")
                     .arg("origin/main:vault.salt")
-                    .current_dir(dir)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .output()
@@ -170,11 +185,13 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             // master password, so it uses the same derived SQLCipher key.
             let remote_path_str = remote_db_path.to_string_lossy();
             let escaped_path = remote_path_str.replace('\'', "''");
-            conn.execute(
-                &format!("ATTACH DATABASE '{}' AS remote_db KEY \"x'{}'\"", escaped_path, *pragma_hex),
-                [],
-            )
-            .map_err(|e| format!("Failed to attach remote database: {}", e))?;
+            // pragma_hex is already Zeroizing<String> -- build the SQL
+            // statement itself as one too instead of a plain format! temporary.
+            let attach_sql: Zeroizing<String> = Zeroizing::new(
+                format!("ATTACH DATABASE '{}' AS remote_db KEY \"x'{}'\"", escaped_path, *pragma_hex)
+            );
+            conn.execute(&attach_sql, [])
+                .map_err(|e| format!("Failed to attach remote database: {}", e))?;
 
             // General forward-compatibility gate: if the remote was last
             // pushed by a version whose format this binary predates, don't
@@ -420,12 +437,11 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                 // of truth would silently undo a completed security operation
                 // while reporting success. Refuse and say how to adopt the
                 // rotated vault instead.
-                let remote_is_ancestor = Command::new("git")
+                let remote_is_ancestor = git_command(dir)
                     .arg("merge-base")
                     .arg("--is-ancestor")
                     .arg("origin/main")
                     .arg("HEAD")
-                    .current_dir(dir)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
@@ -469,21 +485,22 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
 
         // Align local branch history with the remote before committing (preserves
         // the merged -- or, in the incompatible-remote case, purely local -- vault.db)
-        Command::new("git")
+        let reset_status = git_command(dir)
             .arg("reset")
             .arg("origin/main")
-            .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("git reset failed: {}", e))?;
+        if !reset_status.success() {
+            return Err("git reset failed to align local history with the remote before committing. Nothing was pushed; the repository may need manual inspection.".to_string());
+        }
     }
 
     // 3. Stage changes, commit, and push local updates to remote repository
-    let status_output = Command::new("git")
+    let status_output = git_command(dir)
         .arg("status")
         .arg("--porcelain")
-        .current_dir(dir)
         .output()
         .map_err(|e| format!("git status failed: {}", e))?;
 
@@ -491,14 +508,16 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
 
     if is_dirty {
         // Stage vault.db
-        Command::new("git")
+        let add_status = git_command(dir)
             .arg("add")
             .arg("vault.db")
-            .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("git add failed: {}", e))?;
+        if !add_status.success() {
+            return Err("git add failed to stage the merged vault. Nothing was committed or pushed.".to_string());
+        }
 
         // Drop the retired vault.salt sidecar from the repo if a pre-0.3.6
         // push left it tracked. The salt now travels embedded in vault.db's
@@ -506,44 +525,39 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         // device restoring this repo later would find it and derive its key
         // from an outdated salt instead of the header. --ignore-unmatch
         // makes this a no-op for repos that never tracked it.
-        Command::new("git")
+        let _ = git_command(dir)
             .arg("rm")
             .arg("--cached")
             .arg("--ignore-unmatch")
             .arg("-f")
             .arg("vault.salt")
-            .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("git rm failed: {}", e))?;
+            .status();
 
-        // Create commit
-        Command::new("git")
+        // Create commit. Checking success here matters: previously an
+        // unnoticed failure (e.g. missing git identity config) left nothing
+        // committed while the code fell straight through to push and
+        // reported "Sync complete: ... merged and updated!" -- a merge that
+        // never actually landed, with no error shown.
+        let commit_status = git_command(dir)
             .arg("commit")
             .arg("-m")
             .arg("sync: auto-merge vault updates")
-            .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("git commit failed: {}", e))?;
+        if !commit_status.success() {
+            return Err("git commit failed while finalizing the merge -- local changes are staged but not committed, and nothing was pushed. Check `git commit` manually in the vault directory (a missing user.name/user.email is a common cause) and re-run sync.".to_string());
+        }
     }
 
     // Run push to update remote repository state
-    let push_status = Command::new("git")
-        .arg("-c")
-        .arg("connection.timeout=5")
-        .arg("-c")
-        .arg("http.lowSpeedLimit=1000")
-        .arg("-c")
-        .arg("http.lowSpeedTime=5")
+    let push_status = git_command(dir)
         .arg("push")
         .arg("origin")
         .arg("main")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=5 -o ConnectionAttempts=1")
-        .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -590,12 +604,11 @@ pub fn detect_sync_conflicts(
     let base_db_path = dir.join(format!("vault_base_detect_{}_{}.db", std::process::id(), unique_tmp_suffix()));
     let _cleanup = TempCleanup(vec![remote_db_path.clone(), base_db_path.clone()]);
 
-    let show_remote = Command::new("git")
+    let show_remote = git_command(dir)
         .arg("show")
         .arg("origin/main:vault.db")
-        .current_dir(dir)
         .output();
-        
+
     let mut has_remote = false;
     if let Ok(output) = show_remote {
         if output.status.success() && !output.stdout.is_empty() {
@@ -609,21 +622,19 @@ pub fn detect_sync_conflicts(
         return Ok(Vec::new());
     }
 
-    let merge_base_output = Command::new("git")
+    let merge_base_output = git_command(dir)
         .arg("merge-base")
         .arg("HEAD")
         .arg("origin/main")
-        .current_dir(dir)
         .output();
 
     let mut has_base = false;
     if let Ok(output) = merge_base_output {
         if output.status.success() {
             let ancestor_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let show_base = Command::new("git")
+            let show_base = git_command(dir)
                 .arg("show")
                 .arg(format!("{}:vault.db", ancestor_hash))
-                .current_dir(dir)
                 .output();
 
             if let Ok(base_out) = show_base {

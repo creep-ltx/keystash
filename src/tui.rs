@@ -286,6 +286,22 @@ impl TuiApp {
         if let Some(mut k) = self.key.take() {
             k.zeroize();
         }
+
+        // The keyed SQLCipher connection must not survive locking: it holds
+        // the derived page key inside SQLite's own connection state, so
+        // wiping the master key above still leaves every whole-database-
+        // encrypted metadata field (titles, usernames, URLs, categories,
+        // and the raw HIBP hashes) readable through this handle for as
+        // long as the app sits on the Lock screen. Swap it for a fresh
+        // in-memory placeholder -- exactly what TuiApp::new starts with
+        // before the first unlock -- and let the old connection drop.
+        // Background threads that already cloned the master key before
+        // this call (an in-flight HIBP scan, a pending sync) keep working
+        // regardless; that's an accepted property of letting in-flight
+        // work finish, not an oversight.
+        self.conn = Connection::open_in_memory()
+            .expect("failed to open in-memory placeholder database");
+
         self.password_input.zeroize();
         self.password_input.clear();
         self.password_confirm_input.zeroize();
@@ -628,13 +644,16 @@ impl TuiApp {
             if !dir.join(".git").exists() {
                 return;
             }
-            let _ = Command::new("git")
-                .arg("-c")
-                .arg("connection.timeout=5")
+            // Uses the same flag set as every other git invocation in
+            // sync.rs (GIT_TERMINAL_PROMPT=0, low-speed timeouts, null
+            // stdin) -- this one used to be built by hand and drifted,
+            // missing exactly those flags, which let a credential-prompting
+            // HTTPS remote hang this background thread or write a prompt
+            // into the raw-mode TUI screen.
+            let _ = crate::sync::git_command(dir)
                 .arg("fetch")
                 .arg("origin")
                 .arg("main")
-                .current_dir(dir)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -1185,6 +1204,22 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.active_settings_field = 0;
             app.screen = Screen::SettingsScreen;
         }
+        KeyCode::Char('s') => {
+            // The help screen has advertised this key since before it was
+            // ever wired up. Reuses trigger_postconflict_sync's machinery
+            // (join the previous pending sync thread, then run the same
+            // full logical merge git_sync_vault does everywhere else) --
+            // there's nothing conflict-specific about it, it's just the
+            // existing "run a sync now" entry point.
+            if app.no_sync {
+                app.copied_message = Some(("Sync is disabled (--no-sync).".to_string(), Instant::now(), StatusType::Normal));
+            } else if !crate::sync::is_git_configured(crate::get_db_path()) {
+                app.copied_message = Some(("Sync not configured -- no git remote set up in ~/.config/keystash.".to_string(), Instant::now(), StatusType::Normal));
+            } else {
+                app.trigger_postconflict_sync();
+                app.copied_message = Some(("Syncing with git remote...".to_string(), Instant::now(), StatusType::Normal));
+            }
+        }
 
         KeyCode::Char('D') => {
             app.find_duplicate_groups();
@@ -1614,17 +1649,22 @@ fn handle_import_input(app: &mut TuiApp, code: KeyCode) {
 
             let import_result = match detected_format {
                 crate::import::ImportFormat::BitwardenJson => crate::import::import_bitwarden_json(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::BraveChromeCsv => crate::import::import_brave_chrome_csv(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::FirefoxCsv => crate::import::import_firefox_csv(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::LastPassCsv => crate::import::import_lastpass_csv(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::KeePassXcCsv => crate::import::import_keepassxc_csv(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::OnePasswordCsv => crate::import::import_onepassword_csv(&app.conn, file_path, key_ref),
-                crate::import::ImportFormat::KeyStashCsv => crate::import::import_keystash_csv(&app.conn, file_path, key_ref),
+                crate::import::ImportFormat::BraveChromeCsv => crate::import::import_brave_chrome_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
+                crate::import::ImportFormat::FirefoxCsv => crate::import::import_firefox_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
+                crate::import::ImportFormat::LastPassCsv => crate::import::import_lastpass_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
+                crate::import::ImportFormat::KeePassXcCsv => crate::import::import_keepassxc_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
+                crate::import::ImportFormat::OnePasswordCsv => crate::import::import_onepassword_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
+                crate::import::ImportFormat::KeyStashCsv => crate::import::import_keystash_csv(&app.conn, file_path, key_ref).map(|c| (c, 0)),
             };
 
             match import_result {
-                Ok(count) => {
-                    app.copied_message = Some((format!("Success: Imported {} items from {}!", count, detected_format.name()), Instant::now(), StatusType::Normal));
+                Ok((count, skipped)) => {
+                    let skip_note = if skipped > 0 {
+                        format!(" ({} non-login item(s) skipped)", skipped)
+                    } else {
+                        String::new()
+                    };
+                    app.copied_message = Some((format!("Success: Imported {} items from {}!{}", count, detected_format.name(), skip_note), Instant::now(), StatusType::Normal));
                     app.import_path_input.clear();
                     app.refresh_secrets();
                     app.trigger_postunlock_sync();
