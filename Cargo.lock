@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "keystash"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "arboard",
  "argon2",

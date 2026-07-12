@@ -154,9 +154,9 @@ DO NOT run "keystash init" on a secondary device. This will generate a different
   git pull origin main
 .fi
 .SH SECURITY CONSIDERATIONS
-.B Symmetric Encryption Split (Plaintext vs Encrypted Fields)
+.B Layered Encryption (Full Database + Sensitive Fields)
 .IP
-To support logical merging and search across multiple devices, only sensitive fields (password and notes) are encrypted. Database metadata—specifically title, category, username, url, and transaction timestamps—are stored in unencrypted plaintext inside the SQLite database file. Users should be aware that these plaintext metadata fields will be visible to anyone with read access to their private Git backup repository.
+The entire vault.db file is encrypted with SQLCipher: schema, indexes, and every column, including title, category, username, url, and timestamps. Nothing in the file is readable without the master password—including by anyone with read access to your private Git backup repository. As defense in depth, the password and notes fields are additionally encrypted with XChaCha20-Poly1305 under an independently derived key, so a compromise of the SQLCipher layer alone does not expose them. The Argon2id salt is embedded in the first 16 bytes of vault.db (it is not secret on its own); vaults created before v0.3.6 kept it in a vault.salt sidecar file and are converted automatically on first unlock.
 .PP
 .B Clipboard Security
 .IP

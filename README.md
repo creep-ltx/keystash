@@ -160,7 +160,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 
 1. **Full-Database Encryption (SQLCipher):** The entire `vault.db` file is encrypted via SQLCipher — schema, indexes, and every column, including `title`, `category`, `username`, and `url`. Without the correct master password, the file is an opaque blob, not a readable SQLite database; there is no plaintext metadata for anyone with read access to your Git backup repository (or the raw file) to see.
 2. **Independent Column-Level Layer:** As defense in depth on top of full-database encryption, `password` and `notes` are *additionally* encrypted individually with XChaCha20-Poly1305, using a key derived independently (via HKDF-SHA256, with domain separation) from the same Argon2id master key. A compromise of the SQLCipher layer alone does not, by itself, expose these fields.
-3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and stored in a small sidecar file (`vault.salt`) next to the vault, since nothing inside the encrypted database can be read until the key derived from that salt is already known.
+3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and embedded in the first 16 bytes of `vault.db` itself (the SQLCipher header's salt slot, which is deliberately plaintext) — nothing inside the encrypted database can be read until the key derived from that salt is already known, so the salt must live somewhere readable up front, and keeping it in the file makes the vault a single self-contained unit. Vaults created before v0.3.6 kept the salt in a `vault.salt` sidecar file; they are converted automatically on their first unlock.
 4. **XChaCha20-Poly1305 AEAD:** The column-level sensitive fields are encrypted individually before being stored. Every encryption generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
 5. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
 6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
@@ -184,10 +184,9 @@ To upload your existing vault database to GitHub for the first time:
 cd ~/.config/keystash
 git init
 
-# Track only the encrypted database and its salt file
+# Track only the encrypted database
 echo "*" > .gitignore
 echo "!vault.db" >> .gitignore
-echo "!vault.salt" >> .gitignore
 
 # Link your private remote (e.g. GitHub)
 git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
@@ -199,7 +198,7 @@ git commit -m "Initial vault backup"
 git push -u origin main
 ```
 > [!NOTE]
-> `vault.salt` isn't secret on its own (it only becomes meaningful combined with your master password), but it's required to derive your encryption key, so it needs to sync alongside `vault.db`. KeyStash force-adds it during automatic sync even if your `.gitignore` doesn't explicitly allow it, but tracking it explicitly here keeps `git status` clean.
+> The Argon2 salt travels embedded inside `vault.db` itself (its first 16 bytes — not secret on its own, it only becomes meaningful combined with your master password), so the one database file is all that needs to sync. Repos created before v0.3.6 also track a `vault.salt` sidecar; KeyStash removes it from the repo automatically on the first sync after all your devices have converted.
 
 #### **Device B (Adding a New/Secondary Device)**
 > [!WARNING]
@@ -216,14 +215,23 @@ cd ~/.config/keystash
 git init
 echo "*" > .gitignore
 echo "!vault.db" >> .gitignore
-echo "!vault.salt" >> .gitignore
 git remote add origin git@github.com:YOUR_USERNAME/my-keystash-vault.git
 git branch -M main
 
-# Pull down the existing database and salt file
+# Pull down the existing database
 git pull origin main
 ```
 You can now run `keystash` on Device B, enter your existing Master Password, and sync. Both machines will sync and decrypt seamlessly!
+
+#### **Rotating your master password with multiple devices**
+Changing the master password re-encrypts the whole vault under a fresh salt, so for a short window the remote and your other devices disagree about which password is current. To keep that window painless:
+
+1. **Update KeyStash on every device first** (v0.3.6+). Older versions cannot detect a rotation and could silently push a stale vault over it.
+2. Sync every device (open and quit KeyStash, or run `keystash sync`), so no device is holding unpushed changes.
+3. Rotate on one device (`keystash change-password` or `[m]` in the TUI). It pushes the rotated vault to the remote automatically.
+4. On each other device, run `keystash sync`. It will detect the rotation and refuse to push, printing the exact recovery steps: export any local changes, delete the local `vault.db`, sync again to restore the rotated vault, and unlock with the new password.
+
+If a stale device ever syncs before you get to it, nothing is lost: the rotated remote is left untouched and that device keeps working locally until you walk it through step 4.
 
 ### 2. How it operates
 * **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to fetch (but not yet merge) remote changes concurrent with displaying the Master Password lock screen. The database itself is encrypted, so the actual logical merge needs the key and runs immediately after you unlock, before the dashboard appears.

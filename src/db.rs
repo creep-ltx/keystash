@@ -19,9 +19,16 @@ use zeroize::Zeroizing;
 //  outright was the move to whole-database SQLCipher encryption -- a
 //  pre-0.3.0 binary can't read a 0.3.0+ vault at all, not even its metadata,
 //  since the entire file is opaque ciphertext to it from byte one.
+//
+//  0.3.6 moved the Argon2 salt from the `vault.salt` sidecar file into the
+//  SQLCipher header (the first 16 bytes of vault.db) and stopped syncing the
+//  sidecar. A pre-0.3.6 binary can only derive the key from the sidecar; when
+//  a vault has been converted, that file no longer exists, so old code
+//  misdiagnoses the vault as a legacy pre-encryption file and fails to open
+//  it -- genuinely unreadable, hence the floor bump.
 // ─────────────────────────────────────────────
 
-pub const MIN_COMPATIBLE_APP_VERSION: &str = "0.3.0";
+pub const MIN_COMPATIBLE_APP_VERSION: &str = "0.3.6";
 
 /// Parses a plain `MAJOR.MINOR.PATCH` version string (KeyStash doesn't use
 /// pre-release/build suffixes) into a comparable tuple. `None` on anything
@@ -94,13 +101,25 @@ pub fn new_uuid() -> String {
 }
 
 // ─────────────────────────────────────────────
-//  Vault salt sidecar file
+//  Vault salt storage
 //
 //  Once vault.db is a SQLCipher-encrypted file, nothing in it -- including a
 //  stored salt -- can be read before the key is already known. So the Argon2id
-//  salt used to derive that key has to live outside the encrypted file. A salt
-//  isn't secret, it only needs to not move, so this file needs no stronger
-//  protection than restrictive permissions (matching vault.db's own 0600).
+//  salt used to derive that key has to live somewhere readable up front. A
+//  SQLCipher file conveniently already has such a slot: its first 16 bytes
+//  are the (deliberately plaintext) salt SQLCipher itself stores in the file
+//  header. Since KeyStash supplies SQLCipher a raw key (`PRAGMA key =
+//  "x'...'"`), that header salt is not used for page-key derivation, only
+//  HMAC-key derivation -- so it's free to double as the Argon2id salt,
+//  stamped in at creation via `PRAGMA cipher_salt`. That makes vault.db fully
+//  self-contained: one file to sync, and the first 16 bytes of any copy of it
+//  identify which salt (and therefore which master-password generation) that
+//  copy was encrypted under -- which is what sync.rs's rotation check reads.
+//
+//  Vaults created before 0.3.6 kept the salt in a `vault.salt` sidecar file
+//  instead (with a random, unrelated SQLCipher header salt). `open_vault`
+//  converts those once on unlock; the sidecar paths below survive only for
+//  that migration and for restoring not-yet-converted repos.
 // ─────────────────────────────────────────────
 
 /// Path of the temp file `migrate_legacy_vault` builds the new SQLCipher-encrypted
@@ -152,16 +171,43 @@ fn read_salt_sidecar(db_path: &Path) -> Result<[u8; SALT_LEN], String> {
     Ok(salt)
 }
 
-fn write_salt_sidecar(db_path: &Path, salt: &[u8; SALT_LEN]) -> Result<(), String> {
-    let path = salt_sidecar_path(db_path);
-    std::fs::write(&path, salt).map_err(|e| format!("Could not write vault salt file: {}", e))?;
+/// The 16-byte magic header of a plain (unencrypted) SQLite file. Exactly
+/// SALT_LEN bytes, which is what makes the first-16-bytes read below able to
+/// distinguish a legacy plaintext vault from an SQLCipher one. `pub(crate)`
+/// because sync.rs makes the same distinction on fetched remote copies.
+pub(crate) const SQLITE_PLAINTEXT_MAGIC: &[u8; SALT_LEN] = b"SQLite format 3\0";
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+/// Reads the first 16 bytes of the vault file -- the SQLCipher header salt,
+/// which for vaults on the 0.3.6+ format is also the Argon2id salt.
+fn read_embedded_salt(db_path: &Path) -> Result<[u8; SALT_LEN], String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(db_path)
+        .map_err(|e| format!("Could not read vault file: {}", e))?;
+    let mut salt = [0u8; SALT_LEN];
+    file.read_exact(&mut salt)
+        .map_err(|e| format!("Vault file is too short to contain a salt header: {}", e))?;
+    if &salt == SQLITE_PLAINTEXT_MAGIC {
+        return Err("This vault predates full-database encryption and must be migrated first.".to_string());
     }
+    Ok(salt)
+}
 
+/// Confirms a freshly built vault file actually carries `expected` as its
+/// header salt. `PRAGMA cipher_salt` is how the salt gets stamped in, and an
+/// unknown pragma is silently ignored by SQLite rather than erroring -- if
+/// the bundled SQLCipher ever lost support for it, every new vault would be
+/// created with a random header salt and become unopenable on the next
+/// unlock. This check turns that silent failure mode into a loud one before
+/// any file is swapped into place.
+fn verify_embedded_salt(path: &Path, expected: &[u8; SALT_LEN]) -> Result<(), String> {
+    let actual = read_embedded_salt(path)?;
+    if &actual != expected {
+        return Err(
+            "The vault file was not created with the expected salt header (PRAGMA cipher_salt \
+             appears to be unsupported by this SQLCipher build)."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -171,37 +217,64 @@ fn write_salt_sidecar(db_path: &Path, salt: &[u8; SALT_LEN]) -> Result<(), Strin
 /// the key this is used to decide whether to even ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultState {
-    /// No vault.db and no salt sidecar -- brand new install.
+    /// No vault.db and no leftover migration/rotation files -- brand new install.
     New,
-    /// vault.db exists but predates SQLCipher (no salt sidecar) -- needs migration.
+    /// vault.db exists but starts with the plain-SQLite magic header: it
+    /// predates full-database encryption and needs migration.
     NeedsMigration,
-    /// Salt sidecar exists -- normal SQLCipher-encrypted vault, ready to unlock.
+    /// vault.db exists and is SQLCipher-encrypted -- ready to unlock. (Whether
+    /// its Argon2 salt is embedded in the header or still in a `vault.salt`
+    /// sidecar is `open_vault`'s concern, not a separate state.)
     Ready,
     /// A previous `migrate_legacy_vault` run was interrupted (crash, power loss,
-    /// OOM kill) between backing up the old file and finishing the swap -- so
-    /// neither `vault.db` nor `vault.salt` may exist right now even though the
-    /// vault isn't actually new. Detected by the leftover `vault.db.migrating`
-    /// temp file and/or `vault.db.pre-sqlcipher-backup`, either of which means
-    /// there's real data recoverable on disk. Must be checked and handled
-    /// before the `NeedsMigration`/`New` fallthrough, or the app would invite
-    /// the user to `init` a fresh empty vault right over their recoverable data.
+    /// OOM kill) with the vault left in a not-completed shape: either vault.db
+    /// is missing entirely (crash between the two swap renames), or it's still
+    /// the plaintext legacy file with a `vault.db.migrating` temp and/or
+    /// `vault.db.pre-sqlcipher-backup` alongside. Either way there's real data
+    /// recoverable on disk, so this must be surfaced before the
+    /// `NeedsMigration`/`New` fallthrough -- otherwise the app would invite the
+    /// user to `init` a fresh empty vault right over their recoverable data.
     InterruptedMigration,
     /// A previous `change_master_password` run was interrupted between backing
-    /// up the pre-rotation file and finishing the swap. Same shape and same
-    /// recovery as `InterruptedMigration`, detected via the leftover
-    /// `vault.db.rekeying` temp file and/or `vault.db.pre-rekey-backup`.
+    /// up the pre-rotation file and swapping the new one in, leaving no
+    /// vault.db at all -- detected via the leftover `vault.db.rekeying` temp
+    /// file and/or `vault.db.pre-rekey-backup`. Same recovery shape as
+    /// `InterruptedMigration`. A crash *after* the swap is not this state
+    /// anymore: with the salt embedded in the new file itself, the swapped-in
+    /// vault is already complete and simply reports `Ready` (the stale backup
+    /// gets overwritten by the next rotation).
     InterruptedRotation,
 }
 
 pub fn detect_vault_state(db_path: &Path) -> VaultState {
-    if salt_sidecar_path(db_path).exists() {
-        VaultState::Ready
+    if db_path.exists() {
+        // The first 16 bytes distinguish the two on-disk formats: a legacy
+        // plaintext vault starts with SQLite's magic header, an
+        // SQLCipher-encrypted one with its (public, random-looking) salt. An
+        // unreadable or too-short file is treated as encrypted so the unlock
+        // path surfaces the real I/O or corruption error, rather than
+        // misrouting the user into a legacy migration.
+        let is_plaintext = {
+            use std::io::Read;
+            let mut head = [0u8; SALT_LEN];
+            std::fs::File::open(db_path)
+                .and_then(|mut f| f.read_exact(&mut head))
+                .is_ok()
+                && &head == SQLITE_PLAINTEXT_MAGIC
+        };
+        if is_plaintext {
+            if migrating_tmp_path(db_path).exists() || pre_sqlcipher_backup_path(db_path).exists() {
+                VaultState::InterruptedMigration
+            } else {
+                VaultState::NeedsMigration
+            }
+        } else {
+            VaultState::Ready
+        }
     } else if migrating_tmp_path(db_path).exists() || pre_sqlcipher_backup_path(db_path).exists() {
         VaultState::InterruptedMigration
     } else if rekeying_tmp_path(db_path).exists() || pre_rekey_backup_path(db_path).exists() {
         VaultState::InterruptedRotation
-    } else if db_path.exists() {
-        VaultState::NeedsMigration
     } else {
         VaultState::New
     }
@@ -261,6 +334,28 @@ pub(crate) fn open_keyed_connection<P: AsRef<Path>>(
     path: P,
     sqlcipher_key: &[u8; KEY_LEN],
 ) -> Result<Connection, String> {
+    open_keyed_connection_impl(path, sqlcipher_key, None)
+}
+
+/// `open_keyed_connection` for *brand new* vault files: additionally stamps
+/// `salt` into the SQLCipher header via `PRAGMA cipher_salt`, making the
+/// file's first 16 bytes the Argon2id salt (see the "Vault salt storage"
+/// comment above). Only meaningful at creation -- an existing file's header
+/// salt is fixed, so every caller pairs this with a fresh temp path. Callers
+/// must `verify_embedded_salt` the finished file before trusting it.
+fn open_keyed_connection_with_salt<P: AsRef<Path>>(
+    path: P,
+    sqlcipher_key: &[u8; KEY_LEN],
+    salt: &[u8; SALT_LEN],
+) -> Result<Connection, String> {
+    open_keyed_connection_impl(path, sqlcipher_key, Some(salt))
+}
+
+fn open_keyed_connection_impl<P: AsRef<Path>>(
+    path: P,
+    sqlcipher_key: &[u8; KEY_LEN],
+    creation_salt: Option<&[u8; SALT_LEN]>,
+) -> Result<Connection, String> {
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
 
     #[cfg(unix)]
@@ -272,6 +367,14 @@ pub(crate) fn open_keyed_connection<P: AsRef<Path>>(
     let pragma_hex = crypto::pragma_key_hex(sqlcipher_key);
     conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", *pragma_hex))
         .map_err(|e| e.to_string())?;
+
+    if let Some(salt) = creation_salt {
+        // Must run after PRAGMA key (it configures the same codec context)
+        // and before the first write materializes the file header.
+        let salt_hex: String = salt.iter().map(|b| format!("{:02x}", b)).collect();
+        conn.execute_batch(&format!("PRAGMA cipher_salt = \"x'{}'\";", salt_hex))
+            .map_err(|e| e.to_string())?;
+    }
 
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
         .map_err(|_| "Incorrect master password, or the vault file is corrupted.".to_string())?;
@@ -483,38 +586,40 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // Stamp the current compatibility floor if it's not already recorded.
-    // Only ever written here if missing -- never overwritten -- so a vault
-    // that already recorded a *higher* floor (written by a newer version)
-    // keeps requiring that higher version; this call only runs after
-    // `open_vault`'s own pre-check already confirmed the running binary
-    // satisfies whatever floor is currently on file.
-    let has_min_version: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM metadata WHERE key = 'min_app_version'",
-            [],
-            |row| {
-                let count: i64 = row.get(0)?;
-                Ok(count > 0)
-            },
-        )
-        .unwrap_or(false);
-    if !has_min_version {
-        let _ = conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('min_app_version', ?1)",
-            params![MIN_COMPATIBLE_APP_VERSION],
-        );
+    // Stamp the current compatibility floor, raising a lower one if present.
+    // Raising is correct (and necessary) because opening a vault with this
+    // binary converts it to this binary's format on the spot -- e.g. 0.3.6
+    // embeds the salt and stops syncing the sidecar, after which a pre-0.3.6
+    // device could no longer derive the key and must be refused with a clear
+    // message rather than left to misread the repo. A *higher* recorded
+    // floor (written by a newer version) is never lowered; this call only
+    // runs after `open_vault`'s own pre-check already confirmed the running
+    // binary satisfies whatever floor is currently on file.
+    match read_min_app_version(conn) {
+        None => {
+            let _ = conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('min_app_version', ?1)",
+                params![MIN_COMPATIBLE_APP_VERSION],
+            );
+        }
+        Some(stored) if !version_satisfies(&stored, MIN_COMPATIBLE_APP_VERSION) => {
+            let _ = conn.execute(
+                "UPDATE metadata SET value = ?1 WHERE key = 'min_app_version'",
+                params![MIN_COMPATIBLE_APP_VERSION],
+            );
+        }
+        Some(_) => {}
     }
 
     Ok(())
 }
 
-/// Creates a brand new vault at `db_path`: generates a fresh salt (written to the
-/// sidecar file only after everything else below succeeds, so a failure never
-/// leaves an orphaned salt file with no matching vault), derives the master key
-/// and the independent SQLCipher key from `master_password`, creates the
-/// SQLCipher-encrypted database and schema, and stores an encrypted verification
-/// token. Returns the open connection and the master key.
+/// Creates a brand new vault at `db_path`: generates a fresh salt (embedded
+/// into the SQLCipher file header, so the vault is a single self-contained
+/// file), derives the master key and the independent SQLCipher key from
+/// `master_password`, creates the SQLCipher-encrypted database and schema,
+/// and stores an encrypted verification token. Returns the open connection
+/// and the master key.
 pub fn create_vault(
     db_path: &Path,
     master_password: &str,
@@ -527,7 +632,7 @@ pub fn create_vault(
     let master_key = crypto::derive_key(master_password, &salt)?;
     let sqlcipher_key = crypto::derive_sqlcipher_key(&master_key);
 
-    let conn = open_keyed_connection(db_path, &sqlcipher_key)?;
+    let conn = open_keyed_connection_with_salt(db_path, &sqlcipher_key, &salt)?;
     ensure_schema(&conn)?;
 
     let encrypted_token = crypto::encrypt(b"keystash-verification-token", &master_key)?;
@@ -537,21 +642,58 @@ pub fn create_vault(
     )
     .map_err(|e| e.to_string())?;
 
-    write_salt_sidecar(db_path, &salt)?;
+    // In WAL mode everything written so far -- including the header page
+    // carrying the salt -- may still be sitting in vault.db-wal. Checkpoint
+    // so the main file is complete, then confirm the salt actually landed
+    // (see verify_embedded_salt for why this can't be assumed).
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = verify_embedded_salt(db_path, &salt) {
+        // A half-created vault with a wrong header salt must not be left
+        // behind: it would detect as Ready and then never unlock.
+        drop(conn);
+        for p in [
+            db_path.to_path_buf(),
+            db_path.with_file_name("vault.db-wal"),
+            db_path.with_file_name("vault.db-shm"),
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(e);
+    }
 
     Ok((conn, master_key))
 }
 
-/// Opens an existing (already-migrated) vault at `db_path`, deriving the key from
-/// `master_password` and the salt sidecar file. `open_keyed_connection`'s
-/// `sqlite_master` probe is the primary "is this the right password" check
-/// (SQLCipher itself rejects a wrong key); the encrypted verification token is
-/// kept as a secondary check purely for a consistent, friendly error message.
+/// Opens an existing (already-migrated) vault at `db_path`, deriving the key
+/// from `master_password` and the salt embedded in the file header.
+/// `open_keyed_connection`'s `sqlite_master` probe is the primary "is this
+/// the right password" check (SQLCipher itself rejects a wrong key); the
+/// encrypted verification token is kept as a secondary check purely for a
+/// consistent, friendly error message.
+///
+/// A vault still on the pre-0.3.6 layout (salt in a `vault.salt` sidecar,
+/// random header salt) is converted once, here, on its first successful
+/// unlock -- see `embed_sidecar_salt`.
 pub fn open_vault(
     db_path: &Path,
     master_password: &str,
 ) -> Result<(Connection, Zeroizing<[u8; KEY_LEN]>), String> {
-    let salt = read_salt_sidecar(db_path)?;
+    if salt_sidecar_path(db_path).exists() {
+        return embed_sidecar_salt(db_path, master_password);
+    }
+    open_vault_embedded(db_path, master_password)
+}
+
+/// The normal unlock path for vaults whose salt lives in the file header.
+/// Kept separate from `open_vault` so `embed_sidecar_salt` can verify its
+/// freshly converted file *before* deleting the sidecar -- calling
+/// `open_vault` at that point would route straight back into the migration.
+fn open_vault_embedded(
+    db_path: &Path,
+    master_password: &str,
+) -> Result<(Connection, Zeroizing<[u8; KEY_LEN]>), String> {
+    let salt = read_embedded_salt(db_path)?;
     let master_key = crypto::derive_key(master_password, &salt)?;
     let sqlcipher_key = crypto::derive_sqlcipher_key(&master_key);
 
@@ -585,6 +727,151 @@ pub fn open_vault(
     match crypto::decrypt(&encrypted_token, &master_key) {
         Ok(decrypted) if *decrypted == *b"keystash-verification-token" => Ok((conn, master_key)),
         _ => Err("Incorrect master password.".to_string()),
+    }
+}
+
+/// One-time conversion of a pre-0.3.6 vault (salt in the `vault.salt`
+/// sidecar, random SQLCipher header salt) to the self-contained layout: the
+/// vault is rebuilt at a temp path with the *same* salt -- so the same master
+/// key, meaning every ciphertext copies over verbatim, no re-encryption --
+/// but this time stamped into the header via `PRAGMA cipher_salt`, then
+/// atomically swapped into place. Only after the new file is verified to
+/// open are the sidecar and the backup deleted; a failure at any earlier
+/// point leaves the original file and sidecar untouched.
+///
+/// Reuses `change_master_password`'s temp/backup paths: an interruption
+/// mid-swap is detected as `VaultState::InterruptedRotation`, whose recovery
+/// (restore the backup, retry) applies here identically -- the sidecar is
+/// still on disk in that state, so the restored backup unlocks as before.
+fn embed_sidecar_salt(
+    db_path: &Path,
+    master_password: &str,
+) -> Result<(Connection, Zeroizing<[u8; KEY_LEN]>), String> {
+    // 1. Unlock exactly like the old sidecar-era open_vault did.
+    let salt = read_salt_sidecar(db_path)?;
+    let master_key = crypto::derive_key(master_password, &salt)?;
+    let sqlcipher_key = crypto::derive_sqlcipher_key(&master_key);
+
+    let conn = open_keyed_connection(db_path, &sqlcipher_key)
+        .map_err(|_| "Incorrect master password.".to_string())?;
+
+    if let Some(required) = read_min_app_version(&conn)
+        && !version_satisfies(env!("CARGO_PKG_VERSION"), &required)
+    {
+        return Err(format!(
+            "This vault requires KeyStash v{} or newer to open. You are running v{}. Please update KeyStash and try again.",
+            required,
+            env!("CARGO_PKG_VERSION"),
+        ));
+    }
+
+    ensure_schema(&conn)?;
+
+    let encrypted_token: Vec<u8> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'verification'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| "Verification token not found. Database might be corrupted.".to_string())?;
+    match crypto::decrypt(&encrypted_token, &master_key) {
+        Ok(decrypted) if *decrypted == *b"keystash-verification-token" => {}
+        _ => return Err("Incorrect master password.".to_string()),
+    }
+
+    // 2. Read everything that carries over. All of it copies verbatim: the
+    //    salt (and therefore the master key) is unchanged, only where the
+    //    salt is stored changes.
+    let secrets = get_secrets(&conn)?;
+    let tombstones: Vec<(String, String, String, Option<String>, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT title, category, username, sync_uuid, deleted_at FROM deleted_secrets")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+    };
+    let hibp_checks = get_all_hibp_checks(&conn)?;
+
+    // 3. Build the replacement at a temp path with the salt in its header.
+    let tmp_path = rekeying_tmp_path(db_path);
+    let _ = std::fs::remove_file(&tmp_path);
+    let new_conn = open_keyed_connection_with_salt(&tmp_path, &sqlcipher_key, &salt)?;
+    ensure_schema(&new_conn)?;
+
+    new_conn
+        .execute(
+            "INSERT INTO metadata (key, value) VALUES ('verification', ?1)",
+            params![encrypted_token],
+        )
+        .map_err(|e| e.to_string())?;
+    for r in &secrets {
+        // updated_at and sync_uuid are preserved exactly -- this rebuild is
+        // invisible to the sync merge logic, which must not see every record
+        // as freshly edited.
+        new_conn
+            .execute(
+                "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![r.title, r.category, r.username, r.url, r.encrypted_password, r.encrypted_notes, r.updated_at, r.sync_uuid],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (title, category, username, sync_uuid, deleted_at) in &tombstones {
+        new_conn
+            .execute(
+                "INSERT OR REPLACE INTO deleted_secrets (title, category, username, sync_uuid, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![title, category, username, sync_uuid, deleted_at],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (hash, count) in &hibp_checks {
+        new_conn
+            .execute(
+                "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
+                params![hash, count.map(|c| c as i64)],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // Same WAL discipline as change_master_password: force everything into
+    // the main file, since only tmp_path itself gets renamed below.
+    new_conn
+        .execute_batch("PRAGMA journal_mode=DELETE;")
+        .map_err(|e| e.to_string())?;
+    new_conn.close().map_err(|(_, e)| e.to_string())?;
+
+    // The header salt must actually be ours before we swap anything -- see
+    // verify_embedded_salt. Failing here leaves the live vault untouched.
+    if let Err(e) = verify_embedded_salt(&tmp_path, &salt) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // 4. Empty our own WAL sidecars in place before the rename, for the same
+    //    stale-WAL-mistaken-for-the-new-file's reason documented in
+    //    change_master_password.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| format!("Failed to checkpoint vault before salt conversion: {}", e))?;
+    drop(conn);
+
+    // 5. Swap, verify the new file opens on its own (deliberately *not*
+    //    open_vault -- the sidecar still exists and must be ignored), and
+    //    only then delete the sidecar and the backup.
+    let backup_path = pre_rekey_backup_path(db_path);
+    std::fs::rename(db_path, &backup_path).map_err(|e| format!("Failed to back up vault before salt conversion: {}", e))?;
+    std::fs::rename(&tmp_path, db_path).map_err(|e| format!("Failed to move converted vault into place: {}", e))?;
+
+    match open_vault_embedded(db_path, master_password) {
+        Ok(pair) => {
+            let _ = std::fs::remove_file(salt_sidecar_path(db_path));
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(pair)
+        }
+        Err(e) => Err(format!(
+            "Salt conversion produced a vault that failed to reopen ({}). The pre-conversion backup was kept at {:?} and the salt file was left in place.",
+            e, backup_path
+        )),
     }
 }
 
@@ -666,7 +953,7 @@ pub fn migrate_legacy_vault(
 
     let tmp_path = migrating_tmp_path(db_path);
     let _ = std::fs::remove_file(&tmp_path);
-    let new_conn = open_keyed_connection(&tmp_path, &new_sqlcipher_key)?;
+    let new_conn = open_keyed_connection_with_salt(&tmp_path, &new_sqlcipher_key, &new_salt)?;
     ensure_schema(&new_conn)?;
 
     let new_encrypted_token = crypto::encrypt(b"keystash-verification-token", &new_master_key)?;
@@ -713,15 +1000,27 @@ pub fn migrate_legacy_vault(
             )
             .map_err(|e| e.to_string())?;
     }
+    // Force everything into the main file before it gets renamed -- only
+    // tmp_path itself moves, never a -wal sidecar -- and confirm the salt
+    // actually landed in the header before touching the live file.
+    new_conn
+        .execute_batch("PRAGMA journal_mode=DELETE;")
+        .map_err(|e| e.to_string())?;
     new_conn.close().map_err(|(_, e)| e.to_string())?;
+    if let Err(e) = verify_embedded_salt(&tmp_path, &new_salt) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
 
-    // 4. Back up the old file, then move the new one into place, then persist the
-    //    new salt. Order matters: the salt sidecar is only written once the
-    //    migrated file is already sitting at db_path.
+    // 4. Back up the old file, then move the new one into place. The salt
+    //    travels inside the new file's header, so the swap is the whole
+    //    hand-over -- there is no separate salt file to persist (a stray
+    //    sidecar from some earlier layout would misroute the reopen below,
+    //    so make sure none survives).
     let backup_path = pre_sqlcipher_backup_path(db_path);
     std::fs::rename(db_path, &backup_path).map_err(|e| format!("Failed to back up legacy vault: {}", e))?;
     std::fs::rename(&tmp_path, db_path).map_err(|e| format!("Failed to move migrated vault into place: {}", e))?;
-    write_salt_sidecar(db_path, &new_salt)?;
+    let _ = std::fs::remove_file(salt_sidecar_path(db_path));
 
     // 5. Re-open the now-migrated vault through the normal path, so callers get a
     //    connection exactly like any other successful unlock.
@@ -1012,7 +1311,7 @@ pub fn change_master_password(
     //    touched by anything above or below this point until step 5's renames.
     let tmp_path = rekeying_tmp_path(db_path);
     let _ = std::fs::remove_file(&tmp_path);
-    let new_conn = open_keyed_connection(&tmp_path, &new_sqlcipher_key)?;
+    let new_conn = open_keyed_connection_with_salt(&tmp_path, &new_sqlcipher_key, &new_salt)?;
     ensure_schema(&new_conn)?;
 
     new_conn
@@ -1059,6 +1358,15 @@ pub fn change_master_password(
         .map_err(|e| e.to_string())?;
     new_conn.close().map_err(|(_, e)| e.to_string())?;
 
+    // The fresh salt must actually be in the new file's header before the
+    // live file is touched -- the next unlock derives the key from those 16
+    // bytes, so a silently ignored PRAGMA cipher_salt (see
+    // verify_embedded_salt) would brick the rotated vault.
+    if let Err(e) = verify_embedded_salt(&tmp_path, &new_salt) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
     // The caller's own `conn` is still open in WAL mode against db_path, and
     // renaming db_path away (below) only moves the main file -- its
     // `-wal`/`-shm` sidecars stay behind under db_path's original name. Left
@@ -1075,16 +1383,25 @@ pub fn change_master_password(
     // 5. Swap: back up the current file (deleted below once the new one is
     //    confirmed working, unlike the permanent migration backup -- password
     //    rotation is routine, not a one-time format change worth keeping
-    //    insurance for indefinitely), move the new file into place, then
-    //    persist the new salt last.
+    //    insurance for indefinitely), then move the new file into place. The
+    //    fresh salt travels inside the new file's header, so the swap is
+    //    atomic and complete in itself -- the old "re-keyed file on disk but
+    //    its salt only in this process's memory" bricking window no longer
+    //    has a shape it could take.
     let backup_path = pre_rekey_backup_path(db_path);
     std::fs::rename(db_path, &backup_path).map_err(|e| format!("Failed to back up vault before key rotation: {}", e))?;
     std::fs::rename(&tmp_path, db_path).map_err(|e| format!("Failed to move re-keyed vault into place: {}", e))?;
-    write_salt_sidecar(db_path, &new_salt)?;
 
-    // 6. Confirm the new vault actually opens before discarding the backup.
-    match open_vault(db_path, new_password) {
+    // 6. Confirm the new vault actually opens before discarding the backup
+    //    (via the embedded path directly: rotation only ever runs on an
+    //    already-unlocked vault, so no sidecar should exist -- but if a stale
+    //    one somehow did, routing through it here would wrongly re-derive
+    //    from the pre-rotation salt and report a false failure). A stray
+    //    sidecar is deleted only after success: it still holds the old salt,
+    //    which a restored backup would need.
+    match open_vault_embedded(db_path, new_password) {
         Ok(_) => {
+            let _ = std::fs::remove_file(salt_sidecar_path(db_path));
             let _ = std::fs::remove_file(&backup_path);
             Ok(new_key)
         }
@@ -1188,6 +1505,7 @@ mod sqlcipher_tests {
 
         let (conn, old_key) = create_vault(&db_path, "old-password-123").unwrap();
         add_secret(&conn, "Site", "Cat", "user", "", "hunter2", None, &old_key).unwrap();
+        let header_before: Vec<u8> = std::fs::read(&db_path).unwrap()[..16].to_vec();
 
         let new_key = change_master_password(&conn, &db_path, &old_key, "new-password-456").unwrap();
         // change_master_password swaps in a physically different file at
@@ -1209,6 +1527,13 @@ mod sqlcipher_tests {
         // The pre-rotation backup is cleaned up once the new vault is
         // confirmed to open successfully.
         assert!(!db_path.with_file_name("vault.db.pre-rekey-backup").exists());
+
+        // Rotation embeds a *fresh* salt -- that's the point of it -- and
+        // leaves no sidecar behind.
+        let rotated_header = std::fs::read(&db_path).unwrap();
+        assert_ne!(&rotated_header[..16], header_before.as_slice(), "rotation must change the header salt");
+        assert_ne!(&rotated_header[..16], SQLITE_PLAINTEXT_MAGIC.as_slice());
+        assert!(!db_path.with_file_name("vault.salt").exists());
 
         cleanup(&db_path);
     }
@@ -1263,10 +1588,116 @@ mod sqlcipher_tests {
         let header = std::fs::read(&db_path).unwrap();
         assert_ne!(&header[..15.min(header.len())], b"SQLite format 3".as_slice());
 
+        // The salt is embedded in that header -- no sidecar gets written.
+        assert!(
+            !db_path.with_file_name("vault.salt").exists(),
+            "migration must not create a vault.salt sidecar"
+        );
+
         // And the same password re-opens it through the normal path afterwards.
         assert!(open_vault(&db_path, "legacy-master-pw").is_ok());
 
         let _ = std::fs::remove_file(db_path.with_file_name("vault.db.pre-sqlcipher-backup"));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn new_vaults_are_self_contained_with_the_salt_in_the_header() {
+        let db_path = temp_db_path("embedded-salt");
+        let (conn, _key) = create_vault(&db_path, "some-password").unwrap();
+        drop(conn);
+
+        // No sidecar: the salt lives in the file itself.
+        assert!(
+            !db_path.with_file_name("vault.salt").exists(),
+            "a new vault must not create a vault.salt sidecar"
+        );
+
+        // The header is a salt, not the plaintext-SQLite magic, and the vault
+        // opens from the file alone -- proving the key really derives from
+        // those 16 bytes.
+        let header = std::fs::read(&db_path).unwrap();
+        assert_ne!(&header[..16], SQLITE_PLAINTEXT_MAGIC.as_slice());
+        assert!(open_vault(&db_path, "some-password").is_ok());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn sidecar_era_vault_is_converted_on_first_unlock() {
+        let db_path = temp_db_path("sidecar-conversion");
+
+        // Build a pre-0.3.6 vault by hand: salt in a sidecar file, vault.db
+        // created *without* cipher_salt (random header salt), exactly like
+        // the old create_vault produced.
+        let salt = crypto::generate_salt();
+        let master_key = crypto::derive_key("legacy-layout-pw", &salt).unwrap();
+        let sqlcipher_key = crypto::derive_sqlcipher_key(&master_key);
+        {
+            let conn = open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+            ensure_schema(&conn).unwrap();
+            let token = crypto::encrypt(b"keystash-verification-token", &master_key).unwrap();
+            conn.execute("INSERT INTO metadata (key, value) VALUES ('verification', ?1)", params![token]).unwrap();
+            add_secret(&conn, "Site", "Cat", "user", "https://example.com", "hunter2", Some("note"), &master_key).unwrap();
+        }
+        let sidecar = db_path.with_file_name("vault.salt");
+        std::fs::write(&sidecar, salt).unwrap();
+
+        // Sanity: the sidecar-era file's header salt is NOT the Argon2 salt.
+        let header_before = std::fs::read(&db_path).unwrap();
+        assert_ne!(&header_before[..16], &salt[..]);
+
+        // Capture the record's identity fields; the conversion must not
+        // disturb them (the sync merge must not see a rebuilt vault as
+        // freshly edited).
+        let (uuid_before, updated_before) = {
+            let conn = open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+            let s = get_secrets(&conn).unwrap();
+            (s[0].sync_uuid.clone(), s[0].updated_at.clone())
+        };
+
+        // First unlock through the normal path converts the vault.
+        let (conn2, key2) = open_vault(&db_path, "legacy-layout-pw")
+            .expect("a sidecar-era vault must unlock (and convert) through open_vault");
+        assert!(!sidecar.exists(), "the sidecar must be deleted after conversion");
+        let header_after = std::fs::read(&db_path).unwrap();
+        assert_eq!(&header_after[..16], &salt[..], "the Argon2 salt must now be the file header");
+        assert!(
+            !db_path.with_file_name("vault.db.pre-rekey-backup").exists(),
+            "the conversion backup must be cleaned up on success"
+        );
+
+        // Data intact, identity fields untouched, ciphertexts still decrypt.
+        let secrets = get_secrets(&conn2).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].sync_uuid, uuid_before);
+        assert_eq!(secrets[0].updated_at, updated_before);
+        assert_eq!(&*crypto::decrypt(&secrets[0].encrypted_password, &key2).unwrap(), b"hunter2");
+        drop(conn2);
+
+        // And the second unlock takes the plain embedded path.
+        assert!(open_vault(&db_path, "legacy-layout-pw").is_ok());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn stored_version_floor_is_raised_on_open() {
+        let db_path = temp_db_path("floor-raise");
+        let (conn, _key) = create_vault(&db_path, "some-password").unwrap();
+
+        // Simulate a vault last written by an older version.
+        conn.execute("UPDATE metadata SET value = '0.3.0' WHERE key = 'min_app_version'", []).unwrap();
+        drop(conn);
+
+        // Opening with this binary converts the vault to this binary's
+        // format, so the floor must come up with it.
+        let (conn2, _) = open_vault(&db_path, "some-password").unwrap();
+        let floor: String = conn2
+            .query_row("SELECT value FROM metadata WHERE key = 'min_app_version'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(floor, MIN_COMPATIBLE_APP_VERSION);
+
         cleanup(&db_path);
     }
 

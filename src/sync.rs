@@ -28,6 +28,19 @@ impl Drop for TempCleanup {
     }
 }
 
+/// First 16 bytes of a file: the SQLCipher header salt for an encrypted
+/// vault (which on the 0.3.6+ format is also the Argon2 salt), or SQLite's
+/// plaintext magic for a legacy pre-encryption one. `None` if unreadable or
+/// shorter than 16 bytes.
+fn read_file_head(path: &Path) -> Option<[u8; crate::crypto::SALT_LEN]> {
+    use std::io::Read;
+    let mut head = [0u8; crate::crypto::SALT_LEN];
+    fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .ok()
+        .map(|_| head)
+}
+
 /// Check if the database folder is configured as a git repository.
 pub fn is_git_configured<P: AsRef<Path>>(db_path: P) -> bool {
     if let Some(parent) = db_path.as_ref().parent() {
@@ -80,6 +93,10 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     let remote_db_path = dir.join(format!("vault_remote_{}_{}.db", std::process::id(), unique_tmp_suffix()));
     let _cleanup = TempCleanup(vec![remote_db_path.clone()]);
 
+    // (backup path, remote was a legacy plaintext copy) -- set when the
+    // remote couldn't be merged and local gets pushed as source of truth.
+    let mut unmerged_remote_backup: Option<(std::path::PathBuf, bool)> = None;
+
     // Extract remote database to temp file using git show
     let show_output = Command::new("git")
         .arg("show")
@@ -99,14 +116,18 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     }
 
     // 2. Perform SQLite logical merge if remote database was successfully extracted
-    let mut unmerged_remote_backup: Option<std::path::PathBuf> = None;
     if has_remote {
         if !db_ref.exists() {
             fs::copy(&remote_db_path, db_ref).map_err(|e| format!("Failed to restore vault.db from remote: {}", e))?;
 
-            // vault.salt is tracked in git alongside vault.db (see the staging
-            // step below), so restore it the same way if it's also missing
-            // locally -- without it, the restored vault.db can't be unlocked.
+            // Transitional: repos last pushed by a pre-0.3.6 device still
+            // track a vault.salt sidecar, and their vault.db's header salt is
+            // random rather than the Argon2 salt -- restoring such a repo
+            // without the sidecar would leave the vault permanently locked.
+            // Restore it if present; the first unlock then converts the vault
+            // to the embedded-salt layout and deletes the sidecar again. For
+            // repos already on the current format this fetch finds nothing
+            // and is a no-op.
             let salt_path = db_ref.with_file_name("vault.salt");
             if !salt_path.exists() {
                 if let Ok(salt_output) = Command::new("git")
@@ -373,12 +394,76 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             // Detach database
             let _ = conn.execute("DETACH DATABASE remote_db", []);
         } else {
-            let backup_path = dir.join(format!(
-                "vault.db.unmerged-remote-{}",
-                chrono::Local::now().format("%Y%m%d-%H%M%S")
-            ));
-            if fs::copy(&remote_db_path, &backup_path).is_ok() {
-                unmerged_remote_backup = Some(backup_path);
+            // The fetched remote can't be opened with our key. Three distinct
+            // causes, told apart by the first 16 bytes of each file (an
+            // SQLCipher vault's header starts with its salt -- on the current
+            // format, the Argon2 salt -- a legacy plaintext vault with
+            // SQLite's magic):
+            let remote_head = read_file_head(&remote_db_path);
+            let local_head = read_file_head(db_ref);
+            let remote_is_plaintext = remote_head
+                .map(|h| &h == crate::db::SQLITE_PLAINTEXT_MAGIC)
+                .unwrap_or(false);
+
+            if !remote_is_plaintext
+                && let (Some(remote_salt), Some(local_salt)) = (remote_head, local_head)
+                && remote_salt != local_salt
+            {
+                // Different salts: one side rotated the master password (or
+                // re-initialized the vault). Which side is the *newer* one is
+                // exactly what git ancestry answers: if origin/main is an
+                // ancestor of our HEAD, everything on the remote is history
+                // we've already synced, so the salt change is this device's
+                // own rotation propagating outward -- pushing is precisely
+                // correct. If the remote has commits we haven't seen, the
+                // rotation happened elsewhere, and pushing our copy as source
+                // of truth would silently undo a completed security operation
+                // while reporting success. Refuse and say how to adopt the
+                // rotated vault instead.
+                let remote_is_ancestor = Command::new("git")
+                    .arg("merge-base")
+                    .arg("--is-ancestor")
+                    .arg("origin/main")
+                    .arg("HEAD")
+                    .current_dir(dir)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if !remote_is_ancestor {
+                    return Err(
+                        "Sync refused: the remote vault is encrypted under a different master password \
+                         -- it was rotated (or re-initialized) on another device, and pushing this \
+                         device's vault would undo that change.\n\n\
+                         To adopt the rotated vault on this device:\n\
+                         1. Back up any local changes:   keystash export ~/keystash-backup.csv\n\
+                         2. Delete the local vault file: ~/.config/keystash/vault.db (and vault.salt, if present)\n\
+                         3. Run `keystash sync` to restore the vault from the remote.\n\
+                         4. Unlock with the NEW master password, re-import the backup if needed, then \
+                         delete it securely.\n\n\
+                         Nothing was pushed."
+                            .to_string(),
+                    );
+                }
+                // Own rotation: fall through to the push below. No unmerged
+                // backup either -- the remote copy is this device's own
+                // pre-rotation history, already superseded by the re-encrypted
+                // local vault (and by the rotation's own safety backups).
+            } else {
+                // Same salt (or an unreadable/legacy copy): a pre-encryption
+                // file from a not-yet-updated device, or genuine corruption.
+                // Nothing mergeable either way -- back up the remote copy for
+                // manual recovery and fall through to pushing our own
+                // (already-correct) local vault as the new source of truth.
+                let backup_path = dir.join(format!(
+                    "vault.db.unmerged-remote-{}",
+                    chrono::Local::now().format("%Y%m%d-%H%M%S")
+                ));
+                if fs::copy(&remote_db_path, &backup_path).is_ok() {
+                    unmerged_remote_backup = Some((backup_path, remote_is_plaintext));
+                }
             }
         }
 
@@ -415,21 +500,23 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             .status()
             .map_err(|e| format!("git add failed: {}", e))?;
 
-        // Also stage vault.salt (force-added, since the documented setup's
-        // `.gitignore` only allow-lists `vault.db`). Without this, a second
-        // device that clones/pulls this repo would get vault.db but never the
-        // salt needed to derive its SQLCipher key -- it would be misdiagnosed
-        // as a legacy (pre-SQLCipher) vault and fail to open at all. The salt
-        // isn't secret, only the derived key is, so tracking it is safe.
+        // Drop the retired vault.salt sidecar from the repo if a pre-0.3.6
+        // push left it tracked. The salt now travels embedded in vault.db's
+        // own header, and a stale tracked sidecar is actively dangerous: a
+        // device restoring this repo later would find it and derive its key
+        // from an outdated salt instead of the header. --ignore-unmatch
+        // makes this a no-op for repos that never tracked it.
         Command::new("git")
-            .arg("add")
+            .arg("rm")
+            .arg("--cached")
+            .arg("--ignore-unmatch")
             .arg("-f")
             .arg("vault.salt")
             .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|e| format!("git add failed: {}", e))?;
+            .map_err(|e| format!("git rm failed: {}", e))?;
 
         // Create commit
         Command::new("git")
@@ -466,10 +553,15 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         return Err("Git push failed. You might have conflicts or remote changes that couldn't rebase automatically.".to_string());
     }
 
-    if let Some(backup_path) = unmerged_remote_backup {
+    if let Some((backup_path, remote_was_plaintext)) = unmerged_remote_backup {
+        let reason = if remote_was_plaintext {
+            "an outdated pre-encryption copy"
+        } else {
+            "unreadable under the current key despite carrying the same salt -- most likely corrupted"
+        };
         Ok(format!(
-            "Sync complete: remote vault was in an incompatible format (likely an outdated pre-encryption copy) and could not be merged. Your local vault was pushed as the new source of truth; the old remote copy was saved to {:?} in case you need anything from it.",
-            backup_path
+            "Sync complete: the remote vault was {} and could not be merged. Your local vault was pushed as the new source of truth; the old remote copy was saved to {:?} in case you need anything from it.",
+            reason, backup_path
         ))
     } else if is_dirty {
         Ok("Sync complete: Local and remote vaults merged and updated!".to_string())
@@ -755,9 +847,9 @@ mod tests {
     }
 
     /// End-to-end regression test for two related sync bugs:
-    /// 1. A second device couldn't derive the right key at all without
-    ///    `vault.salt` also being synced (it lives outside vault.db and the
-    ///    documented `.gitignore` only allow-lists vault.db).
+    /// 1. A second device must be able to derive the right key from what
+    ///    `git pull` brings down alone -- since 0.3.6 that's vault.db itself
+    ///    (the Argon2 salt lives in its header), with no sidecar involved.
     /// 2. Resolving a sync conflict used to skip the real merge entirely,
     ///    silently dropping any *other* concurrent, non-conflicting change.
     #[test]
@@ -776,7 +868,7 @@ mod tests {
         crate::db::add_secret(&conn_a, "Common", "Cat", "user", "", "common-v1", None, &key_a).unwrap();
         drop(conn_a);
         for args in [
-            vec!["add", "-f", "vault.db", "vault.salt"],
+            vec!["add", "-f", "vault.db"],
             vec!["commit", "-m", "Initial vault backup"],
             vec!["push", "-u", "origin", "main"],
         ] {
@@ -788,13 +880,9 @@ mod tests {
         let device_b = init_device(&root, "device_b", &origin);
         pull(&device_b);
         assert!(device_b.vault_path.exists(), "vault.db did not come down with git pull");
-        assert!(
-            device_b.vault_path.with_file_name("vault.salt").exists(),
-            "vault.salt did not come down with git pull -- a second device could never derive the right key"
-        );
 
         // Device B must be able to open the vault A created, with A's password,
-        // using only what `git pull` brought down.
+        // using only what `git pull` brought down -- the vault file alone.
         let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password")
             .expect("Device B could not open the vault it just cloned");
         let secrets_b = crate::db::get_secrets(&conn_b).unwrap();
@@ -898,7 +986,7 @@ mod tests {
         crate::db::add_secret(&conn_a, "Dup", "Cat", "user", "", "dup-v1-from-A", None, &key_a).unwrap();
         drop(conn_a);
         for args in [
-            vec!["add", "-f", "vault.db", "vault.salt"],
+            vec!["add", "-f", "vault.db"],
             vec!["commit", "-m", "Initial vault backup"],
             vec!["push", "-u", "origin", "main"],
         ] {
@@ -965,7 +1053,7 @@ mod tests {
         }
         drop(conn_a);
         for args in [
-            vec!["add", "-f", "vault.db", "vault.salt"],
+            vec!["add", "-f", "vault.db"],
             vec!["commit", "-m", "Initial vault backup"],
             vec!["push", "-u", "origin", "main"],
         ] {
@@ -1052,6 +1140,100 @@ mod tests {
             assert_ne!(uuids[0], uuids[1], "{}: tombstones must be distinct", label);
             assert!(!uuids.contains(&Some(keep_uuid.clone())), "{}: the kept record must not have a tombstone", label);
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression test for the silent rotation revert: a device that hadn't
+    /// yet seen a master-password rotation used to hit the incompatible-remote
+    /// path and push its own stale vault as the new source of truth --
+    /// undoing the rotation on the remote while reporting success. With the
+    /// salt embedded in the vault header, the stale device must now detect
+    /// the salt mismatch, refuse to push, and leave the rotated remote
+    /// untouched -- while the device that *performed* the rotation (whose
+    /// HEAD already contains everything on the remote) must still be able to
+    /// push it out.
+    #[test]
+    fn stale_device_refuses_to_push_over_a_rotated_remote() {
+        let root = scratch_root("rotation_refusal");
+        let origin = init_bare_origin(&root);
+
+        // --- Device A: create, add a secret, push. ---
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "old-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // --- Device B: clone and unlock with the old password. ---
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (_conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "old-master-password").unwrap();
+        let stale_salt_b = super::read_file_head(&device_b.vault_path).unwrap();
+
+        // --- Device A rotates, then syncs: its own rotation must push. ---
+        let new_key_a =
+            crate::db::change_master_password(&conn_a, &device_a.vault_path, &key_a, "new-master-password").unwrap();
+        drop(conn_a);
+        let rotated_salt = super::read_file_head(&device_a.vault_path).unwrap();
+        assert_ne!(rotated_salt, stale_salt_b, "rotation must have produced a fresh salt");
+
+        let push_rotation = super::git_sync_vault(&device_a.vault_path, &new_key_a);
+        assert!(
+            push_rotation.is_ok(),
+            "the rotating device itself must be able to push its rotation: {:?}",
+            push_rotation
+        );
+
+        // --- Device B syncs while stale: must refuse, changing nothing. ---
+        let sync_b = super::git_sync_vault(&device_b.vault_path, &key_b);
+        let err = sync_b.expect_err("a stale device must refuse to push over a rotated remote");
+        assert!(
+            err.contains("different master password"),
+            "refusal should explain the rotation, got: {}",
+            err
+        );
+        assert_eq!(
+            super::read_file_head(&device_b.vault_path).unwrap(),
+            stale_salt_b,
+            "the refusal must not touch Device B's local vault"
+        );
+
+        // The remote must still hold A's rotated vault: fetch it on B and
+        // check its header salt.
+        let fetch = Command::new("git").args(["fetch", "origin", "main"]).current_dir(&device_b.dir).status().unwrap();
+        assert!(fetch.success());
+        let show = Command::new("git")
+            .args(["show", "origin/main:vault.db"])
+            .current_dir(&device_b.dir)
+            .output()
+            .unwrap();
+        assert!(show.status.success());
+        assert_eq!(
+            &show.stdout[..16],
+            &rotated_salt[..],
+            "the remote must still hold the rotated vault after the stale device's refused sync"
+        );
+
+        // --- And the refusal message's recovery procedure must work: delete
+        // the local vault, sync to restore, unlock with the new password. ---
+        std::fs::remove_file(&device_b.vault_path).unwrap();
+        let restore = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(restore.is_ok(), "restore-from-remote failed: {:?}", restore);
+        let (conn_b2, key_b2) = crate::db::open_vault(&device_b.vault_path, "new-master-password")
+            .expect("Device B should unlock the restored vault with the NEW password");
+        let secrets = crate::db::get_secrets(&conn_b2).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(
+            &*crate::crypto::decrypt(&secrets[0].encrypted_password, &key_b2).unwrap(),
+            b"alpha-v1"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1172,7 +1354,7 @@ mod tests {
         crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
         drop(conn_a);
         for args in [
-            vec!["add", "-f", "vault.db", "vault.salt"],
+            vec!["add", "-f", "vault.db"],
             vec!["commit", "-m", "Initial vault backup"],
             vec!["push", "-u", "origin", "main"],
         ] {
