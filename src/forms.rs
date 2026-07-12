@@ -689,18 +689,34 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
             let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
-        // Adjust length -- same 4..=256 bounds generate_password itself
-        // enforces (see generator::MIN_LENGTH/MAX_LENGTH), so the dialog,
-        // the Settings screen, and the CLI all agree on one rule.
+        // Flip between random characters and diceware passphrases (drawn
+        // from the embedded EFF large wordlist -- the better mode for
+        // anything typed or memorized). Dialog-local, not persisted.
+        KeyCode::Char('w') => {
+            app.gen_passphrase_mode = !app.gen_passphrase_mode;
+            regenerate_in_place(app);
+        }
+        // Adjust length (chars mode: same 4..=256 bounds generate_password
+        // itself enforces; words mode: 3..=12 words).
         KeyCode::Left => {
-            if app.gen_options.length > crate::generator::MIN_LENGTH {
+            if app.gen_passphrase_mode {
+                if app.gen_words > crate::generator::MIN_WORDS {
+                    app.gen_words -= 1;
+                    regenerate_in_place(app);
+                }
+            } else if app.gen_options.length > crate::generator::MIN_LENGTH {
                 app.gen_options.length -= 1;
                 let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }
         KeyCode::Right => {
-            if app.gen_options.length < crate::generator::MAX_LENGTH {
+            if app.gen_passphrase_mode {
+                if app.gen_words < crate::generator::MAX_WORDS {
+                    app.gen_words += 1;
+                    regenerate_in_place(app);
+                }
+            } else if app.gen_options.length < crate::generator::MAX_LENGTH {
                 app.gen_options.length += 1;
                 let _ = app.gen_options.save();
                 regenerate_in_place(app);
@@ -722,6 +738,11 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
 
 
 fn regenerate_in_place(app: &mut TuiApp) {
+    if app.gen_passphrase_mode {
+        app.gen_password.zeroize();
+        app.gen_password = crate::generator::generate_passphrase(app.gen_words);
+        return;
+    }
     // The generator dialog only exposes toggles for uppercase/numbers/symbols
     // -- lowercase can only be turned off from the Settings screen -- so
     // reaching all-four-disabled needs both: lowercase off in Settings, then
@@ -786,16 +807,32 @@ pub(crate) fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(pass_widget, chunks[0]);
 
-    // ── Length row ──
-    let len_line = Line::from(vec![
-        Span::styled("  Length: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[←]", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("  {}  ", app.gen_options.length),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("[→]", Style::default().fg(Color::Cyan)),
-    ]);
+    // ── Length / word-count row (mode-aware) ──
+    let len_line = if app.gen_passphrase_mode {
+        Line::from(vec![
+            Span::styled("  Words:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[←]", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  {}  ", app.gen_words),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[→]", Style::default().fg(Color::Cyan)),
+            Span::styled("   [w] Mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Passphrase (EFF wordlist)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  Length: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[←]", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  {}  ", app.gen_options.length),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[→]", Style::default().fg(Color::Cyan)),
+            Span::styled("   [w] Mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Random characters", Style::default().fg(Color::White)),
+        ])
+    };
     f.render_widget(Paragraph::new(len_line), chunks[2]);
 
     // ── Toggle rows ──

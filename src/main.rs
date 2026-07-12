@@ -333,8 +333,8 @@ fn print_help() {
     println!("  keystash sync                             Force manual Git sync/merge");
     println!("  keystash sync setup                       Interactive one-time git sync setup (first or additional device)");
     println!("  keystash audit [--hibp]                   Audit vault (optional HIBP check via --hibp)");
-    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols] [--save]");
-    println!("                                            Generate a random password (default: 20 chars, all charsets; length clamped to 4-256; --save persists the options as new defaults)");
+    println!("  keystash generate [-l <len>] [--words [n]] [--no-uppercase] [--no-numbers] [--no-symbols] [--save]");
+    println!("                                            Generate a password (20 chars default, 4-256) or, with --words [n], a diceware passphrase (n words from the EFF large list, default 6); --save persists charset options");
     println!("  keystash change-password                  Change Master Password and rotate keys");
     println!("  keystash help                             Show this help message");
 }
@@ -972,12 +972,25 @@ fn main() {
         "generate" | "gen" => {
             let mut options = generator::GeneratorOptions::load();
             let mut save_as_defaults = false;
+            // Some(n) switches to diceware passphrase mode (n words from
+            // the embedded EFF large list) instead of random characters.
+            let mut passphrase_words: Option<usize> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "--save" => {
                         save_as_defaults = true;
                         i += 1;
+                    }
+                    "--words" | "-w" => {
+                        // Optional count: `--words 7` or bare `--words`.
+                        if let Some(n) = args.get(i + 1).and_then(|a| a.parse::<usize>().ok()) {
+                            passphrase_words = Some(n);
+                            i += 2;
+                        } else {
+                            passphrase_words = Some(generator::DEFAULT_WORDS);
+                            i += 1;
+                        }
                     }
                     "-l" | "--length" => {
                         if i + 1 < args.len() {
@@ -1027,12 +1040,20 @@ fn main() {
             // Persisting is opt-in: a one-off `--no-symbols` for some
             // legacy site must not silently become the permanent default
             // for every future password (which is what happened before).
+            // (--words is a per-run mode, never persisted.)
             if save_as_defaults {
                 options.length = options.length.clamp(generator::MIN_LENGTH, generator::MAX_LENGTH);
                 match options.save() {
                     Ok(()) => println!("Saved these options as your new generator defaults."),
                     Err(e) => eprintln!("Could not save generator defaults: {}", e),
                 }
+            }
+
+            if let Some(words) = passphrase_words {
+                let pass = generator::generate_passphrase(words);
+                println!("{}", pass);
+                copy_to_clipboard(Zeroizing::new(pass), "generated passphrase");
+                return;
             }
 
             match generator::generate_password(&options) {

@@ -160,6 +160,10 @@ pub struct TuiApp {
     // Password Generator State
     pub gen_options: crate::generator::GeneratorOptions,
     pub gen_password: String,
+    /// Dialog-local (deliberately not persisted): [w] flips the generator
+    /// between random characters and diceware passphrases for this session.
+    pub gen_passphrase_mode: bool,
+    pub gen_words: usize,
 
     // Help dialog scroll
     pub help_scroll: u16,
@@ -331,6 +335,8 @@ impl TuiApp {
             export_only_marked: false,
             gen_options: crate::generator::GeneratorOptions::load(),
             gen_password: String::new(),
+            gen_passphrase_mode: false,
+            gen_words: crate::generator::DEFAULT_WORDS,
             help_scroll: 0,
             audit_report: None,
             form_reuse_fingerprints: std::collections::HashMap::new(),

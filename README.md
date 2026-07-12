@@ -118,11 +118,11 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   keystash show <ID> [--reveal]
   ```
   *(Shows detailed fields of a secret; passwords and notes are masked by default unless `--reveal` or `-r` is provided)*
-* **Generate Password:**
+* **Generate Password or Passphrase:**
   ```bash
-  keystash generate [-l <length>] [--no-uppercase] [--no-numbers] [--no-symbols] [--uppercase] [--numbers] [--symbols] [--save]
+  keystash generate [-l <length>] [--words [n]] [--no-uppercase] [--no-numbers] [--no-symbols] [--save]
   ```
-  *(Generates a random secure password, avoiding visually ambiguous characters. Length is clamped to 4–256 — the one rule shared by the CLI, the generator dialog, and Settings. Options apply to this run only unless `--save` is passed, which persists them as your new defaults)*
+  *(Generates a random secure password, avoiding visually ambiguous characters; length clamped to 4–256, the one rule shared by CLI, dialog, and Settings. `--words [n]` switches to a **diceware passphrase**: n words (3–12, default 6) from the embedded EFF large wordlist, hyphen-joined — the better choice for anything you have to type or memorize; 6 words ≈ 77 bits of entropy. The TUI generator has the same via the `[w]` mode toggle. Charset options apply to this run only unless `--save` is passed)*
 * **Copy Secret Field to Clipboard:**
   ```bash
   keystash copy <ID> [username|password|url]
