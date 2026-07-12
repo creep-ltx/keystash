@@ -12,7 +12,7 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 - **Split-Pane Layout:** Sidebar for category filtering, text-based query search, and a rich credential detail panel.
 - **Stateful Viewports:** Full list scrolling support (automatically keeps selected rows in view) with support for PageUp / PageDown.
 - **Secure Copy Shortcuts:** Copy username, password, or website URLs directly to your clipboard.
-- **Auto-Clearing Clipboard:** Clipboard data is automatically cleared after 10 seconds to mitigate memory leakage and snooping.
+- **Auto-Clearing Clipboard:** Clipboard data is automatically cleared after a configurable delay (default 5 seconds) to mitigate memory leakage and snooping.
 - **Multi-Select Mass Deletion:** Mark multiple secrets using the Spacebar and batch-delete them all at once.
 - **Delete Confirmations:** Warning prompts on single or mass deletions to prevent accidental loss of data.
 - **First-Time Setup Wizard:** Guides you through setting up a master password on your initial run.
@@ -64,9 +64,9 @@ Your credentials database is stored offline inside your user config folder:
 | **`[Space]`** | Mark / Unmark selected credential |
 | **`[/]`** | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
 | **`[v]`** | Toggle password visibility in detail pane |
-| **`[c]`** | Copy username to clipboard (clears in configured delay, default 10s) |
-| **`[p]`** | Copy decrypted password to clipboard (clears in configured delay, default 10s) |
-| **`[u]`** | Copy website URL to clipboard (clears in configured delay, default 10s) |
+| **`[c]`** | Copy username to clipboard (clears in configured delay, default 5s) |
+| **`[p]`** | Copy decrypted password to clipboard (clears in configured delay, default 5s) |
+| **`[u]`** | Copy website URL to clipboard (clears in configured delay, default 5s) |
 | **`[a]`** | Add new credential |
 | **`[e]`** | Edit selected credential |
 | **`[d]`** | Delete credential (opens verification modal) |
@@ -122,7 +122,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash copy <ID> [username|password|url]
   ```
-  *(Copies target field to system clipboard and automatically clears it after 10 seconds. Defaults to password)*
+  *(Copies target field to system clipboard and automatically clears it after the configured delay (default 5 seconds). Defaults to password)*
 * **Insert a Secret:**
   ```bash
   keystash add <Title> <Category> <Username> [URL]
@@ -168,7 +168,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 4. **XChaCha20-Poly1305 AEAD:** The column-level sensitive fields are encrypted individually before being stored. Every encryption generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
 5. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
 6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants. Locking the vault (idle timeout or manual lock) also drops the open, keyed SQLCipher connection itself, not just the in-memory key — so the whole-database-encrypted contents aren't left readable through a lingering connection handle while the app sits on the Lock screen.
-7. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
+7. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after the configured delay (default 5 seconds). Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
 8. **Schema Migrations & Crash Safety:** Database schema integrity checks and upgrades are performed automatically on startup. Both the one-time move to the encrypted database format and a master-password change build the new vault file at a temporary path and swap it into place atomically, rather than modifying the live file in place — if the process is interrupted partway through (crash, power loss), KeyStash detects the leftover backup/temp files on next launch and shows exact recovery instructions instead of mistaking your vault for a fresh install.
 
 ---

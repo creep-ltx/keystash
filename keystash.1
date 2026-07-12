@@ -33,7 +33,7 @@ Search for matching credentials across titles, categories, usernames, or URLs. P
 Show a detailed view of a secret (including notes). Passwords and notes are masked by default unless \-r or \-\-reveal is supplied.
 .TP
 .B copy \fIid\fR [\fIusername\fR|\fIpassword\fR|\fIurl\fR]
-Copy the target secret field to the system clipboard (automatically clearing it after the configured delay, default 10 seconds). Defaults to copying the password.
+Copy the target secret field to the system clipboard (automatically clearing it after the configured delay, default 5 seconds). Defaults to copying the password.
 .TP
 .B generate [\-l \fIlength\fR] [\-\-no\-uppercase] [\-\-no\-numbers] [\-\-no\-symbols] [\-\-uppercase] [\-\-numbers] [\-\-symbols]
 Generate a random secure password, print it (excluding ambiguous characters), and copy it to the clipboard for the configured delay. Your options are saved as your new defaults.
@@ -89,13 +89,13 @@ Delete the selected credential (or all marked credentials if any exist).
 Toggle password plaintext visibility in the Details pane.
 .TP
 .B c
-Copy username to clipboard (clears automatically in configured delay, default 10s).
+Copy username to clipboard (clears automatically in configured delay, default 5s).
 .TP
 .B p
-Copy decrypted password to clipboard (clears automatically in configured delay, default 10s).
+Copy decrypted password to clipboard (clears automatically in configured delay, default 5s).
 .TP
 .B u
-Copy website URL to clipboard (clears automatically in configured delay, default 10s).
+Copy website URL to clipboard (clears automatically in configured delay, default 5s).
 .TP
 .B m
 Open the Change Master Password form overlay.
@@ -163,7 +163,7 @@ The entire vault.db file is encrypted with SQLCipher: schema, indexes, and every
 .PP
 .B Clipboard Security
 .IP
-KeyStash automatically clears copied credentials from the system clipboard after the configured delay (default 10 seconds). However, third-party clipboard history managers (like CopyQ or Klipper) can intercept and save copied text. You should configure these managers to ignore copy actions from the "keystash" binary.
+KeyStash automatically clears copied credentials from the system clipboard after the configured delay (default 5 seconds). However, third-party clipboard history managers (like CopyQ or Klipper) can intercept and save copied text. You should configure these managers to ignore copy actions from the "keystash" binary.
 .PP
 .B Memory Cleansing
 .IP

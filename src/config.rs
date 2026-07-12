@@ -13,7 +13,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             idle_timeout_seconds: 300,
-            clipboard_clear_seconds: 10,
+            clipboard_clear_seconds: 5,
             auto_sync: true,
             generator: GeneratorOptions::default(),
         }

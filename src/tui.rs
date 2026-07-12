@@ -3505,7 +3505,7 @@ fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
             // this save, soft-locking the user out of the TUI (settings screen
             // included) until they hand-edit config.json.
             let timeout = app.settings_idle_timeout.parse::<u64>().unwrap_or(300).max(10);
-            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(10).clamp(1, 3600);
+            let clip = app.settings_clipboard_clear.parse::<u64>().unwrap_or(5).clamp(1, 3600);
             let gen_len = app.settings_gen_length.parse::<usize>().unwrap_or(20).clamp(4, 256);
 
             app.config.idle_timeout_seconds = timeout;

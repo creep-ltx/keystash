@@ -254,7 +254,7 @@ fn main() {
     let raw_args: Vec<String> = env::args().collect();
     if raw_args.len() >= 3 && raw_args[1] == "__internal-clear-clipboard" {
         use std::io::Read;
-        let secs: u64 = raw_args[2].parse().unwrap_or(10);
+        let secs: u64 = raw_args[2].parse().unwrap_or(5);
         let mut password = String::new();
         if std::io::stdin().read_to_string(&mut password).is_ok() {
             let password_trimmed: Zeroizing<String> = Zeroizing::new(password.trim_end().to_string());
