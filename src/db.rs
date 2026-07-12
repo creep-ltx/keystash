@@ -1236,6 +1236,21 @@ pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Deletes tombstones older than 90 days. A tombstone exists so a device
+/// that hasn't synced in a while still learns a record was deleted instead
+/// of resurrecting it -- prune too aggressively and that's exactly what
+/// happens to a device that syncs less often than the horizon. 90 days is
+/// deliberately generous. Left forever, every deleted credential's title
+/// and username live on in the vault indefinitely, which pruning fixes.
+/// Returns the number of rows removed.
+pub fn prune_old_tombstones(conn: &Connection) -> Result<usize, String> {
+    conn.execute(
+        "DELETE FROM deleted_secrets WHERE deleted_at < STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW', '-90 days')",
+        [],
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Rotates the master password by building a brand new SQLCipher-encrypted
 /// vault at a temp path (fresh salt, every secret decrypted with `old_key` and
 /// re-encrypted with the new one) and atomically swapping it into place --
@@ -1566,6 +1581,36 @@ mod sqlcipher_tests {
             "rotation re-encrypts the ciphertext but isn't a content edit -- it must not bump updated_at, \
              which would make the sync merge logic treat every rotated record as freshly changed"
         );
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn prune_old_tombstones_removes_only_entries_past_the_90_day_horizon() {
+        let db_path = temp_db_path("prune-tombstones");
+        let (conn, key) = create_vault(&db_path, "pw").unwrap();
+
+        add_secret(&conn, "Old", "Cat", "user", "", "pw1", None, &key).unwrap();
+        add_secret(&conn, "Recent", "Cat", "user", "", "pw2", None, &key).unwrap();
+        delete_secret(&conn, 1).unwrap();
+        delete_secret(&conn, 2).unwrap();
+
+        // Backdate the "Old" tombstone well past the horizon; leave "Recent"
+        // at its just-created deleted_at (well within it).
+        conn.execute(
+            "UPDATE deleted_secrets SET deleted_at = '2000-01-01 00:00:00.000' WHERE title = 'Old'",
+            [],
+        ).unwrap();
+
+        let removed = prune_old_tombstones(&conn).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT title FROM deleted_secrets").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(remaining, vec!["Recent".to_string()], "only the tombstone past the 90-day horizon should be pruned");
 
         cleanup(&db_path);
     }

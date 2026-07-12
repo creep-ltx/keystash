@@ -497,6 +497,16 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         }
     }
 
+    // Prune old tombstones here, before the commit/push below, so the
+    // pruned state is what actually gets pushed -- pruning after the push
+    // instead would just get the removed rows silently re-added on this
+    // device's *next* sync, since the (unpruned) remote copy would still
+    // have them and the merge logic copies missing remote tombstones in.
+    // Best-effort: a pruning failure shouldn't block the sync itself.
+    if let Ok(prune_conn) = crate::db::open_keyed_connection(db_ref, &sqlcipher_key) {
+        let _ = crate::db::prune_old_tombstones(&prune_conn);
+    }
+
     // 3. Stage changes, commit, and push local updates to remote repository
     let status_output = git_command(dir)
         .arg("status")
