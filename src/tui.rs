@@ -170,6 +170,12 @@ pub struct TuiApp {
     pub hibp_progress: Arc<Mutex<Option<(usize, usize)>>>,
     pub hibp_abort: Arc<AtomicBool>,
     pub checked_hashes_this_session: Arc<Mutex<HashSet<String>>>,
+    /// Set by spawn_hibp_scan's worker thread right before it clears
+    /// hibp_progress; run_loop polls it once per tick and, if set, clears it
+    /// and calls refresh_secrets() -- otherwise the detail pane kept showing
+    /// stale "Not checked"/breach status until some unrelated action (add,
+    /// edit, delete, unlock) happened to call refresh_secrets anyway.
+    pub hibp_scan_completed: Arc<AtomicBool>,
 
     // Sync conflict state
     pub sync_conflicts: Vec<crate::sync::ConflictGroup>,
@@ -266,6 +272,7 @@ impl TuiApp {
             hibp_progress: Arc::new(Mutex::new(None)),
             hibp_abort: Arc::new(AtomicBool::new(false)),
             checked_hashes_this_session: Arc::new(Mutex::new(HashSet::new())),
+            hibp_scan_completed: Arc::new(AtomicBool::new(false)),
             sync_conflicts: Vec::new(),
             selected_conflict_idx: 0,
             sync_conflicts_detected: Arc::new(Mutex::new(None)),
@@ -800,6 +807,10 @@ fn run_loop<B: ratatui::backend::Backend>(
             }
         }
 
+        if app.hibp_scan_completed.swap(false, Ordering::SeqCst) {
+            app.refresh_secrets();
+        }
+
         app.clear_clipboard_if_expired();
         
         // Check for idle timeout auto-lock
@@ -987,6 +998,7 @@ fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
     let abort_clone = Arc::clone(&app.hibp_abort);
     let key_clone = key.clone();
     let checked_hashes_clone = Arc::clone(&app.checked_hashes_this_session);
+    let completed_clone = Arc::clone(&app.hibp_scan_completed);
 
     std::thread::spawn(move || {
         let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_clone);
@@ -1055,6 +1067,7 @@ fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
             }
         }
         *progress_clone.lock().unwrap() = None;
+        completed_clone.store(true, Ordering::SeqCst);
     });
 }
 
@@ -1081,6 +1094,10 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
     match code {
         KeyCode::Esc => return true, // Exit App
         KeyCode::Char('q') if modifiers == KeyModifiers::CONTROL => return true,
+        // Plain `q` quits too, matching the help screen's documented
+        // "[q] / [Esc] Quit KeyStash" -- it used to do nothing on the
+        // dashboard, only Ctrl+q and Esc actually worked.
+        KeyCode::Char('q') => return true,
         KeyCode::Char('/') => {
             app.searching = true;
         }
@@ -1274,7 +1291,10 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                 .iter()
                 .filter_map(|id| crate::db::get_secret_by_id(&app.conn, *id).ok().flatten())
                 .collect();
-            app.marked_secrets.clear();
+            // Marks are a separate, persistent selection (used by mass
+            // delete etc.) -- checking HIBP status shouldn't silently
+            // consume them as a side effect. Only Space or a completed
+            // mass action should ever clear a mark.
             spawn_hibp_scan(app, records);
         }
         KeyCode::Char('H') => {
@@ -2271,7 +2291,19 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
     } else {
         "Password*"
     };
-    let password_box = Paragraph::new(app.form_password.as_str()).block(
+    // Masked behind the same [v] toggle the Detail View pane already uses --
+    // the form password used to render in the clear unconditionally, the one
+    // place in the whole TUI a password was ever shown on screen with no way
+    // to hide it (shoulder-surfing, screen-share, screenshot). Zeroizing to
+    // match the Detail View pane's own pattern for this same tradeoff --
+    // ratatui's internal render buffer is out of reach either way, but our
+    // own copy shouldn't drop unwiped on top of that.
+    let password_display: Zeroizing<String> = if app.reveal_password {
+        Zeroizing::new(app.form_password.clone())
+    } else {
+        Zeroizing::new("•".repeat(app.form_password.chars().count()))
+    };
+    let password_box = Paragraph::new(password_display.as_str()).block(
         Block::default().borders(Borders::ALL).title(password_title).border_style(get_border_style(FormField::Password))
     );
     f.render_widget(password_box, form_layout[4]);
@@ -2480,7 +2512,10 @@ fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         ]),
 
         Line::from(""),
-        Line::from(Span::styled("Clipboard Actions (clears automatically after 10s):", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            format!("Clipboard Actions (clears automatically after {}s):", app.config.clipboard_clear_seconds),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
         Line::from(vec![
             Span::styled("  [c]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Copy Username to clipboard", Style::default().fg(Color::White)),
@@ -2887,13 +2922,21 @@ fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
 }
 
 fn regenerate_in_place(app: &mut TuiApp) {
-    // Ensure at least one charset is enabled
-    if !app.gen_options.use_uppercase
+    // The generator dialog only exposes toggles for uppercase/numbers/symbols
+    // -- lowercase can only be turned off from the Settings screen -- so
+    // reaching all-four-disabled needs both: lowercase off in Settings, then
+    // the other three toggled off here too. When it happens, generate_password
+    // errors, and that error string used to become the displayed "password"
+    // (and what [c] would copy to the clipboard) instead of an actual
+    // password. Falling back to lowercase-only guarantees a real password
+    // either way, and updates gen_options so the fallback is what's actually
+    // shown/used, not a silent mismatch between state and output.
+    if !app.gen_options.use_lowercase
+        && !app.gen_options.use_uppercase
         && !app.gen_options.use_numbers
         && !app.gen_options.use_symbols
-        && app.gen_options.length > 0
     {
-        // lowercase is always the baseline — never all-disabled
+        app.gen_options.use_lowercase = true;
     }
     app.gen_password.zeroize();
     match crate::generator::generate_password(&app.gen_options) {

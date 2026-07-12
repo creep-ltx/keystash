@@ -116,12 +116,28 @@ fn copy_to_clipboard(text: Zeroizing<String>, label: &str) {
 }
 
 pub fn get_db_path() -> PathBuf {
-    let mut path = if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home)
+    // XDG_CONFIG_HOME, when set, is the correct place to look first (it
+    // already points at a config dir, so keystash/ is appended directly
+    // instead of assuming a .config subdirectory of it). Falling back
+    // silently to the current working directory when HOME is unset used to
+    // be an accident, not a decision: for a password manager, a vault that
+    // silently lands in a different place depending on which directory you
+    // happened to run the command from is a real hazard, not a convenience
+    // -- so that fallback now at least warns loudly instead of staying quiet.
+    let mut path = if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = env::var("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".config");
+        p
     } else {
-        PathBuf::from(".")
+        eprintln!(
+            "Warning: neither XDG_CONFIG_HOME nor HOME is set -- using ./.config/keystash \
+             relative to the current directory. This vault will only be found again if \
+             keystash is run from this same directory every time."
+        );
+        PathBuf::from("./.config")
     };
-    path.push(".config");
     path.push("keystash");
     let _ = fs::create_dir_all(&path);
     set_dir_permissions(&path);
@@ -141,6 +157,23 @@ fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
 /// username containing non-ASCII text.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+/// Parses `keystash search`'s args (everything after "search" itself) into
+/// (query, reveal). A `--` sentinel marks an explicit end of flags --
+/// whatever follows it is the query verbatim, even if it looks like a flag
+/// itself (a real search term starting with '-'). Without one, only args
+/// matching a *known* flag are skipped -- previously any arg starting with
+/// '-' at all was skipped outright, so a query like "-test" could never be
+/// found no matter how it was passed.
+fn parse_search_args(rest: &[String]) -> (Option<&String>, bool) {
+    let reveal = rest.iter().any(|a| a == "--reveal" || a == "-r");
+    let query = if let Some(dash_dash) = rest.iter().position(|a| a == "--") {
+        rest.get(dash_dash + 1)
+    } else {
+        rest.iter().find(|a| a.as_str() != "--reveal" && a.as_str() != "-r")
+    };
+    (query, reveal)
 }
 
 /// Prompts for the master password and opens the vault at `db_path`, transparently
@@ -203,7 +236,6 @@ fn print_help() {
     println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
     println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
     println!("  keystash copy <id> [username|password|url] Copy entry's field to clipboard (default: password)");
-    println!("  keystash generate [-l <len>] [--no-uppercase] [--no-numbers] [--no-symbols] Generate a random password");
     println!("  keystash import <path>                    Import unencrypted logins (Bitwarden JSON; KeyStash, Brave/Chrome, Firefox, LastPass, KeePassXC, 1Password CSV)");
     println!("  keystash export <path>                    Export all vault credentials to an unencrypted CSV file");
     println!("  keystash delete <id>                      Delete a credential by its ID");
@@ -361,9 +393,8 @@ fn main() {
             }
         }
         "search" => {
-            let reveal = args.iter().any(|arg| arg == "--reveal" || arg == "-r");
-            // Find query by skipping flags
-            let query_opt = args.iter().skip(2).find(|arg| *arg != "--reveal" && *arg != "-r" && !arg.starts_with('-'));
+            let rest = args.get(2..).unwrap_or(&[]);
+            let (query_opt, reveal) = parse_search_args(rest);
             let query = match query_opt {
                 Some(q) => q.to_lowercase(),
                 None => {
@@ -920,6 +951,66 @@ mod tests {
         // character count, not byte count.
         let emoji_title: String = std::iter::repeat('\u{1F511}').take(30).collect();
         assert_eq!(truncate_chars(&emoji_title, 22).chars().count(), 22);
+    }
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_search_args_finds_a_plain_query() {
+        let a = args(&["github"]);
+        let (query, reveal) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("github"));
+        assert!(!reveal);
+    }
+
+    #[test]
+    fn parse_search_args_skips_known_flags_regardless_of_order() {
+        let a = args(&["--reveal", "github"]);
+        let (query, reveal) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("github"));
+        assert!(reveal);
+
+        let a = args(&["github", "-r"]);
+        let (query, reveal) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("github"));
+        assert!(reveal);
+    }
+
+    #[test]
+    fn parse_search_args_accepts_a_query_starting_with_a_dash() {
+        // The original bug: any arg starting with '-' was skipped outright,
+        // so a query like "-test" could never be found at all.
+        let a = args(&["-test"]);
+        let (query, reveal) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("-test"));
+        assert!(!reveal);
+    }
+
+    #[test]
+    fn parse_search_args_dash_dash_forces_the_next_arg_to_be_the_query_verbatim() {
+        // Covers the one case the "skip only known flags" rule alone can't:
+        // a query that IS literally "-r" or "--reveal".
+        let a = args(&["--", "-r"]);
+        let (query, _) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("-r"));
+
+        let a = args(&["--reveal", "--", "--reveal"]);
+        let (query, reveal) = parse_search_args(&a);
+        assert_eq!(query.map(|s| s.as_str()), Some("--reveal"));
+        assert!(reveal, "a --reveal flag before -- should still count");
+    }
+
+    #[test]
+    fn parse_search_args_no_query_returns_none() {
+        let a = args(&["--reveal"]);
+        let (query, _) = parse_search_args(&a);
+        assert!(query.is_none());
+
+        let a = args(&[]);
+        let (query, _) = parse_search_args(&a);
+        assert!(query.is_none());
     }
 
     #[cfg(unix)]
