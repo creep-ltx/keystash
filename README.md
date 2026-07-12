@@ -270,6 +270,9 @@ If a stale device ever syncs before you get to it, nothing is lost: the rotated 
 * **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
 * **Logical Database Merge:** Every record carries a stable, randomly generated sync ID (independent of its title/tags/username, which are freely editable and can coincidentally repeat between records) that merges, updates, and tombstones are all matched on. Every field — title, tags, username, URL, password, notes — is carried through the merge, so renames and re-taggings propagate like any other edit. If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept; if *both* sides changed it since their last common state, the interactive conflict resolver opens instead.
 > [!NOTE]
+> Two deliberate tradeoffs worth knowing (details in [THREAT_MODEL.md](THREAT_MODEL.md) §5): the one-side-changed merge picks the newer `updated_at`, which rides device wall-clocks — keep clocks NTP-synced (the OS default) and this never matters; and deletion tombstones expire after 90 days, so a device offline *longer* than that can re-introduce records deleted in the meantime — review after its first sync back.
+
+> [!NOTE]
 > Syncing requires every device to be on a KeyStash version that supports this sync ID. If one device is still on an older version, syncing from an updated device produces a clear "update KeyStash on the other device first" message rather than merging incorrectly — update the older device and sync it at least once, then sync resumes normally everywhere.
 
 ---

@@ -151,3 +151,31 @@ correlating response size with which bucket was queried.
 
 **What they never get:** A specific password, or even a specific
 candidate-narrowed-to-one password, from the query alone.
+
+## 5. Accepted sync tradeoffs (named so the next gap is visible)
+
+Two deliberate design decisions in sync are worth stating explicitly,
+because both trade a rare failure mode for simplicity, and an unstated
+tradeoff is how previous gaps (the HIBP cache, the rotation revert) went
+unnoticed:
+
+**Last-write-wins rides wall-clock time.** When the same record changed on
+both sides and only one side changed it since the common base, the merge
+keeps the copy with the newer `updated_at` — a timestamp from whichever
+device wrote it. A device with a skewed clock therefore silently wins (or
+loses) those merges. The genuinely dangerous case — *both* sides changed
+the same record — does not rely on timestamps: it goes to the interactive
+conflict resolver. Vector clocks or CRDTs could remove the wall-clock
+dependency, but for a single-user, few-device vault the added complexity
+is a worse trade than "keep device clocks sane" (NTP, the default on
+every modern OS, is sufficient).
+
+**Deletion tombstones expire after 90 days.** Tombstones exist so other
+devices learn about deletions instead of resurrecting the record; they are
+pruned after 90 days so a deleted credential's title/username don't live
+in the vault forever (a privacy cost paid indefinitely otherwise). The
+consequence: a device that goes *longer than 90 days* without syncing can
+re-introduce records deleted in the meantime — its copies look like new
+records once the tombstones that would have deleted them are gone. The
+horizon is deliberately generous; if a device has been offline longer
+than that, review its vault contents after its first sync back.
