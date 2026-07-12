@@ -60,6 +60,7 @@ pub(crate) fn perform_unlock(app: &mut TuiApp) {
             // in the vault forever -- the exact privacy issue
             // pruning exists to fix. Best-effort, like sync's call.
             let _ = db::prune_old_tombstones(&app.conn);
+            let _ = db::prune_orphaned_history(&app.conn);
             app.refresh_secrets();
             app.trigger_postunlock_sync();
         }
@@ -391,6 +392,27 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             }
         }
 
+        KeyCode::Char('P') => {
+            // Password history for the selected record: decrypt the stored
+            // prior ciphertexts into the modal's Zeroizing buffer (wiped on
+            // close/lock/drop). Only opens when there's something to show.
+            if let (Some(record), Some(key)) = (app.filtered_secrets.get(app.selected_secret_idx), &app.key)
+                && let Ok(entries) = crate::db::get_password_history(&app.conn, &record.sync_uuid)
+                && !entries.is_empty()
+            {
+                app.history_view = entries
+                    .iter()
+                    .map(|(blob, at)| {
+                        let pw = crate::crypto::decrypt(blob, key)
+                            .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
+                            .unwrap_or_else(|_| Zeroizing::new("<decrypt error>".to_string()));
+                        (pw, at.clone())
+                    })
+                    .collect();
+                app.history_view_idx = 0;
+                app.screen = Screen::PasswordHistory;
+            }
+        }
         KeyCode::Char('D') => {
             app.find_duplicate_groups();
             if app.duplicate_groups.is_empty() {
@@ -537,6 +559,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::Deduplicate => draw_deduplicate_screen(f, app),
         Screen::Settings => draw_settings_screen(f, app),
         Screen::SyncConflict => draw_sync_conflict_screen(f, app),
+        Screen::PasswordHistory => draw_password_history_modal(f, app),
     }
 
     if let Ok(progress_lock) = app.hibp_progress.lock()
@@ -875,6 +898,16 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
         ];
 
         let mut details_text = details_text;
+
+        if let Some(count) = app.history_counts.get(&record.sync_uuid).filter(|c| **c > 0) {
+            details_text.push(Line::from(vec![
+                Span::styled("History:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} previous password(s) -- press [P] to view", count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
 
         if let Some(report) = &app.audit_report
             && let Some(entry) = report.entries.iter().find(|e| e.id == record.id) {

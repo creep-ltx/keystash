@@ -78,6 +78,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[h]`** | Check selected (or marked) password on HaveIBeenPwned |
 | **`[H]`** | Check all credentials in vault on HaveIBeenPwned (runs in background) |
 | **`[D]`** | Open duplicate credential detector and interactive resolver |
+| **`[P]`** | View the selected entry's previous passwords (kept automatically on every password change, last 5 per entry; copy one back with `c`) |
 | **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
 | **`[m]`** | Change master password (key rotation) |
 | **`[s]`** | Force a manual sync with the Git remote (runs the same conflict detection as the automatic post-unlock sync; works even with Auto Sync off) |

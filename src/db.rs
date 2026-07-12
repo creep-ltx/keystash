@@ -501,6 +501,31 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Password history: prior password ciphertexts, keyed on the record's
+    // sync_uuid, capped at PASSWORD_HISTORY_CAP per record. Deliberately
+    // additive -- no MIN_COMPATIBLE_APP_VERSION bump: older versions simply
+    // ignore an unknown table (their merges don't propagate it, so history
+    // may lag through an old-version device; documented -- and a rotation
+    // performed on a pre-history version drops it, since that rebuild only
+    // copies tables it knows about). Rows are written only by the
+    // user-facing edit path (update_secret) when the password actually
+    // changed -- never by update_secret_raw: every edit re-encrypts with a
+    // fresh nonce, so blob inequality there would record phantom "changes".
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS password_history (
+            sync_uuid TEXT NOT NULL,
+            encrypted_password BLOB NOT NULL,
+            replaced_at DATETIME DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_password_history_uuid ON password_history (sync_uuid)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     // Migration: Add 'url' column if database existed before this field was added
     let has_url: bool = conn
         .query_row(
@@ -874,6 +899,28 @@ fn embed_sidecar_salt(
             )
             .map_err(|e| e.to_string())?;
     }
+    // Password history copies verbatim -- same salt, same master key, so
+    // the ciphertexts remain valid unchanged (unlike rotation, which must
+    // re-encrypt them).
+    {
+        let mut stmt = conn
+            .prepare("SELECT sync_uuid, encrypted_password, replaced_at FROM password_history")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (uuid, blob, at) = row.map_err(|e| e.to_string())?;
+            new_conn
+                .execute(
+                    "INSERT INTO password_history (sync_uuid, encrypted_password, replaced_at) VALUES (?1, ?2, ?3)",
+                    params![uuid, blob, at],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
     for (hash, count) in &hibp_checks {
         save_hibp_check(&new_conn, hash, *count)?;
     }
@@ -1101,6 +1148,11 @@ pub fn add_secret(
     Ok(())
 }
 
+/// How many prior passwords are kept per record. Enough to cover "I rotated
+/// it twice this week and locked myself out of the old account", small
+/// enough that a record isn't a growing archive of its own weak history.
+pub const PASSWORD_HISTORY_CAP: usize = 5;
+
 #[allow(clippy::too_many_arguments)] // see the comment above add_secret
 pub fn update_secret(
     conn: &Connection,
@@ -1113,21 +1165,116 @@ pub fn update_secret(
     plaintext_notes: Option<&str>,
     key: &[u8; KEY_LEN],
 ) -> Result<(), String> {
+    // Password history: if this edit actually changes the password (compared
+    // as *plaintext* -- every save re-encrypts with a fresh nonce, so the
+    // blobs always differ even for an unchanged password), the old
+    // ciphertext is preserved verbatim (same master key, no re-encryption
+    // needed) before being overwritten.
+    let previous: Option<(Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT encrypted_password, sync_uuid FROM secrets WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let history_entry = match &previous {
+        Some((old_blob, sync_uuid)) => {
+            let old_plain = crypto::decrypt(old_blob, key)?;
+            if *old_plain != *plaintext_password.as_bytes() {
+                Some((old_blob.clone(), sync_uuid.clone()))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
     let encrypted_password = crypto::encrypt(plaintext_password.as_bytes(), key)?;
     let encrypted_notes = match plaintext_notes {
         Some(notes) if !notes.is_empty() => Some(crypto::encrypt(notes.as_bytes(), key)?),
         _ => None,
     };
 
-    conn.execute(
-        "UPDATE secrets 
-         SET title = ?1, category = ?2, username = ?3, url = ?4, encrypted_password = ?5, encrypted_notes = ?6, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')
-         WHERE id = ?7",
-        params![title, category, username, url, encrypted_password, encrypted_notes, id],
-    )
-    .map_err(|e| e.to_string())?;
+    conn.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        if let Some((old_blob, sync_uuid)) = &history_entry {
+            conn.execute(
+                "INSERT INTO password_history (sync_uuid, encrypted_password, replaced_at)
+                 VALUES (?1, ?2, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
+                params![sync_uuid, old_blob],
+            )
+            .map_err(|e| e.to_string())?;
+            // Cap: drop everything older than the newest CAP entries.
+            // rowid tiebreaks equal timestamps -- STRFTIME's millisecond
+            // precision can collide under rapid successive edits, and the
+            // cap must not silently stop applying when it does.
+            conn.execute(
+                "DELETE FROM password_history
+                 WHERE sync_uuid = ?1
+                   AND rowid NOT IN (
+                       SELECT rowid FROM password_history
+                       WHERE sync_uuid = ?1 ORDER BY replaced_at DESC, rowid DESC LIMIT ?2
+                   )",
+                params![sync_uuid, PASSWORD_HISTORY_CAP as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute(
+            "UPDATE secrets
+             SET title = ?1, category = ?2, username = ?3, url = ?4, encrypted_password = ?5, encrypted_notes = ?6, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')
+             WHERE id = ?7",
+            params![title, category, username, url, encrypted_password, encrypted_notes, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute("COMMIT", []).map(|_| ()).map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
 
-    Ok(())
+/// A record's prior passwords, newest first: (encrypted_password, replaced_at).
+pub fn get_password_history(conn: &Connection, sync_uuid: &str) -> Result<Vec<(Vec<u8>, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT encrypted_password, replaced_at FROM password_history WHERE sync_uuid = ?1 ORDER BY replaced_at DESC, rowid DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![sync_uuid], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+}
+
+/// Per-record history counts, for the detail pane's "N previous password(s)"
+/// line without a query per render.
+pub fn get_history_counts(conn: &Connection) -> Result<std::collections::HashMap<String, usize>, String> {
+    let mut stmt = conn
+        .prepare("SELECT sync_uuid, COUNT(*) FROM password_history GROUP BY sync_uuid")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)))
+        .map_err(|e| e.to_string())?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (uuid, count) = row.map_err(|e| e.to_string())?;
+        map.insert(uuid, count);
+    }
+    Ok(map)
+}
+
+/// Removes history rows whose record no longer exists -- deletions arriving
+/// via sync merge remove the secret but don't know about its history.
+/// Best-effort companion to prune_old_tombstones at the same call sites.
+pub fn prune_orphaned_history(conn: &Connection) -> Result<usize, String> {
+    conn.execute(
+        "DELETE FROM password_history WHERE sync_uuid NOT IN (SELECT sync_uuid FROM secrets)",
+        [],
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Current time in the same format used for `updated_at` columns elsewhere.
@@ -1281,6 +1428,16 @@ pub fn delete_secret(conn: &Connection, id: i64) -> Result<(), String> {
             let _ = conn.execute("ROLLBACK", []);
             return Err(e.to_string());
         }
+        // Deleting the credential deletes its password history with it --
+        // old passwords of a record the user chose to remove shouldn't
+        // linger (same privacy reasoning as tombstone pruning).
+        if let Err(e) = conn.execute(
+            "DELETE FROM password_history WHERE sync_uuid = ?1",
+            params![sync_uuid],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e.to_string());
+        }
     }
 
     // 3. Delete the actual secret
@@ -1364,11 +1521,22 @@ pub fn change_master_password(
             .map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
+    let history_rows: Vec<(String, Vec<u8>, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT sync_uuid, encrypted_password, replaced_at FROM password_history")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+    };
 
     // 3. Decrypt and re-encrypt every secret in memory, fully validated before
     //    any file is touched. sync_uuid is carried over unchanged -- rotating
     //    the password doesn't change a record's sync identity, only how its
-    //    ciphertext is encrypted.
+    //    ciphertext is encrypted. Password history gets the same treatment:
+    //    its blobs are ciphertexts under the old master key and would be
+    //    permanently undecryptable if copied verbatim into the rotated vault.
     let mut re_encrypted_secrets = Vec::with_capacity(secrets.len());
     for r in &secrets {
         let plaintext_pass = crypto::decrypt(&r.encrypted_password, old_key)?;
@@ -1383,6 +1551,11 @@ pub fn change_master_password(
         };
 
         re_encrypted_secrets.push((r, encrypted_pass, encrypted_notes));
+    }
+    let mut re_encrypted_history = Vec::with_capacity(history_rows.len());
+    for (uuid, blob, at) in &history_rows {
+        let plaintext = crypto::decrypt(blob, old_key)?;
+        re_encrypted_history.push((uuid.clone(), crypto::encrypt(&plaintext, &new_key)?, at.clone()));
     }
     let new_verification = crypto::encrypt(b"keystash-verification-token", &new_key)?;
 
@@ -1421,6 +1594,14 @@ pub fn change_master_password(
             .execute(
                 "INSERT OR REPLACE INTO deleted_secrets (title, category, username, sync_uuid, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![title, category, username, sync_uuid, deleted_at],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (uuid, blob, at) in &re_encrypted_history {
+        new_conn
+            .execute(
+                "INSERT INTO password_history (sync_uuid, encrypted_password, replaced_at) VALUES (?1, ?2, ?3)",
+                params![uuid, blob, at],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -1705,6 +1886,77 @@ mod sqlcipher_tests {
         assert_eq!(remaining, vec!["Recent".to_string()], "only the tombstone past the 90-day horizon should be pruned");
 
         cleanup(&db_path);
+    }
+
+    #[test]
+    fn password_history_records_real_changes_caps_and_cleans() {
+        let db_path = temp_db_path("pw-history");
+        let (conn, key) = create_vault(&db_path, "pw").unwrap();
+        add_secret(&conn, "Site", "Cat", "user", "", "v0", None, &key).unwrap();
+        let s = get_secrets(&conn).unwrap();
+        let (id, uuid) = (s[0].id, s[0].sync_uuid.clone());
+
+        // A save that doesn't change the password (rename only) must not
+        // record history -- every save re-encrypts with a fresh nonce, so
+        // this is exactly the phantom-change case plaintext comparison
+        // exists to prevent.
+        update_secret(&conn, id, "Site Renamed", "Cat", "user", "", "v0", None, &key).unwrap();
+        assert!(get_password_history(&conn, &uuid).unwrap().is_empty());
+
+        // Seven real changes -> capped at the newest PASSWORD_HISTORY_CAP.
+        for i in 1..=7 {
+            update_secret(&conn, id, "Site", "Cat", "user", "", &format!("v{}", i), None, &key).unwrap();
+        }
+        let history = get_password_history(&conn, &uuid).unwrap();
+        assert_eq!(history.len(), PASSWORD_HISTORY_CAP);
+        // Newest first: the most recently replaced value is v6 (replaced by
+        // v7); the oldest kept is v2.
+        let decrypted: Vec<String> = history
+            .iter()
+            .map(|(blob, _)| String::from_utf8(crypto::decrypt(blob, &key).unwrap().to_vec()).unwrap())
+            .collect();
+        assert_eq!(decrypted, vec!["v6", "v5", "v4", "v3", "v2"], "newest-first, capped window");
+
+        // Count map agrees.
+        assert_eq!(get_history_counts(&conn).unwrap().get(&uuid), Some(&PASSWORD_HISTORY_CAP));
+
+        // Deleting the record deletes its history with it.
+        delete_secret(&conn, id).unwrap();
+        assert!(get_password_history(&conn, &uuid).unwrap().is_empty());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn rotation_reencrypts_password_history() {
+        let db_path = temp_db_path("pw-history-rotate");
+        let (conn, old_key) = create_vault(&db_path, "old-password").unwrap();
+        add_secret(&conn, "Site", "Cat", "user", "", "original", None, key_of(&old_key)).unwrap();
+        let s = get_secrets(&conn).unwrap();
+        update_secret(&conn, s[0].id, "Site", "Cat", "user", "", "rotated-value", None, key_of(&old_key)).unwrap();
+
+        change_master_password(&conn, &db_path, &old_key, "new-password").unwrap();
+        drop(conn);
+
+        // History must decrypt under the NEW key: rotation re-encrypts it
+        // like live passwords -- copied verbatim it would be dead ciphertext.
+        let (conn2, new_key) = open_vault(&db_path, "new-password").unwrap();
+        let s2 = get_secrets(&conn2).unwrap();
+        let history = get_password_history(&conn2, &s2[0].sync_uuid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            &*crypto::decrypt(&history[0].0, &new_key).unwrap(),
+            b"original",
+            "history must be re-encrypted under the rotated key"
+        );
+
+        cleanup(&db_path);
+    }
+
+    /// `&Zeroizing<[u8; 32]>` -> `&[u8; 32]` without cloning; keeps the
+    /// history tests above readable.
+    fn key_of(k: &Zeroizing<[u8; KEY_LEN]>) -> &[u8; KEY_LEN] {
+        k
     }
 
     #[test]

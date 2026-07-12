@@ -218,6 +218,9 @@ fn rev_parse(dir: &Path, reference: &str) -> Option<String> {
 fn prune_and_checkpoint(db_ref: &Path, sqlcipher_key: &[u8; 32]) {
     if let Ok(conn) = crate::db::open_keyed_connection(db_ref, sqlcipher_key) {
         let _ = crate::db::prune_old_tombstones(&conn);
+        // History rows whose record was deleted by a merged-in tombstone
+        // (the merge deletes the secret but doesn't know about history).
+        let _ = crate::db::prune_orphaned_history(&conn);
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 }
@@ -724,6 +727,53 @@ pub fn git_sync_vault_with_retention<P: AsRef<Path>>(db_path: P, key: &[u8; 32],
                 if let Err(e) = conn.execute(step, []) {
                     let _ = conn.execute("ROLLBACK", []);
                     return Err(format!("Database merge transaction failed: {}", e));
+                }
+            }
+
+            // Password-history union merge, gated on the remote actually
+            // having the table (a vault last pushed by a pre-history
+            // version doesn't -- same transitional pattern as the
+            // sync_uuid check above, same statement-form PRAGMA footgun
+            // avoided). Rows are identified by (sync_uuid, replaced_at);
+            // only records that exist locally after the steps above get
+            // history (deleted records' rows are pruned separately). Cap
+            // re-enforced afterward: two devices can each contribute
+            // near-cap histories for the same record.
+            let remote_has_history: bool = {
+                let mut stmt = conn
+                    .prepare("PRAGMA remote_db.table_info(password_history)")
+                    .map_err(|e| e.to_string())?;
+                let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+                rows.next().map_err(|e| e.to_string())?.is_some()
+            };
+            if remote_has_history {
+                let union = conn.execute(
+                    "INSERT INTO main.password_history (sync_uuid, encrypted_password, replaced_at)
+                     SELECT rh.sync_uuid, rh.encrypted_password, rh.replaced_at
+                     FROM remote_db.password_history rh
+                     WHERE EXISTS (SELECT 1 FROM main.secrets s WHERE s.sync_uuid = rh.sync_uuid)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM main.password_history lh
+                           WHERE lh.sync_uuid = rh.sync_uuid AND lh.replaced_at = rh.replaced_at
+                       )",
+                    [],
+                );
+                // Keep only the newest CAP entries per record: a row is
+                // dropped when CAP-or-more newer siblings exist.
+                let cap = union.and_then(|_| {
+                    conn.execute(
+                        "DELETE FROM main.password_history
+                         WHERE (
+                             SELECT COUNT(*) FROM main.password_history newer
+                             WHERE newer.sync_uuid = main.password_history.sync_uuid
+                               AND newer.replaced_at > main.password_history.replaced_at
+                         ) >= ?1",
+                        rusqlite::params![crate::db::PASSWORD_HISTORY_CAP as i64],
+                    )
+                });
+                if let Err(e) = cap {
+                    let _ = conn.execute("ROLLBACK", []);
+                    return Err(format!("Password-history merge failed: {}", e));
                 }
             }
 
@@ -1770,6 +1820,118 @@ mod tests {
         pull(&device_b);
         let (conn_b, _key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
         assert_eq!(crate::db::get_secrets(&conn_b).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Password history rides sync: union-merged by (sync_uuid, replaced_at)
+    /// so both devices converge on the same set, no duplicates on repeated
+    /// syncs -- and a remote pushed by a version without the table (the
+    /// no-floor-bump compatibility case) is skipped gracefully instead of
+    /// erroring the merge.
+    #[test]
+    fn password_history_unions_across_devices_and_tolerates_legacy_remotes() {
+        let root = scratch_root("history_sync");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Site", "Cat", "user", "", "v1", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (_conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A changes the password (v1 -> v2): one history entry, pushed.
+        let a_sql = crate::crypto::derive_sqlcipher_key(&key_a);
+        {
+            let conn = crate::db::open_keyed_connection(&device_a.vault_path, &a_sql).unwrap();
+            let s = crate::db::get_secrets(&conn).unwrap();
+            crate::db::update_secret(&conn, s[0].id, "Site", "Cat", "user", "", "v2", None, &key_a).unwrap();
+        }
+        assert!(super::git_sync_vault(&device_a.vault_path, &key_a).is_ok());
+
+        // B merges: must receive the history entry, decrypting to v1.
+        assert!(super::git_sync_vault(&device_b.vault_path, &key_b).is_ok());
+        let b_sql = crate::crypto::derive_sqlcipher_key(&key_b);
+        let uuid = {
+            let conn = crate::db::open_keyed_connection(&device_b.vault_path, &b_sql).unwrap();
+            let s = crate::db::get_secrets(&conn).unwrap();
+            let h = crate::db::get_password_history(&conn, &s[0].sync_uuid).unwrap();
+            assert_eq!(h.len(), 1, "B must receive A's history entry");
+            assert_eq!(&*crate::crypto::decrypt(&h[0].0, &key_b).unwrap(), b"v1");
+            s[0].sync_uuid.clone()
+        };
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // B changes it again (v2 -> v3); both entries must land on A, and a
+        // repeat sync must not duplicate anything.
+        {
+            let conn = crate::db::open_keyed_connection(&device_b.vault_path, &b_sql).unwrap();
+            let s = crate::db::get_secrets(&conn).unwrap();
+            crate::db::update_secret(&conn, s[0].id, "Site", "Cat", "user", "", "v3", None, &key_b).unwrap();
+        }
+        assert!(super::git_sync_vault(&device_b.vault_path, &key_b).is_ok());
+        assert!(super::git_sync_vault(&device_a.vault_path, &key_a).is_ok());
+        assert!(super::git_sync_vault(&device_a.vault_path, &key_a).is_ok(), "repeat sync");
+        {
+            let conn = crate::db::open_keyed_connection(&device_a.vault_path, &a_sql).unwrap();
+            let h = crate::db::get_password_history(&conn, &uuid).unwrap();
+            assert_eq!(h.len(), 2, "A must hold both history entries exactly once");
+            let plains: Vec<Vec<u8>> = h.iter().map(|(b, _)| crate::crypto::decrypt(b, &key_a).unwrap().to_vec()).collect();
+            assert!(plains.contains(&b"v1".to_vec()) && plains.contains(&b"v2".to_vec()));
+        }
+
+        // Legacy-remote tolerance: push a copy WITHOUT the history table
+        // (as a pre-history version would) and confirm the next merge
+        // skips the history step instead of failing. open_keyed_connection
+        // deliberately doesn't run ensure_schema, so the drop sticks. B
+        // pulls first (A pushed since), and the explicit checkpoint matters:
+        // _conn_b above is still open, so the drop connection's close won't
+        // checkpoint the WAL on its own and the drop would never reach the
+        // main file git stages.
+        pull(&device_b);
+        {
+            let conn = crate::db::open_keyed_connection(&device_b.vault_path, &b_sql).unwrap();
+            conn.execute_batch("DROP TABLE password_history; PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "simulated pre-history push"],
+            vec!["push", "origin", "main"],
+        ] {
+            let out = Command::new("git").args(&args).current_dir(&device_b.dir).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}{}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let sync = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(sync.is_ok(), "merging a remote without the history table must not fail: {:?}", sync);
+        {
+            let conn = crate::db::open_keyed_connection(&device_a.vault_path, &a_sql).unwrap();
+            assert_eq!(
+                crate::db::get_password_history(&conn, &uuid).unwrap().len(),
+                2,
+                "A's local history must survive a legacy-remote merge untouched"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

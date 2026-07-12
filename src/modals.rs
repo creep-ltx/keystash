@@ -341,6 +341,10 @@ pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::styled("  [D]           ", Style::default().fg(Color::Yellow)),
             Span::styled("Scan for duplicate entries and resolve/merge them", Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("  [P]           ", Style::default().fg(Color::Yellow)),
+            Span::styled("View the selected entry's previous passwords", Style::default().fg(Color::White)),
+        ]),
 
         Line::from(""),
         Line::from(Span::styled(
@@ -895,6 +899,96 @@ pub(crate) fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(hints, chunks[2]);
 }
 
+
+// ─────────────────────────────────────────────
+//  Password History Modal
+// ─────────────────────────────────────────────
+
+pub(crate) fn handle_password_history_input(app: &mut TuiApp, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('P') => {
+            // Wipe the decrypted entries before dropping them, same
+            // discipline as the dedup screen's decrypted passwords.
+            for (pw, _) in &mut app.history_view {
+                use zeroize::Zeroize;
+                pw.zeroize();
+            }
+            app.history_view.clear();
+            app.history_view_idx = 0;
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.history_view_idx = app.history_view_idx.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.history_view_idx + 1 < app.history_view.len() {
+                app.history_view_idx += 1;
+            }
+        }
+        KeyCode::Char('v') => {
+            app.reveal_password = !app.reveal_password;
+        }
+        KeyCode::Char('c') => {
+            // The "restore an old password" workflow: copy it, close the
+            // modal, paste into the edit form.
+            if let Some((pw, _)) = app.history_view.get(app.history_view_idx) {
+                let text = Zeroizing::new(pw.to_string());
+                app.copy_to_clipboard(text, "previous password");
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn draw_password_history_modal(f: &mut ratatui::Frame, app: &TuiApp) {
+    let size = f.area();
+    let area = centered_rect(70, 60, size);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Password History (newest first) ")
+        .border_style(Style::default().fg(Color::Magenta));
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .history_view
+        .iter()
+        .enumerate()
+        .map(|(i, (pw, replaced_at))| {
+            let shown: Zeroizing<String> = if app.reveal_password {
+                Zeroizing::new(pw.to_string())
+            } else {
+                Zeroizing::new("•".repeat(pw.chars().count().min(24)))
+            };
+            let style = if i == app.history_view_idx {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(format!("  replaced {}   {}", replaced_at, shown.as_str())).style(style)
+        })
+        .collect();
+    f.render_widget(List::new(items), chunks[0]);
+
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" [v] ", Style::default().fg(Color::Magenta)),
+        Span::styled("Reveal  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" [c] ", Style::default().fg(Color::Green)),
+        Span::styled("Copy selected  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" [Esc/q] ", Style::default().fg(Color::Red)),
+        Span::styled("Close", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(hints, chunks[1]);
+}
 
 // ─────────────────────────────────────────────
 //  HIBP Progress Dialog

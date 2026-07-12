@@ -272,6 +272,7 @@ fn open_or_migrate_vault(db_path: &Path) -> Option<(rusqlite::Connection, zeroiz
                     // handle_lock_input): git-less users need a prune site
                     // too, and sync's own pre-push prune covers the rest.
                     let _ = db::prune_old_tombstones(&pair.0);
+                    let _ = db::prune_orphaned_history(&pair.0);
                     Some(pair)
                 }
                 Err(e) => {
@@ -974,6 +975,18 @@ fn main() {
                         println!("Password: {}", *decrypted_pass);
                         println!("Notes:    {}", *decrypted_notes);
                         println!("Updated:  {}", r.updated_at);
+                        if reveal
+                            && let Ok(history) = db::get_password_history(&conn, &r.sync_uuid)
+                            && !history.is_empty()
+                        {
+                            println!("History (newest first):");
+                            for (blob, replaced_at) in &history {
+                                let old: Zeroizing<String> = crypto::decrypt(blob, &key)
+                                    .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).to_string()))
+                                    .unwrap_or_else(|_| Zeroizing::new("<Error>".to_string()));
+                                println!("  {}  {}", replaced_at, *old);
+                            }
+                        }
                         println!("----------------------------------------");
                     } else {
                         println!("Secret with ID {} not found.", id);

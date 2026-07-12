@@ -73,6 +73,7 @@ pub(crate) enum Screen {
     Deduplicate,
     Settings,
     SyncConflict,
+    PasswordHistory,
 }
 
 
@@ -170,6 +171,16 @@ pub struct TuiApp {
 
     // Audit screen state
     pub audit_report: Option<crate::audit::AuditReport>,
+
+    /// Per-record password-history counts (sync_uuid -> n), refreshed with
+    /// the secrets; drives the detail pane's "N previous password(s)" line
+    /// without a query per render.
+    pub history_counts: std::collections::HashMap<String, usize>,
+    /// Decrypted entries for the open History modal: (password, replaced_at).
+    /// Wiped on close, lock, and drop -- same handling as the dedup screen's
+    /// decrypted passwords.
+    pub history_view: Vec<(Zeroizing<String>, String)>,
+    pub history_view_idx: usize,
 
     // Add/Edit form audit cache: computed once when the form opens (see
     // refresh_form_audit_cache), not re-decrypted from every secret in the
@@ -339,6 +350,9 @@ impl TuiApp {
             gen_words: crate::generator::DEFAULT_WORDS,
             help_scroll: 0,
             audit_report: None,
+            history_counts: std::collections::HashMap::new(),
+            history_view: Vec::new(),
+            history_view_idx: 0,
             form_reuse_fingerprints: std::collections::HashMap::new(),
             form_hibp_cache: std::collections::HashMap::new(),
             last_activity: Instant::now(),
@@ -437,6 +451,12 @@ impl TuiApp {
         // caches hold HMAC fingerprints (unusable without the key, but
         // there's no reason to keep them either).
         self.audit_report = None;
+        self.history_counts.clear();
+        for (pw, _) in &mut self.history_view {
+            pw.zeroize();
+        }
+        self.history_view.clear();
+        self.history_view_idx = 0;
         self.categories = vec!["All".to_string()];
         self.selected_category_idx = 0;
         self.selected_secret_idx = 0;
@@ -580,6 +600,8 @@ impl TuiApp {
                 }
 
                 self.audit_report = Some(report);
+
+                self.history_counts = db::get_history_counts(&self.conn).unwrap_or_default();
             }
     }
 
@@ -1118,6 +1140,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::Deduplicate => handle_deduplicate_input(app, key.code),
                         Screen::Settings => handle_settings_input(app, key.code),
                         Screen::SyncConflict => handle_sync_conflict_input(app, key.code),
+                        Screen::PasswordHistory => handle_password_history_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -1139,6 +1162,9 @@ impl Drop for TuiApp {
         self.password_confirm_input.zeroize();
         self.form_password.zeroize();
         self.form_notes.zeroize();
+        for (pw, _) in &mut self.history_view {
+            pw.zeroize();
+        }
         self.gen_password.zeroize();
         for group in &mut self.duplicate_groups {
             for pw in &mut group.decrypted_passwords {
