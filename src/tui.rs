@@ -187,6 +187,16 @@ pub struct TuiApp {
     pub settings_gen_numbers: bool,
     pub settings_gen_symbols: bool,
     pub active_settings_field: usize,
+    /// True once the current numeric field (Idle Timeout, Clipboard Delay,
+    /// Gen Length) has actually been edited since navigating to it. False
+    /// means "fresh" -- the next digit or Backspace clears the field first
+    /// instead of appending to/trimming whatever was already there, the
+    /// same "select all on focus" behavior most form fields have. Without
+    /// this, typing a replacement value without first manually backspacing
+    /// away the old one silently concatenates them (e.g. an old "10" plus a
+    /// typed "5" "2" becomes "1052", accepted with no warning since it's
+    /// still a valid number).
+    pub settings_field_touched: bool,
 
     // HIBP background worker
     pub hibp_progress: Arc<Mutex<Option<(usize, usize)>>>,
@@ -294,6 +304,7 @@ impl TuiApp {
             settings_gen_numbers: true,
             settings_gen_symbols: true,
             active_settings_field: 0,
+            settings_field_touched: false,
             hibp_progress: Arc::new(Mutex::new(None)),
             hibp_abort: Arc::new(AtomicBool::new(false)),
             checked_hashes_this_session: Arc::new(Mutex::new(HashSet::new())),

@@ -89,6 +89,52 @@ mod form_integration_tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // Same HOME-isolation rationale as the test above.
+    #[test]
+    #[ignore]
+    fn settings_numeric_field_replaces_stale_value_on_first_keystroke() {
+        let tmp = std::env::temp_dir().join(format!("keystash_settings_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        let mut app = TuiApp::new(true);
+
+        // Simulate opening Settings on a field that already holds a stale
+        // value (e.g. "10" from a previous config), same as the ',' handler
+        // populates it from app.config.
+        app.settings_clipboard_clear = "10".to_string();
+        app.active_settings_field = 1;
+        app.settings_field_touched = false;
+
+        // Typing "5" without backspacing first must *replace* the stale
+        // "10", not concatenate into "105" -- this is the exact bug that
+        // let "10" plus a typed "5" "2" silently become "1052", accepted
+        // with no warning since it's still a valid number.
+        handle_settings_input(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.settings_clipboard_clear, "5", "first digit after navigating to a field must replace its stale value");
+
+        handle_settings_input(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.settings_clipboard_clear, "52", "subsequent digits in the same edit must append normally");
+
+        // Navigating away and back marks the field fresh again.
+        handle_settings_input(&mut app, KeyCode::Tab);
+        handle_settings_input(&mut app, KeyCode::BackTab);
+        assert!(!app.settings_field_touched);
+        handle_settings_input(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.settings_clipboard_clear, "9", "re-navigating to an already-edited field must still replace on the next keystroke");
+
+        // Backspace on a fresh field clears it outright (the old value is
+        // effectively "selected"), rather than trimming one digit off a
+        // value the user hasn't started editing.
+        app.settings_clipboard_clear = "300".to_string();
+        app.settings_field_touched = false;
+        handle_settings_input(&mut app, KeyCode::Backspace);
+        assert_eq!(app.settings_clipboard_clear, "", "Backspace on a fresh field clears it entirely, not just the last digit");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 
@@ -752,21 +798,36 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
             app.active_settings_field = settings_field_step(app.active_settings_field, key);
+            // The field just arrived at hasn't been edited yet -- the next
+            // digit/Backspace should replace its old value, not build on it.
+            app.settings_field_touched = false;
         }
         KeyCode::Char(c) => {
             match app.active_settings_field {
                 0 => {
                     if c.is_ascii_digit() {
+                        if !app.settings_field_touched {
+                            app.settings_idle_timeout.clear();
+                            app.settings_field_touched = true;
+                        }
                         app.settings_idle_timeout.push(c);
                     }
                 }
                 1 => {
                     if c.is_ascii_digit() {
+                        if !app.settings_field_touched {
+                            app.settings_clipboard_clear.clear();
+                            app.settings_field_touched = true;
+                        }
                         app.settings_clipboard_clear.push(c);
                     }
                 }
                 3 => {
                     if c.is_ascii_digit() {
+                        if !app.settings_field_touched {
+                            app.settings_gen_length.clear();
+                            app.settings_field_touched = true;
+                        }
                         app.settings_gen_length.push(c);
                     }
                 }
@@ -786,12 +847,24 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
             }
         }
         KeyCode::Backspace => {
+            // A fresh (untouched-since-navigating-here) field's old value is
+            // effectively "selected" -- Backspace clears the whole thing in
+            // one press, same as it would on a pre-selected form field,
+            // rather than trimming one digit off a value the user hasn't
+            // actually started editing yet.
             match app.active_settings_field {
-                0 => { app.settings_idle_timeout.pop(); }
-                1 => { app.settings_clipboard_clear.pop(); }
-                3 => { app.settings_gen_length.pop(); }
+                0 => {
+                    if app.settings_field_touched { app.settings_idle_timeout.pop(); } else { app.settings_idle_timeout.clear(); }
+                }
+                1 => {
+                    if app.settings_field_touched { app.settings_clipboard_clear.pop(); } else { app.settings_clipboard_clear.clear(); }
+                }
+                3 => {
+                    if app.settings_field_touched { app.settings_gen_length.pop(); } else { app.settings_gen_length.clear(); }
+                }
                 _ => {}
             }
+            app.settings_field_touched = true;
         }
         KeyCode::Enter => {
             // Clamped rather than accepted as-typed: an idle timeout of 0 makes

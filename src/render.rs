@@ -353,6 +353,7 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             app.settings_gen_numbers = app.config.generator.use_numbers;
             app.settings_gen_symbols = app.config.generator.use_symbols;
             app.active_settings_field = 0;
+            app.settings_field_touched = false;
             app.screen = Screen::SettingsScreen;
         }
         KeyCode::Char('s') => {
