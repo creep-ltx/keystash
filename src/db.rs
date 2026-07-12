@@ -1329,11 +1329,18 @@ pub fn change_master_password(
         .map_err(|e| e.to_string())?;
 
     for (r, enc_pass, enc_notes) in &re_encrypted_secrets {
+        // r.updated_at is carried over unchanged, same as migrate_legacy_vault
+        // does -- rotating the password re-encrypts the ciphertext but isn't
+        // a content edit, so it shouldn't look like one to the sync merge
+        // logic (last-write-wins on updated_at). Re-stamping every record to
+        // NOW here would make a rotation alone win every future conflict
+        // against genuinely newer edits made on another device beforehand,
+        // and would also blow away the detail pane's real "last edited" time.
         new_conn
             .execute(
                 "INSERT INTO secrets (title, category, username, url, encrypted_password, encrypted_notes, updated_at, sync_uuid)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), ?7)",
-                params![r.title, r.category, r.username, r.url, enc_pass, enc_notes, r.sync_uuid],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![r.title, r.category, r.username, r.url, enc_pass, enc_notes, r.updated_at, r.sync_uuid],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -1533,6 +1540,32 @@ mod sqlcipher_tests {
         assert_ne!(&rotated_header[..16], header_before.as_slice(), "rotation must change the header salt");
         assert_ne!(&rotated_header[..16], SQLITE_PLAINTEXT_MAGIC.as_slice());
         assert!(!db_path.with_file_name("vault.salt").exists());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn change_master_password_preserves_updated_at() {
+        let db_path = temp_db_path("rekey-updated-at");
+
+        let (conn, old_key) = create_vault(&db_path, "old-password-123").unwrap();
+        add_secret(&conn, "Site", "Cat", "user", "", "hunter2", None, &old_key).unwrap();
+
+        // Backdate the record so it's unambiguously distinguishable from
+        // whatever "now" would be if rotation re-stamped it.
+        let backdated = "2020-01-01 00:00:00.000";
+        conn.execute("UPDATE secrets SET updated_at = ?1", params![backdated]).unwrap();
+
+        change_master_password(&conn, &db_path, &old_key, "new-password-456").unwrap();
+        drop(conn);
+
+        let (conn2, _) = open_vault(&db_path, "new-password-456").unwrap();
+        let secrets = get_secrets(&conn2).unwrap();
+        assert_eq!(
+            secrets[0].updated_at, backdated,
+            "rotation re-encrypts the ciphertext but isn't a content edit -- it must not bump updated_at, \
+             which would make the sync merge logic treat every rotated record as freshly changed"
+        );
 
         cleanup(&db_path);
     }
