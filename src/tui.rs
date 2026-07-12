@@ -431,24 +431,15 @@ impl TuiApp {
                     })
                     .collect();
 
-                let mut report = crate::audit::audit_passwords(&mut plaintext);
+                let mut report = crate::audit::audit_passwords(&mut plaintext, &key);
 
-                // Restore HIBP status from database if password hasn't changed.
-                // We recreate plaintext list to compute SHA-256 (since audit_passwords zeroized plaintext)
+                // Restore HIBP status from the persisted cache using the
+                // fingerprints audit_passwords already computed above -- no
+                // second decrypt-every-password pass needed.
                 if let Ok(db_checks) = db::get_all_hibp_checks(&self.conn) {
-                    if let Ok(records) = db::get_secrets(&self.conn) {
-                        for r in &records {
-                            if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, &key) {
-                                if let Ok(pw) = String::from_utf8(dec.to_vec()) {
-                                    let hash_bytes = crate::audit::sha256(pw.as_bytes());
-                                    let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-                                    if let Some(cached_count) = db_checks.get(&hash_hex) {
-                                        if let Some(entry) = report.entries.iter_mut().find(|e| e.id == r.id) {
-                                            entry.hibp_count = *cached_count;
-                                        }
-                                    }
-                                }
-                            }
+                    for entry in report.entries.iter_mut() {
+                        if let Some(cached_count) = db_checks.get(&entry.hibp_fingerprint) {
+                            entry.hibp_count = *cached_count;
                         }
                     }
                 }
@@ -997,8 +988,7 @@ fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
                 let mut checked_online = false;
                 if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone) {
                     if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
-                        let hash_bytes = crate::audit::sha256(pw.as_bytes());
-                        let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+                        let hash_hex = crate::crypto::hibp_cache_fingerprint(pw.as_bytes(), &key_clone);
 
                         if let Ok(checked_lock) = checked_hashes_clone.lock() {
                             if checked_lock.contains(&hash_hex) {
@@ -2171,12 +2161,11 @@ fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
     )
 }
 
-fn check_local_hibp(conn: &rusqlite::Connection, password: &str) -> Option<u64> {
+fn check_local_hibp(conn: &rusqlite::Connection, password: &str, master_key: &[u8; 32]) -> Option<u64> {
     if password.is_empty() {
         return None;
     }
-    let hash_bytes = crate::audit::sha256(password.as_bytes());
-    let hash_hex = hash_bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+    let hash_hex = crate::crypto::hibp_cache_fingerprint(password.as_bytes(), master_key);
     conn.query_row(
         "SELECT hibp_count FROM hibp_checks WHERE password_hash = ?1",
         [hash_hex],
@@ -2294,7 +2283,7 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
         has_warnings = true;
     }
 
-    if let Some(hibp_count) = check_local_hibp(&app.conn, &app.form_password) {
+    if let Some(hibp_count) = app.key.as_ref().and_then(|key| check_local_hibp(&app.conn, &app.form_password, key)) {
         if hibp_count > 0 {
             if has_warnings {
                 warning_spans.push(Span::raw(" | "));

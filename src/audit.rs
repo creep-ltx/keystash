@@ -34,6 +34,11 @@ pub struct AuditEntry {
     pub score: u8,
     /// None = not checked, Some(0) = not pwned, Some(n) = found in n breaches.
     pub hibp_count: Option<u64>,
+    /// The same HMAC fingerprint `hibp_checks` is keyed on (see
+    /// `crypto::hibp_cache_fingerprint`), computed here from the plaintext
+    /// password before it's zeroized. Callers use this to look up a cached
+    /// HIBP result without decrypting the password a second time.
+    pub hibp_fingerprint: String,
 }
 
 pub struct AuditReport {
@@ -66,24 +71,30 @@ const COMMON_WEAK: &[&str] = &[
 ///
 /// `records` is `(id, title, category, username, plaintext_password)`.
 /// Passwords are zeroized inside `run_full_audit` before the function returns.
-pub fn audit_passwords(records: &mut Vec<(i64, String, String, String, String)>) -> AuditReport {
-    run_full_audit(records)
+/// `master_key` keys the HIBP cache fingerprint attached to each entry (see
+/// `AuditEntry::hibp_fingerprint`) -- the same one `hibp_checks` is keyed on.
+pub fn audit_passwords(records: &mut Vec<(i64, String, String, String, String)>, master_key: &[u8; 32]) -> AuditReport {
+    run_full_audit(records, master_key)
 }
 
 /// Internal implementation that does a single pass: hash → zeroize → report.
-fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>) -> AuditReport {
+fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>, master_key: &[u8; 32]) -> AuditReport {
     use std::collections::HashMap;
 
-    // First pass: collect sha256 fingerprints before zeroizing.
-    let fingerprints: Vec<[u8; 32]> = records
+    // First pass: collect HIBP cache fingerprints before zeroizing. These
+    // double as the duplicate-detection key below -- for a fixed master_key,
+    // two passwords fingerprint equal iff they're equal, same guarantee a
+    // plain hash gave, but this one only an attacker holding the master key
+    // (not just the SQLCipher layer) can reproduce.
+    let fingerprints: Vec<String> = records
         .iter()
-        .map(|(_, _, _, _, pw)| sha256(pw.as_bytes()))
+        .map(|(_, _, _, _, pw)| crate::crypto::hibp_cache_fingerprint(pw.as_bytes(), master_key))
         .collect();
 
     // Build duplicate map: fingerprint → list of (title, id)
-    let mut fp_map: HashMap<[u8; 32], Vec<(i64, String)>> = HashMap::new();
+    let mut fp_map: HashMap<&str, Vec<(i64, String)>> = HashMap::new();
     for (i, (id, title, _, _, _)) in records.iter().enumerate() {
-        fp_map.entry(fingerprints[i]).or_default().push((*id, title.clone()));
+        fp_map.entry(&fingerprints[i]).or_default().push((*id, title.clone()));
     }
     let duplicate_groups: Vec<Vec<String>> = fp_map
         .values()
@@ -99,7 +110,7 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>) -> A
             let (mut severity, mut issues, score) = check_strength(password);
 
             // Mark duplicates as Critical
-            let fp = &fingerprints[i];
+            let fp = fingerprints[i].as_str();
             if let Some(group) = fp_map.get(fp) {
                 if group.len() > 1 {
                     issues.push(format!(
@@ -123,6 +134,7 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>) -> A
                 issues,
                 score,
                 hibp_count: None,
+                hibp_fingerprint: fingerprints[i].clone(),
             }
         })
         .collect();
@@ -244,76 +256,6 @@ fn is_sequential(s: &str) -> bool {
     // Check descending sequence
     let descending = bytes.windows(2).all(|w| w[1] == w[0].wrapping_sub(1));
     ascending || descending
-}
-
-// ─────────────────────────────────────────────
-//  Tiny SHA-256 (no extra dep — uses ring/sha2
-//  if available, otherwise inline pure-Rust)
-// ─────────────────────────────────────────────
-
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    use std::num::Wrapping;
-
-    // Pure-Rust SHA-256 (RFC 6234)
-    const K: [u32; 64] = [
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
-    ];
-
-    let mut h: [Wrapping<u32>; 8] = [
-        Wrapping(0x6a09e667), Wrapping(0xbb67ae85), Wrapping(0x3c6ef372), Wrapping(0xa54ff53a),
-        Wrapping(0x510e527f), Wrapping(0x9b05688c), Wrapping(0x1f83d9ab), Wrapping(0x5be0cd19),
-    ];
-
-    // Pre-processing: pad message
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 512-bit chunk
-    for chunk in msg.chunks(64) {
-        let mut w = [Wrapping(0u32); 64];
-        for i in 0..16 {
-            w[i] = Wrapping(u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]));
-        }
-        for i in 16..64 {
-            let s0 = w[i-15].0.rotate_right(7) ^ w[i-15].0.rotate_right(18) ^ (w[i-15].0 >> 3);
-            let s1 = w[i-2].0.rotate_right(17) ^ w[i-2].0.rotate_right(19) ^ (w[i-2].0 >> 10);
-            w[i] = Wrapping(w[i-16].0.wrapping_add(s0).wrapping_add(w[i-7].0).wrapping_add(s1));
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.0.rotate_right(6) ^ e.0.rotate_right(11) ^ e.0.rotate_right(25);
-            let ch = (e.0 & f.0) ^ ((!e.0) & g.0);
-            let temp1 = Wrapping(hh.0.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i].0));
-            let s0 = a.0.rotate_right(2) ^ a.0.rotate_right(13) ^ a.0.rotate_right(22);
-            let maj = (a.0 & b.0) ^ (a.0 & c.0) ^ (b.0 & c.0);
-            let temp2 = Wrapping(s0.wrapping_add(maj));
-            hh = g; g = f; f = e;
-            e = Wrapping(d.0.wrapping_add(temp1.0));
-            d = c; c = b; b = a;
-            a = Wrapping(temp1.0.wrapping_add(temp2.0));
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-    }
-
-    let mut out = [0u8; 32];
-    for (i, v) in h.iter().enumerate() {
-        out[i*4..i*4+4].copy_from_slice(&v.0.to_be_bytes());
-    }
-    out
 }
 
 // ─────────────────────────────────────────────

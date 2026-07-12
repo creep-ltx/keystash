@@ -7,8 +7,11 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
 
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
@@ -73,6 +76,36 @@ pub fn derive_sqlcipher_key(master_key: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LE
     Zeroizing::new(okm)
 }
 
+/// Derives a third, independent key for the local HIBP breach-count cache from
+/// the same Argon2id master key via HKDF-SHA256, mirroring `derive_sqlcipher_key`.
+/// Keying the cache this way (see `hibp_cache_fingerprint`) means an attacker who
+/// only compromises the SQLCipher layer -- exactly the threat model the README's
+/// defense-in-depth claim is about -- cannot use the cache's lookup keys to test
+/// candidate passwords offline, unlike a raw, unsalted SHA-256 of each password.
+fn derive_hibp_cache_key(master_key: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
+    let hk = Hkdf::<Sha256>::new(None, master_key);
+    let mut okm = [0u8; KEY_LEN];
+    hk.expand(b"keystash-hibp-cache-key-v1", &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    Zeroizing::new(okm)
+}
+
+/// Computes the lookup key used for the local HIBP cache: HMAC-SHA256 of the
+/// password, keyed on `derive_hibp_cache_key(master_key)`. Because the key is
+/// derived from the master key, rotating the master password (a fresh salt,
+/// hence a fresh master key) naturally and silently invalidates every entry
+/// in the cache -- callers should not try to carry old entries over.
+pub fn hibp_cache_fingerprint(password: &[u8], master_key: &[u8; KEY_LEN]) -> String {
+    let cache_key = derive_hibp_cache_key(master_key);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&*cache_key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(password);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 /// Formats a raw key as the hex literal SQLCipher's `PRAGMA key = "x'...'"` expects.
 pub fn pragma_key_hex(key: &[u8; KEY_LEN]) -> Zeroizing<String> {
     let mut hex = String::with_capacity(KEY_LEN * 2);
@@ -116,4 +149,48 @@ pub fn decrypt(encrypted_data: &[u8], key: &[u8; KEY_LEN]) -> Result<Zeroizing<V
         .map_err(|e| e.to_string())?;
 
     Ok(Zeroizing::new(decrypted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hibp_fingerprint_is_not_raw_sha256() {
+        let master_key = [0x42u8; KEY_LEN];
+        let password = b"hunter2";
+
+        let fingerprint = hibp_cache_fingerprint(password, &master_key);
+
+        // A raw SHA-256 of the password would be reproducible by anyone who
+        // only has the SQLCipher layer (i.e. without the master key) -- the
+        // entire point of HMAC-keying it. Confirm the two diverge.
+        use sha2::Digest;
+        let raw_sha256_hex: String = Sha256::digest(password)
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_ne!(fingerprint, raw_sha256_hex);
+    }
+
+    #[test]
+    fn hibp_fingerprint_is_deterministic_and_key_dependent() {
+        let key_a = [0x11u8; KEY_LEN];
+        let key_b = [0x22u8; KEY_LEN];
+        let password = b"correct horse battery staple";
+
+        // Same master key + password -> same fingerprint every time (needed
+        // for cache lookups to hit at all).
+        assert_eq!(
+            hibp_cache_fingerprint(password, &key_a),
+            hibp_cache_fingerprint(password, &key_a)
+        );
+
+        // Different master key (i.e. after a rotation) -> different
+        // fingerprint, which is what makes the old cache entries unmatchable.
+        assert_ne!(
+            hibp_cache_fingerprint(password, &key_a),
+            hibp_cache_fingerprint(password, &key_b)
+        );
+    }
 }

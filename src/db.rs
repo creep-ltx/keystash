@@ -941,7 +941,6 @@ pub fn migrate_legacy_vault(
             .map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
-    let hibp_checks = get_all_hibp_checks(&old_conn)?;
     old_conn.close().map_err(|(_, e)| e.to_string())?;
 
     // 3. Create the new SQLCipher-encrypted vault at a temp path alongside the old
@@ -992,14 +991,13 @@ pub fn migrate_legacy_vault(
             )
             .map_err(|e| e.to_string())?;
     }
-    for (hash, count) in &hibp_checks {
-        new_conn
-            .execute(
-                "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
-                params![hash, count.map(|c| c as i64)],
-            )
-            .map_err(|e| e.to_string())?;
-    }
+    // The HIBP cache is deliberately *not* carried over here: its lookup key
+    // is HMAC'd with a key derived from the master key (see
+    // crypto::hibp_cache_fingerprint), so a fresh salt/master key -- exactly
+    // what this migration generates -- makes every existing cache entry
+    // permanently unmatchable anyway. Leaving hibp_checks empty in the new
+    // vault is the correct outcome, not a bug: entries get re-populated the
+    // next time each password is checked.
     // Force everything into the main file before it gets renamed -- only
     // tmp_path itself moves, never a -wal sidecar -- and confirm the salt
     // actually landed in the header before touching the live file.
@@ -1272,8 +1270,14 @@ pub fn change_master_password(
     let new_sqlcipher_key = crypto::derive_sqlcipher_key(&new_key);
 
     // 2. Read everything that needs to carry over from the still-untouched
-    //    live vault: secrets (to be re-encrypted below), tombstones and the
-    //    HIBP cache (copied verbatim -- neither is field-level encrypted).
+    //    live vault: secrets (to be re-encrypted below) and tombstones. The
+    //    HIBP cache deliberately does NOT carry over -- its lookup key is
+    //    HMAC'd with a key derived from the master key (see
+    //    crypto::hibp_cache_fingerprint), so rotating to `new_key` above
+    //    makes every existing cache entry permanently unmatchable. Starting
+    //    the rotated vault with an empty cache is the correct outcome, not
+    //    a bug: entries get re-populated the next time each password is
+    //    checked.
     let secrets = get_secrets(conn)?;
     let tombstones: Vec<(String, String, String, Option<String>, String)> = {
         let mut stmt = conn
@@ -1284,7 +1288,6 @@ pub fn change_master_password(
             .map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
-    let hibp_checks = get_all_hibp_checks(conn)?;
 
     // 3. Decrypt and re-encrypt every secret in memory, fully validated before
     //    any file is touched. sync_uuid is carried over unchanged -- rotating
@@ -1335,14 +1338,6 @@ pub fn change_master_password(
             .execute(
                 "INSERT OR REPLACE INTO deleted_secrets (title, category, username, sync_uuid, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![title, category, username, sync_uuid, deleted_at],
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    for (hash, count) in &hibp_checks {
-        new_conn
-            .execute(
-                "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
-                params![hash, count.map(|c| c as i64)],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -1534,6 +1529,33 @@ mod sqlcipher_tests {
         assert_ne!(&rotated_header[..16], header_before.as_slice(), "rotation must change the header salt");
         assert_ne!(&rotated_header[..16], SQLITE_PLAINTEXT_MAGIC.as_slice());
         assert!(!db_path.with_file_name("vault.salt").exists());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn change_master_password_invalidates_hibp_cache() {
+        let db_path = temp_db_path("rekey-hibp");
+
+        let (conn, old_key) = create_vault(&db_path, "old-password-123").unwrap();
+        add_secret(&conn, "Site", "Cat", "user", "", "hunter2", None, &old_key).unwrap();
+        let old_fingerprint = crypto::hibp_cache_fingerprint(b"hunter2", &old_key);
+        save_hibp_check(&conn, &old_fingerprint, Some(3)).unwrap();
+        assert_eq!(get_all_hibp_checks(&conn).unwrap().len(), 1);
+
+        let new_key = change_master_password(&conn, &db_path, &old_key, "new-password-456").unwrap();
+        drop(conn);
+
+        // The old cache entry must not survive rotation: its lookup key was
+        // HMAC'd with the old master key, so keeping it around would be
+        // silently unmatchable dead weight at best -- dropping it is correct.
+        let (conn2, _) = open_vault(&db_path, "new-password-456").unwrap();
+        assert!(get_all_hibp_checks(&conn2).unwrap().is_empty());
+
+        // And the new fingerprint for the same password differs from the old
+        // one, confirming the cache key really did change with rotation.
+        let new_fingerprint = crypto::hibp_cache_fingerprint(b"hunter2", &new_key);
+        assert_ne!(old_fingerprint, new_fingerprint);
 
         cleanup(&db_path);
     }

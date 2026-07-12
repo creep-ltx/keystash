@@ -788,6 +788,7 @@ dependencies = [
  "crossterm",
  "csv",
  "hkdf",
+ "hmac",
  "rand",
  "ratatui",
  "rpassword",

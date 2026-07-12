@@ -631,7 +631,7 @@ fn main() {
                 })
                 .collect();
 
-            let mut report = audit::audit_passwords(&mut plaintext_records);
+            let mut report = audit::audit_passwords(&mut plaintext_records, &key);
 
             // ── Optional HIBP check ──
             if run_hibp {
