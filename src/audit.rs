@@ -1,4 +1,4 @@
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // ─────────────────────────────────────────────
 //  Types
@@ -177,7 +177,7 @@ fn check_strength(password: &str) -> (Severity, Vec<String>, u8) {
     let has_lower  = password.chars().any(|c| c.is_lowercase());
     let has_digit  = password.chars().any(|c| c.is_ascii_digit());
     let has_symbol = password.chars().any(|c| !c.is_alphanumeric());
-    let lower_pw   = password.to_lowercase();
+    let lower_pw   = Zeroizing::new(password.to_lowercase());
     let is_common  = COMMON_WEAK.contains(&lower_pw.as_str());
 
     // Empty / blank
@@ -279,8 +279,27 @@ pub fn check_hibp(password: &str) -> Result<u64, String> {
 
     let url = format!("https://api.pwnedpasswords.com/range/{}", prefix);
 
-    let response = ureq::get(&url)
+    // ureq's `native-tls` feature (see Cargo.toml -- reuses the OpenSSL
+    // already vendored for SQLCipher instead of statically linking a second,
+    // separate rustls/ring/webpki-roots TLS stack for this one HTTPS call)
+    // is deliberately never auto-selected by the ureq::get() shortcut, per
+    // its own docs -- it has to be wired up explicitly via an Agent.
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(std::sync::Arc::new(
+            ureq::native_tls::TlsConnector::new().map_err(|e| format!("TLS init failed: {}", e))?,
+        ))
+        .build();
+
+    // ureq's default agent has no timeout at all, so a stalled response
+    // (dead connection, misbehaving proxy) could hang the calling thread
+    // indefinitely -- including the abortable background scan, whose abort
+    // flag is only checked *between* requests. `Add-Padding` asks the API
+    // to pad response sizes, blunting traffic analysis of which bucket
+    // (and therefore roughly which password) was queried.
+    let response = agent.get(&url)
         .set("User-Agent", "keystash-password-manager")
+        .set("Add-Padding", "true")
+        .timeout(std::time::Duration::from_secs(10))
         .call()
         .map_err(|e| format!("HIBP request failed: {}", e))?;
 
@@ -361,9 +380,35 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
     }
 
+    // msg holds the padded plaintext password bytes -- wipe it rather than
+    // letting it drop intact in already-freed heap memory.
+    msg.zeroize();
+
     let mut out = [0u8; 20];
     for (i, v) in h.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&v.0.to_be_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hits the real HIBP API -- excluded from the normal `cargo test` run
+    /// (sandboxes/CI may have no network) and run explicitly with
+    /// `cargo test -- --ignored`. Exists specifically to catch a TLS backend
+    /// regression: after switching ureq off rustls onto native-tls (to reuse
+    /// the OpenSSL already vendored for SQLCipher instead of statically
+    /// linking a second crypto/TLS stack), a real HTTPS handshake is the only
+    /// way to confirm the vendored OpenSSL's default CA trust store is
+    /// actually being found at runtime, not just that it compiles.
+    #[test]
+    #[ignore]
+    fn check_hibp_reaches_the_real_api_over_tls() {
+        let result = check_hibp("password");
+        assert!(result.is_ok(), "check_hibp against the real API failed: {:?}", result.err());
+        // "password" is one of the most breached passwords ever recorded.
+        assert!(result.unwrap() > 0);
+    }
 }
