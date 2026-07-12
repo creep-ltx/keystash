@@ -2,6 +2,8 @@
 
 `KeyStash` is a lightweight, secure, and completely offline Terminal User Interface (TUI) secret and password manager written in Rust. It stores credentials locally in a SQLCipher-encrypted SQLite database (the entire file, not just individual fields), additionally encrypts `password`/`notes` with XChaCha20-Poly1305 as a second, independent layer, derives encryption keys with Argon2id, and supports unencrypted Bitwarden JSON exports.
 
+Built with AI-assisted development, I handle the auditing, testing, and editorial judgment.
+
 ---
 
 ## 🛠️ Features
@@ -72,6 +74,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[H]`** | Check all credentials in vault on HaveIBeenPwned (runs in background) |
 | **`[D]`** | Open duplicate credential detector and interactive resolver |
 | **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
+| **`[m]`** | Change master password (key rotation) |
 | **`[i]`** | Import unencrypted credentials from backups |
 | **`[x]`** | Export credentials (all or selected) to CSV |
 | **`[?]`** | Open Help dialog |
@@ -252,3 +255,4 @@ KeyStash relies exclusively on safe and audited Rust libraries:
 - `arboard` for native Wayland and X11 clipboard integration.
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.
+- `ureq` for the HaveIBeenPwned breach-check HTTP requests.
