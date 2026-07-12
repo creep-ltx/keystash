@@ -101,7 +101,7 @@ Copy website URL to clipboard (clears automatically in configured delay, default
 Open the Change Master Password form overlay.
 .TP
 .B s
-Force a manual sync with the configured Git remote.
+Force a manual sync with the configured Git remote. Runs the same conflict detection as the automatic post-unlock sync, and works even when the Auto Sync setting is off.
 .TP
 .B i
 Open the Import modal popup to import credentials from unencrypted backups.
@@ -135,6 +135,8 @@ Each credential carries one or more comma-separated tags (e.g. "work, email"). T
 If the config folder (~/.config/keystash) is initialized as a Git repository, keystash will automatically synchronize and merge database updates across your machines.
 .PP
 The settings screen's Auto Sync toggle controls only the automatic sync actions (startup fetch, post-unlock/post-import merge, exit-time push); with it off, the manual [s] key and "keystash sync" still work on demand. The \-\-no\-sync flag is stronger and disables all sync, manual included, for that session. The outcome of every background sync is reported in the TUI: success in the status bar, failures (including a refused push after a master-password rotation performed elsewhere) in a dialog with recovery instructions.
+.PP
+Syncs are cheap when nothing changed: after the fetch, if the remote's commit equals the local one and the vault file is untouched, the sync ends there -- no merge work, no push -- and quitting a session that modified nothing skips the exit-time sync entirely. The .gitignore written in the setup steps below is created automatically on the first sync if missing (an existing customized one is never touched).
 .PP
 .B First-time Setup (Device A):
 .nf

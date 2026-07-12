@@ -79,7 +79,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[D]`** | Open duplicate credential detector and interactive resolver |
 | **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
 | **`[m]`** | Change master password (key rotation) |
-| **`[s]`** | Force a manual sync with the Git remote |
+| **`[s]`** | Force a manual sync with the Git remote (runs the same conflict detection as the automatic post-unlock sync; works even with Auto Sync off) |
 | **`[i]`** | Import unencrypted credentials from backups |
 | **`[x]`** | Export credentials (all or selected) to CSV |
 | **`[?]`** | Open Help dialog |
@@ -210,7 +210,7 @@ git commit -m "Initial vault backup"
 git push -u origin main
 ```
 > [!NOTE]
-> The Argon2 salt travels embedded inside `vault.db` itself (its first 16 bytes — not secret on its own, it only becomes meaningful combined with your master password), so the one database file is all that needs to sync. Repos created before v0.3.6 also track a `vault.salt` sidecar; KeyStash removes it from the repo automatically on the first sync after all your devices have converted.
+> The Argon2 salt travels embedded inside `vault.db` itself (its first 16 bytes — not secret on its own, it only becomes meaningful combined with your master password), so the one database file is all that needs to sync. Repos created before v0.3.6 also track a `vault.salt` sidecar; KeyStash removes it from the repo automatically on the first sync after all your devices have converted. The `.gitignore` step is belt-and-braces: since v0.4.2, KeyStash writes that exact two-line file automatically on its first sync if it's missing (an existing customized one is never touched).
 
 #### **Device B (Adding a New/Secondary Device)**
 > [!WARNING]
@@ -243,7 +243,7 @@ Changing the master password re-encrypts the whole vault under a fresh salt, so 
 3. Rotate on one device (`keystash change-password` or `[m]` in the TUI). It pushes the rotated vault to the remote automatically.
 4. On each other device, run `keystash sync`. It will detect the rotation and refuse to push, printing the exact recovery steps: export any local changes, delete the local `vault.db`, sync again to restore the rotated vault, and unlock with the new password.
 
-If a stale device ever syncs before you get to it, nothing is lost: the rotated remote is left untouched and that device keeps working locally until you walk it through step 4.
+If a stale device ever syncs before you get to it, nothing is lost: the rotated remote is left untouched and that device keeps working locally until you walk it through step 4. The reverse race is handled too — if another device pushes an ordinary edit *before* your just-rotated device syncs, the rotating device refuses to push and its recovery steps correctly identify that the rotation was local (restore the remote, unlock with the **old** password, re-import, then redo the rotation), rather than telling you to delete your freshly rotated vault.
 
 ### 2. How it operates
 * **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to fetch (but not yet merge) remote changes concurrent with displaying the Master Password lock screen. The database itself is encrypted, so the actual logical merge needs the key and runs immediately after you unlock, before the dashboard appears.

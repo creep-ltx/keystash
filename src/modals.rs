@@ -363,7 +363,7 @@ pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(Span::styled("Git Sync:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
             Span::styled("  [s]           ", Style::default().fg(Color::Yellow)),
-            Span::styled("Force manual sync with Git remote", Style::default().fg(Color::White)),
+            Span::styled("Force manual sync (detects conflicts; works with Auto Sync off)", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
         Line::from(Span::styled("Other:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
