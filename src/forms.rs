@@ -17,6 +17,44 @@ mod form_integration_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// Serializes the tests in this module: they steer `get_db_path` via the
+    /// KEYSTASH_CONFIG_DIR env var, and env vars are process-wide state --
+    /// two tests setting it to different directories concurrently would race
+    /// (the exact reason these tests used to be #[ignore]d back when they
+    /// overrode HOME, which additionally raced every *other* test). Nothing
+    /// outside this module reads the variable, so serializing just these
+    /// against each other is sufficient to run them in the default parallel
+    /// suite. `unwrap_or_else(into_inner)` keeps a panicked (poisoned) test
+    /// from cascading into the other one failing on the lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points KEYSTASH_CONFIG_DIR at a fresh per-test directory (removing it
+    /// again on drop, so no other test can accidentally inherit it) and
+    /// returns the guard keeping other tests in this module out.
+    struct ConfigDirGuard {
+        dir: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn isolated_config_dir(name: &str) -> ConfigDirGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("keystash_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY (edition 2024): set_var is process-global; ENV_LOCK above
+        // guarantees no concurrent reader/writer of this variable exists
+        // while the guard is alive.
+        unsafe { std::env::set_var("KEYSTASH_CONFIG_DIR", &dir); }
+        ConfigDirGuard { dir, _lock: lock }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("KEYSTASH_CONFIG_DIR"); }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     fn render_text(app: &TuiApp) -> String {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -32,22 +70,11 @@ mod form_integration_tests {
         out
     }
 
-    // Excluded from the normal `cargo test` run and run explicitly with
-    // `cargo test -- --ignored`: it overrides the process-wide HOME env var
-    // (via TuiApp::new, which reads it internally with no way to inject a
-    // test path), which would race against any other test reading it if run
-    // concurrently as part of the default parallel suite. Isolated to a
-    // throwaway temp dir, so it never touches a real vault.
     #[test]
-    #[ignore]
     fn form_reuse_and_strength_reflect_the_cache_not_live_decrypt() {
-        let tmp = std::env::temp_dir().join(format!("keystash_form_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp); }
+        let guard = isolated_config_dir("form_test");
 
-        let db_path = tmp.join(".config/keystash/vault.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let db_path = crate::get_db_path();
         let (conn, key) = db::create_vault(&db_path, "master-pw").unwrap();
         db::add_secret(&conn, "One", "Cat", "u1", "", "hunter2", None, &key).unwrap();
         db::add_secret(&conn, "Two", "Cat", "u2", "", "hunter2", None, &key).unwrap();
@@ -87,17 +114,12 @@ mod form_integration_tests {
             "a password used by no other entry must not show a reuse warning, got:\n{rendered2}"
         );
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        drop(guard);
     }
 
-    // Same HOME-isolation rationale as the test above.
     #[test]
-    #[ignore]
     fn settings_numeric_field_replaces_stale_value_on_first_keystroke() {
-        let tmp = std::env::temp_dir().join(format!("keystash_settings_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp); }
+        let guard = isolated_config_dir("settings_test");
 
         let mut app = TuiApp::new(true);
 
@@ -133,7 +155,7 @@ mod form_integration_tests {
         handle_settings_input(&mut app, KeyCode::Backspace);
         assert_eq!(app.settings_clipboard_clear, "", "Backspace on a fresh field clears it entirely, not just the last digit");
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        drop(guard);
     }
 }
 
@@ -356,6 +378,16 @@ pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
 }
 
 
+/// Delegates scoring to audit::check_strength -- the same entropy-based
+/// scorer the CLI `audit` command and the dashboard's Security Audit panel
+/// use -- instead of an independent, older additive-points scheme that used
+/// to live here. The two used to disagree: a long random lowercase
+/// passphrase could show up "Weak" while being typed into this form and
+/// "Good" moments later in the audit report for that exact same password --
+/// precisely the mis-scoring entropy-based scoring was introduced to fix in
+/// the first place (see check_strength's own doc comment); this indicator
+/// just hadn't been switched over when that fix landed. Bar/color/label now
+/// match the Detail View pane's Security Audit summary exactly.
 fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
     if password.is_empty() {
         return (
@@ -505,8 +537,8 @@ pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
         .and_then(|fp| app.form_hibp_cache.get(fp))
         .copied()
         .flatten();
-    if let Some(hibp_count) = hibp_lookup {
-        if hibp_count > 0 {
+    if let Some(hibp_count) = hibp_lookup
+        && hibp_count > 0 {
             if has_warnings {
                 warning_spans.push(Span::raw(" | "));
             }
@@ -516,7 +548,6 @@ pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
             ));
             has_warnings = true;
         }
-    }
 
     if !has_warnings {
         if app.form_password.is_empty() {
@@ -745,7 +776,7 @@ pub(crate) fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         };
         Line::from(vec![
             Span::styled(format!("  [{key}] "), Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{icon}"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(icon.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {label}"), Style::default().fg(Color::White)),
         ])
     };
@@ -782,18 +813,8 @@ pub(crate) fn draw_generator_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 // ─────────────────────────────────────────────
-//  Deduplication Screen
+//  Settings Screen
 // ─────────────────────────────────────────────
-
-/// Re-stamps a record's `updated_at` to now. Must be called *after* deleting
-/// its duplicates, not before: each duplicate's tombstone carries that
-/// duplicate's own sync_uuid, so the uuid-keyed merge can never mistake one
-/// for the kept record -- but the legacy fallback merge (against a remote
-/// still on the pre-sync_uuid format) matches tombstones by the shared
-/// (title, category, username) triple, and if the kept record's timestamp
-/// predates a duplicate's tombstone there, that merge treats the kept record
-/// as deleted and destroys it on the next sync -- silently losing the entry
-/// the user just chose to keep.
 
 pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
     match key {
@@ -835,8 +856,8 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
                         app.settings_gen_length.push(c);
                     }
                 }
-                2 | 4 | 5 | 6 | 7 => {
-                    if c == ' ' {
+                2 | 4 | 5 | 6 | 7
+                    if c == ' ' => {
                         match app.active_settings_field {
                             2 => app.settings_auto_sync = !app.settings_auto_sync,
                             4 => app.settings_gen_lowercase = !app.settings_gen_lowercase,
@@ -846,7 +867,6 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
                             _ => {}
                         }
                     }
-                }
                 _ => {}
             }
         }
@@ -903,7 +923,6 @@ pub(crate) fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
 /// (0<->1, 2<->3, ...); Tab/Shift+Tab are unchanged from before the grid
 /// existed -- a plain linear cycle through all 8, independent of the grid
 /// shape, since that's the "just cycle through" behavior already relied on.
-
 fn settings_field_step(field: usize, key: KeyCode) -> usize {
     match key {
         KeyCode::Up => (field + 6) % 8,
@@ -925,7 +944,6 @@ const SETTINGS_GRID_ROWS: usize = 4;
 /// row is always among the visible ones. Pure function of height and the
 /// active field, not app state, so there's nothing to keep in sync -- the
 /// scroll position just falls out of "what's focused" on every frame.
-
 fn settings_grid_scroll(area_height: u16, active_settings_field: usize) -> (usize, usize) {
     const ROW_HEIGHT: u16 = 3;
     const RESERVED_FOR_HINTS: u16 = 3;

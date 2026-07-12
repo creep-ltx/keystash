@@ -70,9 +70,9 @@ pub(crate) enum Screen {
     ExportTypeDialog,
     ExportDialog,
     GeneratorDialog,
-    DeduplicateScreen,
-    SettingsScreen,
-    SyncConflictScreen,
+    Deduplicate,
+    Settings,
+    SyncConflict,
 }
 
 
@@ -468,8 +468,8 @@ impl TuiApp {
 
     pub(crate) fn refresh_secrets(&mut self) {
 
-        if let Some(key) = self.key.clone() {
-            if let Ok(records) = db::get_secrets(&self.conn) {
+        if let Some(key) = self.key.clone()
+            && let Ok(records) = db::get_secrets(&self.conn) {
                 self.secrets = records;
                 
                 // Build the sidebar tag list: each record's stored tags
@@ -515,7 +515,6 @@ impl TuiApp {
 
                 self.audit_report = Some(report);
             }
-        }
     }
 
     /// Populates form_reuse_fingerprints and form_hibp_cache once, when the
@@ -532,13 +531,12 @@ impl TuiApp {
             if Some(r.id) == self.edit_id {
                 continue;
             }
-            if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, &key) {
-                if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+            if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, &key)
+                && let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
                     let fp = crate::crypto::hibp_cache_fingerprint(pw.as_bytes(), &key);
                     pw.zeroize();
                     *self.form_reuse_fingerprints.entry(fp).or_insert(0) += 1;
                 }
-            }
         }
     }
 
@@ -560,12 +558,11 @@ impl TuiApp {
         let mut query_chars = query_lower.chars().peekable();
         let mut match_indices = Vec::new();
         for (i, c) in target_lower.chars().enumerate() {
-            if let Some(&qc) = query_chars.peek() {
-                if c == qc {
+            if let Some(&qc) = query_chars.peek()
+                && c == qc {
                     query_chars.next();
                     match_indices.push(i);
                 }
-            }
         }
 
         if query_chars.peek().is_none() {
@@ -613,7 +610,7 @@ impl TuiApp {
                 }
             }
 
-            scored_secrets.sort_by(|a, b| b.0.cmp(&a.0));
+            scored_secrets.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             self.filtered_secrets = scored_secrets.into_iter().map(|(_, r)| r).collect();
         }
 
@@ -771,17 +768,13 @@ impl TuiApp {
             if let Some(prev) = previous {
                 let _ = prev.join();
             }
-            match crate::sync::detect_sync_conflicts(&db_path, &key) {
-                Ok(conflicts) => {
-                    if !conflicts.is_empty() {
-                        // The conflict screen is the outcome here; no
-                        // separate status message needed.
-                        *detected_clone.lock().unwrap() = Some(conflicts);
-                        return;
-                    }
+            if let Ok(conflicts) = crate::sync::detect_sync_conflicts(&db_path, &key)
+                && !conflicts.is_empty() {
+                    // The conflict screen is the outcome here; no
+                    // separate status message needed.
+                    *detected_clone.lock().unwrap() = Some(conflicts);
+                    return;
                 }
-                Err(_) => {}
-            }
             let result = crate::sync::git_sync_vault(&db_path, &key);
             if let Ok(mut slot) = result_clone.lock() {
                 *slot = Some(result);
@@ -865,11 +858,10 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     // both doing `git reset`/`add`/`commit`/`push` -- is exactly what corrupted a
     // real vault back to its pre-migration format with no error ever surfacing,
     // when the app was unlocked and quit again quickly.
-    if let Ok(mut slot) = app.pending_sync_thread.lock() {
-        if let Some(handle) = slot.take() {
+    if let Ok(mut slot) = app.pending_sync_thread.lock()
+        && let Some(handle) = slot.take() {
             let _ = handle.join();
         }
-    }
 
     // Auto-sync updates on exit if Git is configured and sync is not disabled.
     // Only possible if the vault was actually unlocked at some point during this
@@ -877,8 +869,8 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     // SQLCipher-encrypted database, and there's nothing to merge otherwise.
     // Gated on Auto Sync like every automatic trigger (a manual [s] sync
     // that's still in flight was already joined above regardless).
-    if !app.no_sync && app.config.auto_sync {
-        if let Some(key) = app.key.clone() {
+    if !app.no_sync && app.config.auto_sync
+        && let Some(key) = app.key.clone() {
             let db_path = crate::get_db_path();
             if crate::sync::is_git_configured(&db_path) {
                 println!("Syncing vault updates on exit...");
@@ -888,7 +880,6 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
                 }
             }
         }
-    }
 
     Ok(())
 }
@@ -899,13 +890,12 @@ fn run_loop<B: ratatui::backend::Backend>(
     app: &mut TuiApp,
 ) -> io::Result<()> {
     loop {
-        if let Ok(mut detected_lock) = app.sync_conflicts_detected.lock() {
-            if let Some(conflicts) = detected_lock.take() {
+        if let Ok(mut detected_lock) = app.sync_conflicts_detected.lock()
+            && let Some(conflicts) = detected_lock.take() {
                 app.sync_conflicts = conflicts;
                 app.selected_conflict_idx = 0;
-                app.screen = Screen::SyncConflictScreen;
+                app.screen = Screen::SyncConflict;
             }
-        }
 
         // Surface the outcome of a finished background sync. Consumed only
         // on the Dashboard: an error dialog popping over a half-typed form
@@ -939,11 +929,10 @@ fn run_loop<B: ratatui::backend::Backend>(
         app.clear_clipboard_if_expired();
         
         // Check for idle timeout auto-lock
-        if app.key.is_some() && app.screen != Screen::Lock && app.screen != Screen::Setup {
-            if app.last_activity.elapsed() >= Duration::from_secs(app.config.idle_timeout_seconds) {
+        if app.key.is_some() && app.screen != Screen::Lock && app.screen != Screen::Setup
+            && app.last_activity.elapsed() >= Duration::from_secs(app.config.idle_timeout_seconds) {
                 app.lock_vault();
             }
-        }
         
         terminal.draw(|f| draw_ui(f, app))?;
 
@@ -951,8 +940,8 @@ fn run_loop<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(250))? {
             let ev = event::read()?;
             app.reset_activity();
-            if let Event::Key(key) = ev {
-                if key.kind == event::KeyEventKind::Press {
+            if let Event::Key(key) = ev
+                && key.kind == event::KeyEventKind::Press {
                     let checking_active = app.hibp_progress.lock().map(|p| p.is_some()).unwrap_or(false);
                     if checking_active {
                         if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
@@ -990,9 +979,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                         Screen::ExportTypeDialog => handle_export_type_input(app, key.code),
                         Screen::ExportDialog => handle_export_input(app, key.code),
                         Screen::GeneratorDialog => handle_generator_input(app, key.code),
-                        Screen::DeduplicateScreen => handle_deduplicate_input(app, key.code),
-                        Screen::SettingsScreen => handle_settings_input(app, key.code),
-                        Screen::SyncConflictScreen => handle_sync_conflict_input(app, key.code),
+                        Screen::Deduplicate => handle_deduplicate_input(app, key.code),
+                        Screen::Settings => handle_settings_input(app, key.code),
+                        Screen::SyncConflict => handle_sync_conflict_input(app, key.code),
                         Screen::ErrorDialog => {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                                 app.screen = Screen::Dashboard;
@@ -1000,7 +989,6 @@ fn run_loop<B: ratatui::backend::Backend>(
                         }
                     }
                 }
-            }
         }
     }
 }

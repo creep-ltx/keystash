@@ -123,13 +123,11 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         .output();
 
     let mut has_remote = false;
-    if let Ok(output) = show_output {
-        if output.status.success() && !output.stdout.is_empty() {
-            if fs::write(&remote_db_path, output.stdout).is_ok() {
+    if let Ok(output) = show_output
+        && output.status.success() && !output.stdout.is_empty()
+            && fs::write(&remote_db_path, output.stdout).is_ok() {
                 has_remote = true;
             }
-        }
-    }
 
     // 2. Perform SQLite logical merge if remote database was successfully extracted
     if has_remote {
@@ -145,15 +143,14 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             // repos already on the current format this fetch finds nothing
             // and is a no-op.
             let salt_path = db_ref.with_file_name("vault.salt");
-            if !salt_path.exists() {
-                if let Ok(salt_output) = git_command(dir)
+            if !salt_path.exists()
+                && let Ok(salt_output) = git_command(dir)
                     .arg("show")
                     .arg("origin/main:vault.salt")
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .output()
-                {
-                    if salt_output.status.success() && !salt_output.stdout.is_empty() {
+                    && salt_output.status.success() && !salt_output.stdout.is_empty() {
                         let _ = fs::write(&salt_path, salt_output.stdout);
                         #[cfg(unix)]
                         {
@@ -161,8 +158,6 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                             let _ = fs::set_permissions(&salt_path, fs::Permissions::from_mode(0o600));
                         }
                     }
-                }
-            }
 
             return Ok("Sync complete: Local vault restored from remote repository!".to_string());
         }
@@ -629,13 +624,11 @@ pub fn detect_sync_conflicts(
         .output();
 
     let mut has_remote = false;
-    if let Ok(output) = show_remote {
-        if output.status.success() && !output.stdout.is_empty() {
-            if fs::write(&remote_db_path, output.stdout).is_ok() {
+    if let Ok(output) = show_remote
+        && output.status.success() && !output.stdout.is_empty()
+            && fs::write(&remote_db_path, output.stdout).is_ok() {
                 has_remote = true;
             }
-        }
-    }
 
     if !has_remote {
         return Ok(Vec::new());
@@ -648,23 +641,20 @@ pub fn detect_sync_conflicts(
         .output();
 
     let mut has_base = false;
-    if let Ok(output) = merge_base_output {
-        if output.status.success() {
+    if let Ok(output) = merge_base_output
+        && output.status.success() {
             let ancestor_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let show_base = git_command(dir)
                 .arg("show")
                 .arg(format!("{}:vault.db", ancestor_hash))
                 .output();
 
-            if let Ok(base_out) = show_base {
-                if base_out.status.success() && !base_out.stdout.is_empty() {
-                    if fs::write(&base_db_path, base_out.stdout).is_ok() {
+            if let Ok(base_out) = show_base
+                && base_out.status.success() && !base_out.stdout.is_empty()
+                    && fs::write(&base_db_path, base_out.stdout).is_ok() {
                         has_base = true;
                     }
-                }
-            }
         }
-    }
 
     let sqlcipher_key = crate::crypto::derive_sqlcipher_key(key);
     let local_conn = crate::db::open_keyed_connection(db_path, &sqlcipher_key).map_err(|e| e.to_string())?;
@@ -833,7 +823,7 @@ pub fn detect_sync_conflicts(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
 
@@ -855,14 +845,14 @@ mod tests {
         dir
     }
 
-    fn init_bare_origin(root: &PathBuf) -> PathBuf {
+    fn init_bare_origin(root: &Path) -> PathBuf {
         let origin = root.join("origin.git");
         let status = Command::new("git").arg("init").arg("--bare").arg(&origin).status().unwrap();
         assert!(status.success());
         origin
     }
 
-    fn init_device(root: &PathBuf, name: &str, origin: &PathBuf) -> Device {
+    fn init_device(root: &Path, name: &str, origin: &Path) -> Device {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -1078,8 +1068,8 @@ mod tests {
             .iter()
             .map(|s| crate::crypto::decrypt(&s.encrypted_password, &key_a).unwrap().to_vec())
             .collect();
-        assert!(decrypted_passwords.contains(&b"dup-v1-from-A".to_vec()));
-        assert!(decrypted_passwords.contains(&b"dup-v2-from-B".to_vec()));
+        assert!(decrypted_passwords.contains(b"dup-v1-from-A".as_slice()));
+        assert!(decrypted_passwords.contains(b"dup-v2-from-B".as_slice()));
 
         // And their sync_uuids are genuinely distinct -- the whole point.
         assert_ne!(dup_rows[0].sync_uuid, dup_rows[1].sync_uuid);

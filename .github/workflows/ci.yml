@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The sync test harness shells out to git (bare origins, clones,
+      # fetch/push between simulated devices); runners ship git, but fail
+      # loudly here rather than obscurely mid-suite if that ever changes.
+      - name: git available
+        run: git --version
+      # The one #[ignore]d test (check_hibp_reaches_the_real_api_over_tls)
+      # needs live network to api.pwnedpasswords.com and stays excluded by
+      # design -- run it manually with `cargo test -- --ignored` after any
+      # TLS-backend change.
+      - name: cargo test
+        run: cargo test --all-targets
+
+  lint:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # -D warnings: the tree was brought to zero clippy warnings when this
+      # workflow landed, precisely so a single new warning fails the build
+      # instead of drowning in an ambient count nobody reads. Deliberate
+      # exceptions live as narrow, commented #[allow]s at the code they
+      # apply to -- never as global lint switches here.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release

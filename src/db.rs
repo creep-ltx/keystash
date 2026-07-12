@@ -1068,6 +1068,13 @@ pub fn migrate_legacy_vault(
     open_vault(db_path, master_password)
 }
 
+// The three record-writing functions below all exceed clippy's argument
+// threshold. The honest fix is a shared params struct (which would also
+// remove the swap-two-&str-fields-silently hazard of long positional
+// lists) -- planned as its own refactor commit touching every call site,
+// not smuggled into unrelated work. Until then the lint is acknowledged
+// per-function, not disabled globally.
+#[allow(clippy::too_many_arguments)]
 pub fn add_secret(
     conn: &Connection,
     title: &str,
@@ -1094,6 +1101,7 @@ pub fn add_secret(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // see the comment above add_secret
 pub fn update_secret(
     conn: &Connection,
     id: i64,
@@ -1139,6 +1147,7 @@ pub fn now_timestamp(conn: &Connection) -> Result<String, String> {
 /// the sync_uuid identity those are mutable payload like url/notes, so
 /// resolving "keep remote" must be able to apply a remote-side rename, not
 /// just remote's password/notes.
+#[allow(clippy::too_many_arguments)] // see the comment above add_secret
 pub fn update_secret_raw(
     conn: &Connection,
     id: i64,
@@ -1501,10 +1510,8 @@ pub fn get_all_hibp_checks(conn: &Connection) -> Result<std::collections::HashMa
     }).map_err(|e| e.to_string())?;
 
     let mut map = std::collections::HashMap::new();
-    for row in rows {
-        if let Ok((hash, count)) = row {
-            map.insert(hash, count);
-        }
+    for (hash, count) in rows.flatten() {
+        map.insert(hash, count);
     }
     Ok(map)
 }

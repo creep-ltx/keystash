@@ -189,6 +189,9 @@ Deleting a credential leaves a tombstone record behind so the deletion propagate
 The local SQLite database storing metadata, validation tokens, and your encrypted secrets.
 .SH ENVIRONMENT
 .TP
+.B KEYSTASH_CONFIG_DIR
+If set, names the directory vault.db and config.json live in directly (no keystash/ subdirectory is appended), overriding XDG_CONFIG_HOME and HOME entirely. Primarily an isolation seam for tests and unusual setups.
+.TP
 .B XDG_CONFIG_HOME
 If set, used to locate the config directory as $XDG_CONFIG_HOME/keystash/ instead of the default. Checked before HOME.
 .TP

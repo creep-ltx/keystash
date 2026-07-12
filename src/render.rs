@@ -117,7 +117,6 @@ pub(crate) fn handle_setup_input(app: &mut TuiApp, code: KeyCode) -> bool {
 /// (`h`) and full-vault (`H`) checks -- so a single check gets the same
 /// keyed-connection persistence, progress dialog, and abort key that
 /// previously only the full scan had.
-
 fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
     let key = match &app.key {
         Some(k) => k,
@@ -148,33 +147,29 @@ fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
                 }
 
                 let mut checked_online = false;
-                if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone) {
-                    if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, &key_clone)
+                    && let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
                         let hash_hex = crate::crypto::hibp_cache_fingerprint(pw.as_bytes(), &key_clone);
 
-                        if let Ok(checked_lock) = checked_hashes_clone.lock() {
-                            if checked_lock.contains(&hash_hex) {
+                        if let Ok(checked_lock) = checked_hashes_clone.lock()
+                            && checked_lock.contains(&hash_hex) {
                                 pw.zeroize();
-                                if let Ok(mut progress_lock) = progress_clone.lock() {
-                                    if let Some(p) = &mut *progress_lock {
+                                if let Ok(mut progress_lock) = progress_clone.lock()
+                                    && let Some(p) = &mut *progress_lock {
                                         p.0 = i + 1;
                                     }
-                                }
                                 continue;
                             }
-                        }
 
-                        if let Some(Some(count)) = cached_checks.get(&hash_hex) {
-                            if *count > 0 {
+                        if let Some(Some(count)) = cached_checks.get(&hash_hex)
+                            && *count > 0 {
                                 pw.zeroize();
-                                if let Ok(mut progress_lock) = progress_clone.lock() {
-                                    if let Some(p) = &mut *progress_lock {
+                                if let Ok(mut progress_lock) = progress_clone.lock()
+                                    && let Some(p) = &mut *progress_lock {
                                         p.0 = i + 1;
                                     }
-                                }
                                 continue;
                             }
-                        }
 
                         let result = crate::audit::check_hibp(&pw);
                         pw.zeroize();
@@ -191,13 +186,11 @@ fn spawn_hibp_scan(app: &TuiApp, records: Vec<crate::db::SecretRecord>) {
                         };
                         let _ = crate::db::save_hibp_check(&conn, &hash_hex, count);
                     }
-                }
 
-                if let Ok(mut progress_lock) = progress_clone.lock() {
-                    if let Some(p) = &mut *progress_lock {
+                if let Ok(mut progress_lock) = progress_clone.lock()
+                    && let Some(p) = &mut *progress_lock {
                         p.0 = i + 1;
                     }
-                }
 
                 if checked_online && total_checks > 1 && i + 1 < total_checks {
                     std::thread::sleep(Duration::from_millis(700));
@@ -275,11 +268,10 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
                     if let Ok(dec_pass) = crate::crypto::decrypt(&record.encrypted_password, key) {
                         app.form_password = String::from_utf8_lossy(&dec_pass).to_string();
                     }
-                    if let Some(enc_notes) = &record.encrypted_notes {
-                        if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
+                    if let Some(enc_notes) = &record.encrypted_notes
+                        && let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
                             app.form_notes = String::from_utf8_lossy(&dec_notes).to_string();
                         }
-                    }
                 }
                 app.refresh_form_audit_cache();
             }
@@ -354,7 +346,7 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             app.settings_gen_symbols = app.config.generator.use_symbols;
             app.active_settings_field = 0;
             app.settings_field_touched = false;
-            app.screen = Screen::SettingsScreen;
+            app.screen = Screen::Settings;
         }
         KeyCode::Char('s') => {
             // The help screen has advertised this key since before it was
@@ -379,7 +371,7 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
                 app.error_message = "No duplicates found based on matching username and title/URL!".to_string();
                 app.screen = Screen::ErrorDialog;
             } else {
-                app.screen = Screen::DeduplicateScreen;
+                app.screen = Screen::Deduplicate;
             }
         }
 
@@ -389,15 +381,12 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             }
         }
         KeyCode::Char('p') => {
-            if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
-                if let Some(key) = &app.key {
-                    if let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key) {
-                        if let Ok(plaintext) = String::from_utf8(dec.to_vec()) {
+            if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx)
+                && let Some(key) = &app.key
+                    && let Ok(dec) = crate::crypto::decrypt(&record.encrypted_password, key)
+                        && let Ok(plaintext) = String::from_utf8(dec.to_vec()) {
                             app.copy_to_clipboard(Zeroizing::new(plaintext), "password");
                         }
-                    }
-                }
-            }
         }
         KeyCode::Tab => {
             app.active_block = match app.active_block {
@@ -452,11 +441,10 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
                     app.apply_filter();
                 }
             }
-            ActiveBlock::Secrets => {
-                if app.selected_secret_idx > 0 {
+            ActiveBlock::Secrets
+                if app.selected_secret_idx > 0 => {
                     app.selected_secret_idx -= 1;
                 }
-            }
             _ => {}
         },
         KeyCode::Down => match app.active_block {
@@ -466,11 +454,10 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
                     app.apply_filter();
                 }
             }
-            ActiveBlock::Secrets => {
-                if app.selected_secret_idx + 1 < app.filtered_secrets.len() {
+            ActiveBlock::Secrets
+                if app.selected_secret_idx + 1 < app.filtered_secrets.len() => {
                     app.selected_secret_idx += 1;
                 }
-            }
             _ => {}
         },
         KeyCode::PageUp => match app.active_block {
@@ -521,16 +508,15 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, app: &TuiApp) {
         Screen::ExportTypeDialog => draw_export_type_dialog(f, app),
         Screen::ExportDialog => draw_export_dialog(f, app),
         Screen::GeneratorDialog => draw_generator_dialog(f, app),
-        Screen::DeduplicateScreen => draw_deduplicate_screen(f, app),
-        Screen::SettingsScreen => draw_settings_screen(f, app),
-        Screen::SyncConflictScreen => draw_sync_conflict_screen(f, app),
+        Screen::Deduplicate => draw_deduplicate_screen(f, app),
+        Screen::Settings => draw_settings_screen(f, app),
+        Screen::SyncConflict => draw_sync_conflict_screen(f, app),
     }
 
-    if let Ok(progress_lock) = app.hibp_progress.lock() {
-        if let Some((checked, total)) = *progress_lock {
+    if let Ok(progress_lock) = app.hibp_progress.lock()
+        && let Some((checked, total)) = *progress_lock {
             draw_hibp_progress_dialog(f, checked, total);
         }
-    }
 }
 
 
@@ -584,7 +570,6 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 /// in the TUI is safe to do from here (there's no key, and no vault.db this
 /// process should touch), so this just surfaces the recovery instructions and
 /// waits for the user to quit, fix it from a shell, and relaunch.
-
 fn draw_interrupted_migration_screen(f: &mut ratatui::Frame) {
     let size = f.size();
     f.render_widget(Clear, size);
@@ -611,7 +596,6 @@ pub(crate) fn handle_interrupted_migration_input(code: KeyCode) -> bool {
 
 /// Same reasoning as `draw_interrupted_migration_screen`, for an interrupted
 /// `change_master_password` run instead.
-
 fn draw_interrupted_rotation_screen(f: &mut ratatui::Frame) {
     let size = f.size();
     f.render_widget(Clear, size);
@@ -841,8 +825,8 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
 
         let mut details_text = details_text;
 
-        if let Some(report) = &app.audit_report {
-            if let Some(entry) = report.entries.iter().find(|e| e.id == record.id) {
+        if let Some(report) = &app.audit_report
+            && let Some(entry) = report.entries.iter().find(|e| e.id == record.id) {
                 let (sev_color, sev_label) = match entry.severity {
                     crate::audit::Severity::Critical => (Color::Red, "CRITICAL"),
                     crate::audit::Severity::Weak => (Color::Yellow, "WEAK"),
@@ -884,7 +868,6 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
                     }
                 }
             }
-        }
 
         let details_paragraph = Paragraph::new(details_text)
             .block(details_block)
@@ -926,17 +909,6 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
         );
     f.render_widget(status_bar, main_layout[1]);
 }
-
-/// Delegates scoring to audit::check_strength -- the same entropy-based
-/// scorer the CLI `audit` command and the dashboard's Security Audit panel
-/// use -- instead of an independent, older additive-points scheme that used
-/// to live here. The two used to disagree: a long random lowercase
-/// passphrase could show up "Weak" while being typed into this form and
-/// "Good" moments later in the audit report for that exact same password --
-/// precisely the mis-scoring entropy-based scoring was introduced to fix in
-/// the first place (see check_strength's own doc comment); this indicator
-/// just hadn't been switched over when that fix landed. Bar/color/label now
-/// match the Detail View pane's Security Audit summary exactly.
 
 pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()

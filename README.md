@@ -54,6 +54,7 @@ Your credentials database is stored offline inside your user config folder:
 * **Linux/macOS:** `~/.config/keystash/vault.db`
 * If `XDG_CONFIG_HOME` is set, KeyStash uses `$XDG_CONFIG_HOME/keystash/vault.db` instead.
 * If neither `HOME` nor `XDG_CONFIG_HOME` is set, KeyStash falls back to `./.config/keystash/vault.db` relative to the current directory, and prints a warning — the vault will only be found again if run from that same directory every time.
+* `KEYSTASH_CONFIG_DIR`, if set, overrides all of the above and names the vault's directory directly (no `keystash/` subdirectory appended) — mainly an isolation seam for tests and unusual setups.
 
 ---
 

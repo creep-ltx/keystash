@@ -594,13 +594,21 @@ pub(crate) fn draw_export_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
 }
 
 // ─────────────────────────────────────────────
-//  Password Generator Dialog
+//  Deduplication Screen
 // ─────────────────────────────────────────────
 
-
+/// Re-stamps a record's `updated_at` to now. Must be called *after* deleting
+/// its duplicates, not before: each duplicate's tombstone carries that
+/// duplicate's own sync_uuid, so the uuid-keyed merge can never mistake one
+/// for the kept record -- but the legacy fallback merge (against a remote
+/// still on the pre-sync_uuid format) matches tombstones by the shared
+/// (title, category, username) triple, and if the kept record's timestamp
+/// predates a duplicate's tombstone there, that merge treats the kept record
+/// as deleted and destroys it on the next sync -- silently losing the entry
+/// the user just chose to keep.
 fn restamp_record(conn: &rusqlite::Connection, id: i64) {
-    if let Ok(now) = crate::db::now_timestamp(conn) {
-        if let Ok(Some(r)) = crate::db::get_secret_by_id(conn, id) {
+    if let Ok(now) = crate::db::now_timestamp(conn)
+        && let Ok(Some(r)) = crate::db::get_secret_by_id(conn, id) {
             let _ = crate::db::update_secret_raw(
                 conn,
                 id,
@@ -613,7 +621,6 @@ fn restamp_record(conn: &rusqlite::Connection, id: i64) {
                 &now,
             );
         }
-    }
 }
 
 
@@ -683,18 +690,17 @@ pub(crate) fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
             let mut merged_notes: Zeroizing<String> = Zeroizing::new(String::new());
 
             if let Some(key) = &app.key {
-                if let Some(enc_notes) = &keep_record.encrypted_notes {
-                    if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
+                if let Some(enc_notes) = &keep_record.encrypted_notes
+                    && let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
                         *merged_notes = String::from_utf8_lossy(&dec_notes).to_string();
                     }
-                }
 
                 for (idx, r) in current_group.records.iter().enumerate() {
                     if idx == keep_idx {
                         continue;
                     }
-                    if let Some(enc_notes) = &r.encrypted_notes {
-                        if let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
+                    if let Some(enc_notes) = &r.encrypted_notes
+                        && let Ok(dec_notes) = crate::crypto::decrypt(enc_notes, key) {
                             let other_note = Zeroizing::new(String::from_utf8_lossy(&dec_notes).to_string());
                             if !other_note.is_empty() {
                                 if !merged_notes.is_empty() {
@@ -703,10 +709,9 @@ pub(crate) fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
                                 merged_notes.push_str(&format!("Merged from duplicate: {}", *other_note));
                             }
                         }
-                    }
                 }
                 
-                let key_bytes: &[u8; 32] = &**key;
+                let key_bytes: &[u8; 32] = key;
                 let _ = crate::db::update_secret(
                     &app.conn,
                     keep_record.id,
@@ -887,9 +892,8 @@ pub(crate) fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 
 
 // ─────────────────────────────────────────────
-//  Settings Screen
+//  HIBP Progress Dialog
 // ─────────────────────────────────────────────
-
 
 pub(crate) fn draw_hibp_progress_dialog(f: &mut ratatui::Frame, checked: usize, total: usize) {
     let size = f.size();
@@ -912,7 +916,7 @@ pub(crate) fn draw_hibp_progress_dialog(f: &mut ratatui::Frame, checked: usize, 
         ])
         .split(area);
 
-    let percentage = if total > 0 { (checked * 100) / total } else { 0 };
+    let percentage = (checked * 100).checked_div(total).unwrap_or(0);
     let width = chunks[1].width.saturating_sub(6) as usize; // account for margins
     let filled_width = (width * percentage) / 100;
     let empty_width = width.saturating_sub(filled_width);

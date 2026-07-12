@@ -119,6 +119,20 @@ fn copy_to_clipboard(text: Zeroizing<String>, label: &str) {
 }
 
 pub fn get_db_path() -> PathBuf {
+    // KEYSTASH_CONFIG_DIR overrides the entire directory resolution below:
+    // it names the directory vault.db (and config.json) live in directly --
+    // no `keystash/` subdirectory is appended. It exists so tests can give
+    // each test its own isolated vault directory without mutating the
+    // process-wide HOME (the reason two regression tests used to be
+    // #[ignore]d), and doubles as an escape hatch for unusual setups; a
+    // future --profile flag can build on this same seam.
+    if let Ok(dir) = env::var("KEYSTASH_CONFIG_DIR") {
+        let mut path = PathBuf::from(dir);
+        let _ = fs::create_dir_all(&path);
+        set_dir_permissions(&path);
+        path.push("vault.db");
+        return path;
+    }
     // XDG_CONFIG_HOME, when set, is the correct place to look first (it
     // already points at a config dir, so keystash/ is appended directly
     // instead of assuming a .config subdirectory of it). Falling back
@@ -978,7 +992,7 @@ mod tests {
 
         // Entirely multi-byte (emoji, 4 bytes each): still truncates by
         // character count, not byte count.
-        let emoji_title: String = std::iter::repeat('\u{1F511}').take(30).collect();
+        let emoji_title: String = std::iter::repeat_n('\u{1F511}', 30).collect();
         assert_eq!(truncate_chars(&emoji_title, 22).chars().count(), 22);
     }
 

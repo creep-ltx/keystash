@@ -253,13 +253,11 @@ pub fn import_bitwarden_json(
                     if let Some(p) = &login.password {
                         password = p.clone();
                     }
-                    if let Some(uris) = &login.uris {
-                        if !uris.is_empty() {
-                            if let Some(uri) = &uris[0].uri {
+                    if let Some(uris) = &login.uris
+                        && !uris.is_empty()
+                            && let Some(uri) = &uris[0].uri {
                                 url = uri.clone();
                             }
-                        }
-                    }
                 }
 
                 db::add_secret(
@@ -681,11 +679,10 @@ pub fn export_vault_csv(
     writeln!(file, "title,url,username,password,notes,category").map_err(|e| e.to_string())?;
     
     for r in secrets {
-        if let Some(ids) = filter_ids {
-            if !ids.contains(&r.id) {
+        if let Some(ids) = filter_ids
+            && !ids.contains(&r.id) {
                 continue;
             }
-        }
         
         let decrypted_pass: Zeroizing<String> = crate::crypto::decrypt(&r.encrypted_password, key)
             .map(|dec| Zeroizing::new(String::from_utf8_lossy(&dec).to_string()))

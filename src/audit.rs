@@ -73,12 +73,12 @@ const COMMON_WEAK: &[&str] = &[
 /// Passwords are zeroized inside `run_full_audit` before the function returns.
 /// `master_key` keys the HIBP cache fingerprint attached to each entry (see
 /// `AuditEntry::hibp_fingerprint`) -- the same one `hibp_checks` is keyed on.
-pub fn audit_passwords(records: &mut Vec<(i64, String, String, String, String)>, master_key: &[u8; 32]) -> AuditReport {
+pub fn audit_passwords(records: &mut [(i64, String, String, String, String)], master_key: &[u8; 32]) -> AuditReport {
     run_full_audit(records, master_key)
 }
 
 /// Internal implementation that does a single pass: hash → zeroize → report.
-fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>, master_key: &[u8; 32]) -> AuditReport {
+fn run_full_audit(records: &mut [(i64, String, String, String, String)], master_key: &[u8; 32]) -> AuditReport {
     use std::collections::HashMap;
 
     // First pass: collect HIBP cache fingerprints before zeroizing. These
@@ -111,8 +111,8 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>, mast
 
             // Mark duplicates as Critical
             let fp = fingerprints[i].as_str();
-            if let Some(group) = fp_map.get(fp) {
-                if group.len() > 1 {
+            if let Some(group) = fp_map.get(fp)
+                && group.len() > 1 {
                     issues.push(format!(
                         "Password reused across {} entries",
                         group.len()
@@ -121,7 +121,6 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>, mast
                         severity = Severity::Critical;
                     }
                 }
-            }
 
             password.zeroize();
 
@@ -309,11 +308,10 @@ pub fn check_hibp(password: &str) -> Result<u64, String> {
 
     for line in body.lines() {
         // Each line: "HASH_SUFFIX:COUNT"
-        if let Some((line_suffix, count_str)) = line.split_once(':') {
-            if line_suffix.eq_ignore_ascii_case(suffix) {
+        if let Some((line_suffix, count_str)) = line.split_once(':')
+            && line_suffix.eq_ignore_ascii_case(suffix) {
                 return Ok(count_str.trim().parse().unwrap_or(1));
             }
-        }
     }
 
     Ok(0) // not in breach list
@@ -354,6 +352,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 chunk[i * 4 + 3],
             ]));
         }
+        // Indexing, not iterators, on purpose: each element derives from
+        // four *earlier* elements of the same array, which is exactly the
+        // shape RFC 3174 specifies -- an iterator rewrite would obscure the
+        // 1:1 correspondence with the spec this implementation is checked
+        // against.
+        #[allow(clippy::needless_range_loop)]
         for i in 16..80 {
             let val = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).0;
             w[i] = Wrapping(val.rotate_left(1));
@@ -361,6 +365,9 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 
         let [mut a, mut b, mut c, mut d, mut e] = h;
 
+        // Same rationale as the loop above: `i` selects both w[i] and the
+        // round constants by range, mirroring the spec's round structure.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..80 {
             let (f, k) = match i {
                 0..=19  => ((b & c) | (!b & d), Wrapping(0x5A827999u32)),
