@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] (0.4.3)
+## [0.4.3] - 2026-07-12
 - Fix: Notes are now masked in the detail pane behind the same `[v]` toggle as the password -- they're the other field-layer-encrypted value and where recovery codes live, yet rendered in the clear unconditionally. Masked notes aren't even decrypted, so the plaintext never exists in memory until revealed.
 - Fix: The frozen-terminal seconds during unlock, vault creation, and master-password change (Argon2id at 64 MiB is deliberately slow; a password change runs up to three derivations plus a full re-encryption) now show a "Deriving key, please wait..." notice instead of reading as a hang -- the blocking work is deferred one frame so the notice actually renders first.
 - Fix: One generated-password length rule everywhere: 4-256, enforced inside `generate_password` itself. Previously the CLI accepted any `-l` (a 1-character "password" generated fine), the generator dialog stopped at 128, and Settings at 256. And `keystash generate` no longer silently persists its flags as your new defaults -- a one-off `--no-symbols` used to permanently change every future password; persisting is now opt-in via `--save`.
