@@ -76,6 +76,48 @@ pub fn is_git_configured<P: AsRef<Path>>(db_path: P) -> bool {
     }
 }
 
+/// The commit hash a ref points at, or `None` if it can't be resolved (fresh
+/// repo with no commits, remote branch that doesn't exist yet, ...).
+fn rev_parse(dir: &Path, reference: &str) -> Option<String> {
+    git_command(dir)
+        .arg("rev-parse")
+        .arg(reference)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Prunes expired tombstones and checkpoints the WAL into the main vault
+/// file. Best-effort on both counts (see the call sites for why each
+/// matters); called before anything decides what to stage or whether the
+/// on-disk file differs from the committed one -- a fresh edit through the
+/// TUI's still-open connection lives in vault.db-wal, invisible to git,
+/// until this runs.
+fn prune_and_checkpoint(db_ref: &Path, sqlcipher_key: &[u8; 32]) {
+    if let Ok(conn) = crate::db::open_keyed_connection(db_ref, sqlcipher_key) {
+        let _ = crate::db::prune_old_tombstones(&conn);
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+}
+
+/// Whether the files sync manages (vault.db, and a legacy vault.salt) differ
+/// from the committed state -- scoped so stray untracked files in the config
+/// dir can never make a sync look dirty.
+fn vault_paths_dirty(dir: &Path) -> Result<bool, String> {
+    let status_output = git_command(dir)
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--")
+        .arg("vault.db")
+        .arg("vault.salt")
+        .output()
+        .map_err(|e| format!("git status failed: {}", e))?;
+    Ok(!status_output.stdout.is_empty())
+}
+
 /// Perform a full git pull, logical SQLite database merge, auto-commit, and git push.
 ///
 /// `key` is the master key (the same one returned by `db::open_vault` et al.) --
@@ -117,6 +159,37 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         return Err("Could not reach git remote 'origin/main'. Check network or SSH configuration.".to_string());
     }
 
+    // Short-circuit: the fetch above already answered "did the remote
+    // move?" -- the commit hash is the vault's version number. If
+    // origin/main is exactly our HEAD, the remote holds nothing we haven't
+    // already merged, so the whole extract/attach/merge/reset ceremony
+    // below (and, when nothing changed locally either, the no-op push) is
+    // pure waste -- previously every no-change sync paid for all of it,
+    // twice per session (post-unlock and exit).
+    //
+    // Guarded on the local vault file existing: a missing vault.db must
+    // keep flowing into the restore-from-remote path below, never into a
+    // dirtiness check that would stage (and push!) the file's deletion.
+    //
+    // Prune+checkpoint runs *before* the dirtiness check, not just for the
+    // staging correctness documented on the helper: an edit made through
+    // the TUI's open connection seconds ago is WAL-resident, and git would
+    // otherwise report the main file unchanged -- wrongly concluding
+    // "up-to-date" and leaving the edit unpushed until some later sync.
+    let heads_equal = match (rev_parse(dir, "HEAD"), rev_parse(dir, "origin/main")) {
+        (Some(local), Some(remote)) => local == remote,
+        _ => false, // fresh repo or no remote branch yet: take the full path
+    };
+    let skip_merge = db_ref.exists() && heads_equal;
+    if skip_merge {
+        prune_and_checkpoint(db_ref, &sqlcipher_key);
+        if !vault_paths_dirty(dir)? {
+            return Ok("Sync complete: Vault is already up-to-date with remote.".to_string());
+        }
+        // Local-only changes on top of a remote we're already level with:
+        // nothing to merge, fall through directly to stage/commit/push.
+    }
+
     // Determine if we have remote commits we need to merge
     let remote_db_path = dir.join(format!("vault_remote_{}_{}.db", std::process::id(), unique_tmp_suffix()));
     let _cleanup = TempCleanup(vec![remote_db_path.clone()]);
@@ -125,16 +198,17 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     // remote couldn't be merged and local gets pushed as source of truth.
     let mut unmerged_remote_backup: Option<(std::path::PathBuf, bool)> = None;
 
-    // Extract remote database to temp file using git show
-    let show_output = git_command(dir)
-        .arg("show")
-        .arg("origin/main:vault.db")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
+    // Extract remote database to temp file using git show. Skipped entirely
+    // on the short-circuit fast path: heads equal means the remote copy is
+    // byte-identical to our own last-merged state.
     let mut has_remote = false;
-    if let Ok(output) = show_output
+    if !skip_merge
+        && let Ok(output) = git_command(dir)
+            .arg("show")
+            .arg("origin/main:vault.db")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
         && output.status.success() && !output.stdout.is_empty()
             && fs::write(&remote_db_path, output.stdout).is_ok() {
                 has_remote = true;
@@ -517,43 +591,25 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     // instead would just get the removed rows silently re-added on this
     // device's *next* sync, since the (unpruned) remote copy would still
     // have them and the merge logic copies missing remote tombstones in.
-    // Best-effort: a pruning failure shouldn't block the sync itself.
-    //
-    // The checkpoint after it matters for what `git add vault.db` below
-    // actually stages: committed frames -- this sync's own merge/prune
-    // writes, and anything the caller's still-open connection (the TUI
-    // holds one) wrote earlier -- can otherwise still be sitting in
-    // vault.db-wal, which is never staged. Relying on close-time passive
-    // checkpointing here is exactly the hazard change_master_password's
-    // comments document and defend against explicitly; sync gets the same
-    // explicit discipline. Best-effort like the prune: if a concurrent
-    // reader blocks the checkpoint, the pre-existing close-time behavior
-    // still applies.
-    if let Ok(prune_conn) = crate::db::open_keyed_connection(db_ref, &sqlcipher_key) {
-        let _ = crate::db::prune_old_tombstones(&prune_conn);
-        let _ = prune_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    // Best-effort: a pruning failure shouldn't block the sync itself. The
+    // checkpoint bundled with it matters for what `git add vault.db` below
+    // actually stages -- see prune_and_checkpoint. Both already ran on the
+    // short-circuit fast path, before its dirtiness check.
+    if !skip_merge {
+        prune_and_checkpoint(db_ref, &sqlcipher_key);
     }
 
     // 3. Stage changes, commit, and push local updates to remote repository.
-    // The status check is scoped to the files sync actually manages:
-    // without the scope, stray untracked files in the config dir (the
-    // -wal/-shm sidecars whenever a connection is open, unmerged-remote
-    // backups, exports) made every sync look dirty -- which, combined with
-    // the commit exit-status check, turned a plain no-op sync into a
-    // misleading "git commit failed" error whenever no .gitignore existed.
-    // vault.salt is included so dropping a legacy sidecar (the tracked-file
-    // deletion staged by the `git rm --cached` below) still counts as a
-    // change worth committing.
-    let status_output = git_command(dir)
-        .arg("status")
-        .arg("--porcelain")
-        .arg("--")
-        .arg("vault.db")
-        .arg("vault.salt")
-        .output()
-        .map_err(|e| format!("git status failed: {}", e))?;
-
-    let is_dirty = !status_output.stdout.is_empty();
+    // The dirtiness check is scoped to the files sync actually manages
+    // (see vault_paths_dirty): without the scope, stray untracked files in
+    // the config dir (the -wal/-shm sidecars whenever a connection is open,
+    // unmerged-remote backups, exports) made every sync look dirty --
+    // which, combined with the commit exit-status check, turned a plain
+    // no-op sync into a misleading "git commit failed" error whenever no
+    // .gitignore existed. vault.salt is included so dropping a legacy
+    // sidecar (the tracked-file deletion staged by the `git rm --cached`
+    // below) still counts as a change worth committing.
+    let is_dirty = vault_paths_dirty(dir)?;
     let mut committed = false;
 
     if is_dirty {
@@ -1494,6 +1550,78 @@ mod tests {
         assert!(sync_result.is_err(), "syncing against a remote requiring a newer version should refuse, not merge");
         let err = sync_result.unwrap_err();
         assert!(err.contains("99.0.0"), "error should name the required version, got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the sync short-circuit: when origin/main equals HEAD, a sync
+    /// with no local changes returns up-to-date after the fetch alone (no
+    /// merge, no commit, no push -- observable as the origin's commit count
+    /// not moving), local-only changes still push (skipping just the merge),
+    /// and a remote that actually moved takes the full merge path (covered
+    /// by every other two-device test in this suite; asserted here via the
+    /// commit counts advancing exactly when they should).
+    #[test]
+    fn noop_syncs_short_circuit_after_the_fetch() {
+        let root = scratch_root("short_circuit");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        let origin_commits = |dir: &Path| -> usize {
+            let out = Command::new("git")
+                .args(["rev-list", "--count", "origin/main"])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        assert_eq!(origin_commits(&device_a.dir), 1);
+
+        // 1. Nothing changed anywhere: up-to-date, no new commit.
+        let msg = super::git_sync_vault(&device_a.vault_path, &key_a).unwrap();
+        assert!(msg.contains("up-to-date"), "expected short-circuit up-to-date, got: {}", msg);
+        assert_eq!(origin_commits(&device_a.dir), 1, "a no-op sync must not create a commit");
+
+        // 2. Local-only change (made through a connection held open across
+        //    the sync, so it's WAL-resident at check time -- the dirtiness
+        //    check must see it via the checkpoint, not wrongly short-circuit
+        //    to "up-to-date" and leave it unpushed).
+        let held_conn = crate::db::open_keyed_connection(
+            &device_a.vault_path,
+            &crate::crypto::derive_sqlcipher_key(&key_a),
+        )
+        .unwrap();
+        crate::db::add_secret(&held_conn, "Beta", "Cat", "user", "", "beta-v1", None, &key_a).unwrap();
+        let msg = super::git_sync_vault(&device_a.vault_path, &key_a).unwrap();
+        assert!(msg.contains("merged and updated"), "local-only changes must still push, got: {}", msg);
+        assert_eq!(origin_commits(&device_a.dir), 2);
+        drop(held_conn);
+
+        // 3. And a device whose remote genuinely moved takes the full merge
+        //    path: B (cloned at commit 1) syncs against A's commit 2.
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (_conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+        let msg = super::git_sync_vault(&device_b.vault_path, &key_b).unwrap();
+        assert!(msg.contains("up-to-date"), "B pulled the latest before syncing, so the merge is a no-op: {}", msg);
+        let conn_b = crate::db::open_keyed_connection(
+            &device_b.vault_path,
+            &crate::crypto::derive_sqlcipher_key(&key_b),
+        )
+        .unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_b).unwrap().len(), 2, "B must have Alpha and Beta");
 
         let _ = std::fs::remove_dir_all(&root);
     }

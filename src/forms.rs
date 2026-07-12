@@ -258,6 +258,7 @@ pub(crate) fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyM
                         app.form_notes.zeroize();
                         app.form_notes.clear();
                         app.screen = Screen::Dashboard;
+                        app.vault_modified_since_sync = true;
                         app.refresh_secrets();
                     }
                     Err(err) => {
@@ -346,6 +347,7 @@ pub(crate) fn handle_change_password_input(app: &mut TuiApp, code: KeyCode) {
                             app.form_password.clear();
                             app.error_message = String::new();
                             app.screen = Screen::Dashboard;
+                            app.vault_modified_since_sync = true;
                             app.refresh_secrets();
                         }
                         Err(err) => {

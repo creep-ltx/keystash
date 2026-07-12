@@ -214,6 +214,20 @@ pub struct TuiApp {
     pub selected_conflict_idx: usize,
     pub sync_conflicts_detected: Arc<Mutex<Option<Vec<crate::sync::ConflictGroup>>>>,
 
+    /// True when this session has modified the vault (add/edit/delete,
+    /// import, dedup, conflict resolution, rotation) since the last sync
+    /// was *started*. `run_tui`'s exit-time sync is skipped when false: its
+    /// only job is pushing local edits -- pulling remote changes is the
+    /// next unlock's job -- so a session that changed nothing has nothing
+    /// to push and shouldn't cost a fetch+push on quit. Set back to true
+    /// when a sync reports failure (retry at exit) or when detected
+    /// conflicts are postponed (the old exit-time LWW push remains their
+    /// fallback). Cleared when a sync thread is actually spawned, not on
+    /// completion: an edit landing while a sync is in flight re-sets it
+    /// afterward on this same thread, so the worst case is one redundant
+    /// exit sync, never a skipped push.
+    pub vault_modified_since_sync: bool,
+
     /// Outcome of the most recent background sync (post-unlock, post-import,
     /// post-conflict, or the manual [s] key), written by the worker thread
     /// and consumed by run_loop. Without this, background sync results --
@@ -323,6 +337,7 @@ impl TuiApp {
             hibp_scan_completed: Arc::new(AtomicBool::new(false)),
             sync_conflicts: Vec::new(),
             selected_conflict_idx: 0,
+            vault_modified_since_sync: false,
             sync_conflicts_detected: Arc::new(Mutex::new(None)),
             sync_result: Arc::new(Mutex::new(None)),
             pending_sync_thread: Arc::new(Mutex::new(None)),
@@ -745,11 +760,14 @@ impl TuiApp {
     /// Runs right after a successful unlock/setup/migration, once a key exists.
     /// Detects conflicts against the ref `trigger_prelock_fetch` already updated;
     /// if none are found, performs the normal full logical merge + push.
-    pub(crate) fn trigger_postunlock_sync(&self) {
+    pub(crate) fn trigger_postunlock_sync(&mut self) {
         // Automatic trigger -- gated on Auto Sync, see trigger_prelock_fetch.
         if self.no_sync || !self.config.auto_sync {
             return;
         }
+        // A sync is being spawned for the current state -- see the field's
+        // doc for why this clears on spawn rather than on completion.
+        self.vault_modified_since_sync = false;
         let key = match &self.key {
             Some(k) => k.clone(),
             None => return,
@@ -793,10 +811,11 @@ impl TuiApp {
     /// else instead, relying on the conflict handlers above having already
     /// re-stamped each resolved record with a fresh "now" timestamp so the
     /// ordinary last-write-wins merge logic doesn't immediately re-clobber them.
-    pub(crate) fn trigger_postconflict_sync(&self) {
+    pub(crate) fn trigger_postconflict_sync(&mut self) {
         if self.no_sync {
             return;
         }
+        self.vault_modified_since_sync = false;
         let key = match &self.key {
             Some(k) => k.clone(),
             None => return,
@@ -868,8 +887,11 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     // session -- git_sync_vault needs the key to open/attach the now
     // SQLCipher-encrypted database, and there's nothing to merge otherwise.
     // Gated on Auto Sync like every automatic trigger (a manual [s] sync
-    // that's still in flight was already joined above regardless).
-    if !app.no_sync && app.config.auto_sync
+    // that's still in flight was already joined above regardless), and on
+    // the session having actually modified the vault: the exit sync's only
+    // job is pushing local edits (pulling is the next unlock's job), so a
+    // look-only session skips the exit fetch+push entirely.
+    if !app.no_sync && app.config.auto_sync && app.vault_modified_since_sync
         && let Some(key) = app.key.clone() {
             let db_path = crate::get_db_path();
             if crate::sync::is_git_configured(&db_path) {
@@ -896,6 +918,14 @@ fn run_loop<B: ratatui::backend::Backend>(
                 app.selected_conflict_idx = 0;
                 app.screen = Screen::SyncConflict;
             }
+        // Ordered after the take() above so the borrow on the mutex guard has
+        // ended. The sync that detected conflicts returned without pushing:
+        // if the user resolves them, the post-conflict sync takes over, but
+        // if they postpone (Esc), this keeps the exit-time sync as the
+        // fallback push instead of it being skipped as "nothing modified".
+        if !app.sync_conflicts.is_empty() {
+            app.vault_modified_since_sync = true;
+        }
 
         // Surface the outcome of a finished background sync. Consumed only
         // on the Dashboard: an error dialog popping over a half-typed form
@@ -917,6 +947,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                     // recovery steps must actually be readable.
                     app.error_message = format!("Sync failed: {}", err);
                     app.screen = Screen::ErrorDialog;
+                    // The spawn optimistically cleared the modified flag;
+                    // the sync didn't land, so the exit sync must retry.
+                    app.vault_modified_since_sync = true;
                 }
                 None => {}
             }

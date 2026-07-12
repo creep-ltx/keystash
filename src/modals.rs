@@ -27,6 +27,7 @@ pub(crate) fn handle_confirmation_input(app: &mut TuiApp, code: KeyCode, action:
                 }
             }
             app.screen = Screen::Dashboard;
+            app.vault_modified_since_sync = true;
             app.refresh_secrets();
         }
         KeyCode::Char('n') | KeyCode::Esc => {
@@ -672,6 +673,8 @@ pub(crate) fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
             }
             restamp_record(&app.conn, keep_id);
 
+            app.vault_modified_since_sync = true;
+
             app.refresh_secrets();
             app.find_duplicate_groups();
 
@@ -735,6 +738,8 @@ pub(crate) fn handle_deduplicate_input(app: &mut TuiApp, key: KeyCode) {
                 let _ = crate::db::delete_secret(&app.conn, id);
             }
             restamp_record(&app.conn, keep_id);
+
+            app.vault_modified_since_sync = true;
 
             app.refresh_secrets();
             app.find_duplicate_groups();
