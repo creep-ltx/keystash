@@ -129,12 +129,6 @@ pub fn get_db_path() -> PathBuf {
     path
 }
 
-pub fn get_config_path() -> PathBuf {
-    let mut path = get_db_path();
-    path.set_file_name("generator.json");
-    path
-}
-
 fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     print!("{}", prompt);
     let _ = io::stdout().flush();

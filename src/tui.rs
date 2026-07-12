@@ -146,11 +146,7 @@ pub struct TuiApp {
 
     // Audit screen state
     pub audit_report: Option<crate::audit::AuditReport>,
-    pub audit_scroll: usize,
-    pub audit_selected: usize,
 
-    // HIBP cache to persist checked counts across edits/refreshes. Map: id -> (password_sha256_hex, Option<u64>)
-    pub hibp_cache: std::collections::HashMap<i64, (String, Option<u64>)>,
     pub last_activity: Instant,
     pub config: crate::config::AppConfig,
 
@@ -253,9 +249,6 @@ impl TuiApp {
             gen_password: String::new(),
             help_scroll: 0,
             audit_report: None,
-            audit_scroll: 0,
-            audit_selected: 0,
-            hibp_cache: std::collections::HashMap::new(),
             last_activity: Instant::now(),
             config: crate::config::AppConfig::load(),
             duplicate_groups: Vec::new(),
