@@ -2,6 +2,10 @@
 name = "keystash"
 version = "0.4.3"
 edition = "2024"
+# MSRV: edition 2024 alone needs 1.85, but the let-chains used throughout
+# stabilized in 1.88. Declaring it gives older toolchains a clear "requires
+# rustc 1.88" error up front instead of a wall of parse errors mid-install.
+rust-version = "1.88"
 description = "A secure offline TUI and CLI password manager featuring logical Git sync"
 license = "MIT"
 repository = "https://github.com/creep-ltx/keystash"
