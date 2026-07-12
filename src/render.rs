@@ -559,11 +559,17 @@ fn draw_lock_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         ])
         .split(size);
 
-    let title_text = if app.needs_migration {
-        "KeyStash Password Vault (legacy vault -- will migrate to encrypted format)"
+    let mut title_text = if app.needs_migration {
+        "KeyStash Password Vault (legacy vault -- will migrate to encrypted format)".to_string()
     } else {
-        "KeyStash Password Vault"
+        "KeyStash Password Vault".to_string()
     };
+    // Which vault is this? With profiles, "the vault" is ambiguous --
+    // showing the active one on the lock screen prevents typing the work
+    // password at the personal vault and vice versa.
+    if let Some(profile) = crate::active_profile() {
+        title_text.push_str(&format!("  [profile: {}]", profile));
+    }
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .alignment(ratatui::layout::Alignment::Center);

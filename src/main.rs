@@ -118,22 +118,48 @@ fn copy_to_clipboard(text: Zeroizing<String>, label: &str) {
     }
 }
 
+/// The vault profile selected via `--profile <name>`, set exactly once at
+/// startup before any path resolution, thread spawn, or connection exists
+/// -- which is what makes a process-global safe here: nothing can observe
+/// it changing, because it never changes after main()'s first lines.
+/// Each profile is a fully independent world (own vault.db, config.json,
+/// and git repo/remote) living under `<config root>/profiles/<name>/`.
+static ACTIVE_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Profile names become a single path component, so the alphabet is locked
+/// down hard: anything else -- separators, dots, empties -- would let
+/// `--profile ../somewhere` walk out of the config root.
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn set_active_profile(name: &str) -> Result<(), String> {
+    if !valid_profile_name(name) {
+        return Err(format!(
+            "Invalid profile name '{}': use only letters, digits, '-' and '_' (max 64 chars).",
+            name
+        ));
+    }
+    ACTIVE_PROFILE
+        .set(name.to_string())
+        .map_err(|_| "Profile already selected for this process.".to_string())
+}
+
+pub fn active_profile() -> Option<&'static str> {
+    ACTIVE_PROFILE.get().map(|s| s.as_str())
+}
+
 pub fn get_db_path() -> PathBuf {
-    // KEYSTASH_CONFIG_DIR overrides the entire directory resolution below:
-    // it names the directory vault.db (and config.json) live in directly --
-    // no `keystash/` subdirectory is appended. It exists so tests can give
+    // KEYSTASH_CONFIG_DIR overrides the config *root* below: it names the
+    // directory vault.db (and config.json) live in directly -- no
+    // `keystash/` subdirectory is appended. It exists so tests can give
     // each test its own isolated vault directory without mutating the
     // process-wide HOME (the reason two regression tests used to be
-    // #[ignore]d), and doubles as an escape hatch for unusual setups; a
-    // future --profile flag can build on this same seam.
-    if let Ok(dir) = env::var("KEYSTASH_CONFIG_DIR") {
-        let mut path = PathBuf::from(dir);
-        let _ = fs::create_dir_all(&path);
-        set_dir_permissions(&path);
-        path.push("vault.db");
-        return path;
-    }
-    // XDG_CONFIG_HOME, when set, is the correct place to look first (it
+    // #[ignore]d), and doubles as an escape hatch for unusual setups.
+    //
+    // XDG_CONFIG_HOME, when set, is the correct place to look next (it
     // already points at a config dir, so keystash/ is appended directly
     // instead of assuming a .config subdirectory of it). Falling back
     // silently to the current working directory when HOME is unset used to
@@ -141,21 +167,33 @@ pub fn get_db_path() -> PathBuf {
     // silently lands in a different place depending on which directory you
     // happened to run the command from is a real hazard, not a convenience
     // -- so that fallback now at least warns loudly instead of staying quiet.
-    let mut path = if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else if let Ok(home) = env::var("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push(".config");
-        p
+    let mut path = if let Ok(dir) = env::var("KEYSTASH_CONFIG_DIR") {
+        PathBuf::from(dir)
     } else {
-        eprintln!(
-            "Warning: neither XDG_CONFIG_HOME nor HOME is set -- using ./.config/keystash \
-             relative to the current directory. This vault will only be found again if \
-             keystash is run from this same directory every time."
-        );
-        PathBuf::from("./.config")
+        let mut p = if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg)
+        } else if let Ok(home) = env::var("HOME") {
+            let mut p = PathBuf::from(home);
+            p.push(".config");
+            p
+        } else {
+            eprintln!(
+                "Warning: neither XDG_CONFIG_HOME nor HOME is set -- using ./.config/keystash \
+                 relative to the current directory. This vault will only be found again if \
+                 keystash is run from this same directory every time."
+            );
+            PathBuf::from("./.config")
+        };
+        p.push("keystash");
+        p
     };
-    path.push("keystash");
+    // --profile composes with whichever root won above: profiles are
+    // subdirectories of the root, so the test/env seam and profiles stack
+    // instead of fighting.
+    if let Some(profile) = active_profile() {
+        path.push("profiles");
+        path.push(profile);
+    }
     let _ = fs::create_dir_all(&path);
     set_dir_permissions(&path);
     path.push("vault.db");
@@ -319,6 +357,9 @@ fn print_help() {
     println!("  ~/.config/keystash/vault.db");
     println!();
     println!("Usage:");
+    println!("  keystash [--profile <name>] [--no-sync] [command]");
+    println!("                                            --profile keeps fully separate vaults (own db, config, git remote)");
+    println!("                                            under ~/.config/keystash/profiles/<name>/ -- e.g. work, personal");
     println!("  keystash [tui]                            Start the interactive TUI (default)");
     println!("  keystash init                             Initialize the password vault");
     println!("  keystash add <title> <tags> <user> [url]  Add a new secret (tags: comma-separated, e.g. \"work,email\")");
@@ -371,7 +412,23 @@ fn main() {
         return;
     }
     let no_sync = raw_args.iter().any(|arg| arg == "--no-sync");
-    let args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--no-sync").collect();
+    let mut args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--no-sync").collect();
+
+    // --profile must be resolved before the first get_db_path() call below
+    // -- every path in the process (vault, config, sync repo) derives from
+    // it, and it can only be set once.
+    if let Some(pos) = args.iter().position(|a| a == "--profile" || a == "-P") {
+        let Some(name) = args.get(pos + 1).cloned() else {
+            eprintln!("Usage: keystash --profile <name> [command]");
+            return;
+        };
+        if let Err(e) = set_active_profile(&name) {
+            eprintln!("{}", e);
+            return;
+        }
+        args.drain(pos..=pos + 1);
+    }
+
     let db_path = get_db_path();
     
     // Ensure parent directory of db_path exists
@@ -1167,6 +1224,29 @@ mod tests {
         let a = args(&[]);
         let (query, _) = parse_search_args(&a);
         assert!(query.is_none());
+    }
+
+    #[test]
+    fn profile_names_are_locked_to_a_single_safe_path_component() {
+        for good in ["work", "personal", "my-vault_2", "A", "0"] {
+            assert!(valid_profile_name(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "",             // empty
+            "../evil",      // traversal
+            "a/b",          // separator
+            "a\\b",         // windows separator
+            ".",            // dot component
+            "..",           // parent
+            "name with spaces",
+            "sneaky\0null",
+            "å",            // non-ASCII stays out: one alphabet, no confusables
+        ] {
+            assert!(!valid_profile_name(bad), "{bad:?} must be rejected");
+        }
+        // Length cap.
+        assert!(!valid_profile_name(&"x".repeat(65)));
+        assert!(valid_profile_name(&"x".repeat(64)));
     }
 
     #[cfg(unix)]
