@@ -234,7 +234,7 @@ fn print_help() {
     println!("Usage:");
     println!("  keystash [tui]                            Start the interactive TUI (default)");
     println!("  keystash init                             Initialize the password vault");
-    println!("  keystash add <title> <category> <user> [url] Add a new secret to the database");
+    println!("  keystash add <title> <tags> <user> [url]  Add a new secret (tags: comma-separated, e.g. \"work,email\")");
     println!("  keystash list [--reveal]                  List stored credentials (passwords masked by default)");
     println!("  keystash search <query> [--reveal]        Search stored credentials (passwords masked by default)");
     println!("  keystash show <id> [--reveal]             Show detailed decrypted view of an entry");
@@ -328,6 +328,17 @@ fn main() {
                 db::VaultState::New => {}
             }
             let pass = prompt_password("Set Master Password: ");
+            // Reject empty BEFORE the match check: two empty reads also
+            // "match", which is exactly what happens when rpassword can't
+            // read at all (stdin is a pipe, no tty) and prompt_password
+            // falls back to "" -- previously that silently created a vault
+            // whose master password is the empty string. The TUI setup
+            // screen and `change-password` have always refused empty; init
+            // was the one entry point that didn't.
+            if pass.trim().is_empty() {
+                eprintln!("Master password cannot be empty. (If you are piping input: keystash reads passwords from the terminal, not stdin.)");
+                return;
+            }
             let confirm = prompt_password("Confirm Master Password: ");
             if pass != confirm {
                 eprintln!("Passwords do not match.");
@@ -340,7 +351,14 @@ fn main() {
         }
         "add" => {
             if args.len() < 5 {
-                eprintln!("Usage: keystash add <title> <category> <username> [url]");
+                eprintln!("Usage: keystash add <title> <tags> <username> [url]");
+                return;
+            }
+            // Tags are stored normalized (split on commas, trimmed, deduped)
+            // so CLI-added and TUI-added records land identically.
+            let tags = db::normalize_tags(&args[3]);
+            if tags.is_empty() {
+                eprintln!("At least one tag is required (e.g. \"work\" or \"work,email\").");
                 return;
             }
             let (conn, key) = match open_or_migrate_vault(&db_path) {
@@ -348,6 +366,14 @@ fn main() {
                 None => return,
             };
             let pass = prompt_password("Enter Secret Password: ");
+            // Same rule the TUI's Add/Edit form has always enforced -- and
+            // the same no-tty fallback protection as `init` above: without
+            // this, a failed prompt read stored a credential with an empty
+            // password while reporting success.
+            if pass.trim().is_empty() {
+                eprintln!("Password cannot be empty.");
+                return;
+            }
             print!("Enter Notes (optional): ");
             let _ = io::stdout().flush();
             let mut notes: Zeroizing<String> = Zeroizing::new(String::new());
@@ -359,7 +385,7 @@ fn main() {
             match db::add_secret(
                 &conn,
                 &args[2],
-                &args[3],
+                &tags,
                 &args[4],
                 url,
                 &pass,
@@ -379,7 +405,7 @@ fn main() {
             match db::get_secrets(&conn) {
                 Ok(records) => {
                     let pass_header = if reveal { "Password" } else { "Password (Masked)" };
-                    println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Category", "Username", "URL", pass_header);
+                    println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Tags", "Username", "URL", pass_header);
                     println!("{}", "-".repeat(100));
                     for r in records {
                         let decrypted_pass = if reveal {
@@ -425,7 +451,7 @@ fn main() {
                         println!("No credentials matching '{}' found.", query);
                     } else {
                         let pass_header = if reveal { "Password" } else { "Password (Masked)" };
-                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Category", "Username", "URL", pass_header);
+                        println!("{:<4} | {:<20} | {:<12} | {:<20} | {:<25} | {}", "ID", "Title", "Tags", "Username", "URL", pass_header);
                         println!("{}", "-".repeat(100));
                         for r in filtered {
                             let decrypted_pass = if reveal {
@@ -713,7 +739,7 @@ fn main() {
             let hibp_col = if run_hibp { "  HIBP Breaches" } else { "" };
             println!(
                 "  {:<4}  {:<22}  {:<14}  {:<22}  {:<10}  Issues{}",
-                "ID", "Title", "Category", "Username", "Strength", hibp_col
+                "ID", "Title", "Tags", "Username", "Strength", hibp_col
             );
             println!("  {}", "-".repeat(if run_hibp { 115 } else { 100 }));
 
@@ -793,7 +819,7 @@ fn main() {
                         println!("Secret Details (ID: {}):", r.id);
                         println!("----------------------------------------");
                         println!("Title:    {}", r.title);
-                        println!("Category: {}", r.category);
+                        println!("Tags:     {}", r.category);
                         println!("Username: {}", r.username);
                         println!("URL:      {}", r.url);
                         println!("Password: {}", *decrypted_pass);

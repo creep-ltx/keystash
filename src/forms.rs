@@ -190,11 +190,15 @@ pub(crate) fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyM
             FormField::Notes => { app.form_notes.pop(); }
         },
         KeyCode::Enter => {
+            // Tags are stored normalized (split, trimmed, deduped, re-joined
+            // -- see db::normalize_tags), so "work,email" and " work , email"
+            // land identically and the sidebar never shows phantom variants.
+            let normalized_tags = db::normalize_tags(&app.form_category);
             if app.form_title.trim().is_empty()
-                || app.form_category.trim().is_empty()
+                || normalized_tags.is_empty()
                 || app.form_password.trim().is_empty()
             {
-                app.error_message = "Title, Category and Password are required!".to_string();
+                app.error_message = "Title, at least one Tag, and Password are required!".to_string();
                 app.screen = Screen::ErrorDialog;
                 return;
             }
@@ -205,7 +209,7 @@ pub(crate) fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyM
                         &app.conn,
                         id,
                         &app.form_title,
-                        &app.form_category,
+                        &normalized_tags,
                         &app.form_username,
                         &app.form_url,
                         &app.form_password,
@@ -216,7 +220,7 @@ pub(crate) fn handle_form_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyM
                     db::add_secret(
                         &app.conn,
                         &app.form_title,
-                        &app.form_category,
+                        &normalized_tags,
                         &app.form_username,
                         &app.form_url,
                         &app.form_password,
@@ -418,7 +422,7 @@ pub(crate) fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(title_box, form_layout[0]);
 
     let category_box = Paragraph::new(app.form_category.as_str()).block(
-        Block::default().borders(Borders::ALL).title("Category*").border_style(get_border_style(FormField::Category))
+        Block::default().borders(Borders::ALL).title("Tags* (comma-separated)").border_style(get_border_style(FormField::Category))
     );
     f.render_widget(category_box, form_layout[1]);
 

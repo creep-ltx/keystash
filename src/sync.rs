@@ -281,9 +281,18 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
                     // Update local secrets if remote is newer. sync_uuid has a
                     // UNIQUE index, so unlike the old title/category/username
                     // triple, these scalar subqueries can never match more than
-                    // one remote row.
+                    // one remote row. Every mutable column must be carried,
+                    // title/category/username included: sync_uuid becoming the
+                    // merge identity turned the triple into ordinary editable
+                    // payload, and leaving it out of this SET list silently
+                    // dropped renames -- while still copying updated_at, so
+                    // both sides ended up with equal timestamps and the
+                    // divergence never healed on any later sync.
                     "UPDATE main.secrets
-                     SET url = (SELECT url FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
+                     SET title = (SELECT title FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
+                         category = (SELECT category FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
+                         username = (SELECT username FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
+                         url = (SELECT url FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
                          encrypted_password = (SELECT encrypted_password FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
                          encrypted_notes = (SELECT encrypted_notes FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid),
                          updated_at = (SELECT updated_at FROM remote_db.secrets r WHERE r.sync_uuid = main.secrets.sync_uuid)
@@ -759,7 +768,16 @@ pub fn detect_sync_conflicts(
                 Zeroizing::new(String::new())
             };
 
-            let differs = local_pw != remote_pw || local_notes != remote_notes || local_sec.url != remote_sec.url;
+            // title/category/username are compared too: they're mutable
+            // payload under the sync_uuid identity (see the merge UPDATE in
+            // git_sync_vault), so concurrent renames are conflicts exactly
+            // like concurrent password edits.
+            let differs = local_pw != remote_pw
+                || local_notes != remote_notes
+                || local_sec.url != remote_sec.url
+                || local_sec.title != remote_sec.title
+                || local_sec.category != remote_sec.category
+                || local_sec.username != remote_sec.username;
             if differs {
                 if let Some(base_sec) = base_map.get(k) {
                     let base_pw: Zeroizing<String> = crate::crypto::decrypt(&base_sec.encrypted_password, key)
@@ -773,8 +791,18 @@ pub fn detect_sync_conflicts(
                         Zeroizing::new(String::new())
                     };
 
-                    let local_changed = local_pw != base_pw || local_notes != base_notes || local_sec.url != base_sec.url;
-                    let remote_changed = remote_pw != base_pw || remote_notes != base_notes || remote_sec.url != base_sec.url;
+                    let local_changed = local_pw != base_pw
+                        || local_notes != base_notes
+                        || local_sec.url != base_sec.url
+                        || local_sec.title != base_sec.title
+                        || local_sec.category != base_sec.category
+                        || local_sec.username != base_sec.username;
+                    let remote_changed = remote_pw != base_pw
+                        || remote_notes != base_notes
+                        || remote_sec.url != base_sec.url
+                        || remote_sec.title != base_sec.title
+                        || remote_sec.category != base_sec.category
+                        || remote_sec.username != base_sec.username;
 
                     if local_changed && remote_changed {
                         conflicts.push(ConflictGroup {
@@ -957,6 +985,9 @@ mod tests {
             crate::db::update_secret_raw(
                 &conn_a,
                 resolved.local_secret.id,
+                &resolved.remote_secret.title,
+                &resolved.remote_secret.category,
+                &resolved.remote_secret.username,
                 &resolved.remote_secret.url,
                 &resolved.remote_secret.encrypted_password,
                 resolved.remote_secret.encrypted_notes.as_deref(),
@@ -1112,6 +1143,9 @@ mod tests {
             crate::db::update_secret_raw(
                 &conn_a,
                 keep.id,
+                &keep.title,
+                &keep.category,
+                &keep.username,
                 &keep.url,
                 &keep.encrypted_password,
                 keep.encrypted_notes.as_deref(),
@@ -1418,6 +1452,189 @@ mod tests {
         assert!(sync_result.is_err(), "syncing against a remote requiring a newer version should refuse, not merge");
         let err = sync_result.unwrap_err();
         assert!(err.contains("99.0.0"), "error should name the required version, got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression test for B6: title/category/username edits must propagate
+    /// through the merge like every other field. The merge UPDATE used to
+    /// carry only url/password/notes/updated_at -- a rename on device A
+    /// reached device B as the new *timestamp* with the old *name*, and
+    /// since both sides then held equal timestamps, no later sync ever
+    /// reconciled them: permanent split-brain with "Sync complete" on both.
+    #[test]
+    fn renames_propagate_between_devices() {
+        let root = scratch_root("rename_propagation");
+        let origin = init_bare_origin(&root);
+
+        // --- Device A: create and push a record. ---
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Old Name", "old-tag", "olduser", "", "the-password", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // --- Device B: clone it. ---
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (_conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // --- Device A renames the record: title, tags, and username all
+        // change; the password stays the same. Exactly what the Edit form
+        // does. ---
+        let a_sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_a);
+        let renamed_uuid;
+        {
+            let conn_a = crate::db::open_keyed_connection(&device_a.vault_path, &a_sqlcipher_key).unwrap();
+            let secrets = crate::db::get_secrets(&conn_a).unwrap();
+            renamed_uuid = secrets[0].sync_uuid.clone();
+            crate::db::update_secret(
+                &conn_a,
+                secrets[0].id,
+                "New Name",
+                "new-tag, work",
+                "newuser",
+                "https://renamed.example",
+                "the-password",
+                None,
+                &key_a,
+            )
+            .unwrap();
+        }
+
+        let push_a = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(push_a.is_ok(), "Device A's post-rename sync failed: {:?}", push_a);
+
+        // --- Device B merges: the rename must arrive whole, not just its
+        // timestamp. ---
+        let sync_b = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(sync_b.is_ok(), "Device B's merge failed: {:?}", sync_b);
+
+        let conn_b = crate::db::open_keyed_connection(&device_b.vault_path, &crate::crypto::derive_sqlcipher_key(&key_b)).unwrap();
+        let secrets_b = crate::db::get_secrets(&conn_b).unwrap();
+        assert_eq!(secrets_b.len(), 1, "the rename must not duplicate the record");
+        let r = &secrets_b[0];
+        assert_eq!(r.sync_uuid, renamed_uuid, "same record identity");
+        assert_eq!(r.title, "New Name", "title must propagate through the merge");
+        assert_eq!(r.category, "new-tag, work", "tags/category must propagate through the merge");
+        assert_eq!(r.username, "newuser", "username must propagate through the merge");
+        assert_eq!(r.url, "https://renamed.example");
+        assert_eq!(&*crate::crypto::decrypt(&r.encrypted_password, &key_b).unwrap(), b"the-password");
+        drop(conn_b);
+
+        // --- And a second sync on either side is a genuine no-op: equal
+        // timestamps must now mean equal *content*, not hidden divergence. ---
+        let resync_a = super::git_sync_vault(&device_a.vault_path, &key_a).unwrap();
+        let conn_a_final = crate::db::open_keyed_connection(&device_a.vault_path, &a_sqlcipher_key).unwrap();
+        let secrets_a = crate::db::get_secrets(&conn_a_final).unwrap();
+        assert_eq!(secrets_a[0].title, "New Name", "the rename must survive A's next sync (got clobbered back: {})", resync_a);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Companion to the test above: *concurrent* renames of the same record
+    /// on two devices are a genuine conflict and must surface in
+    /// detect_sync_conflicts (differs/base comparison now include the
+    /// triple), and resolving "keep remote" must apply the remote's rename.
+    #[test]
+    fn concurrent_renames_surface_as_conflict_and_resolve() {
+        let root = scratch_root("rename_conflict");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Original", "Cat", "user", "", "same-password", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A renames and pushes; B renames differently *before* seeing A's
+        // push -- both sides diverge from the shared base on the title only.
+        let a_sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_a);
+        {
+            let conn_a = crate::db::open_keyed_connection(&device_a.vault_path, &a_sqlcipher_key).unwrap();
+            let s = crate::db::get_secrets(&conn_a).unwrap();
+            crate::db::update_secret(&conn_a, s[0].id, "Renamed-by-A", "Cat", "user", "", "same-password", None, &key_a).unwrap();
+        }
+        let push_a = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(push_a.is_ok(), "Device A's push failed: {:?}", push_a);
+
+        std::thread::sleep(Duration::from_millis(20));
+        {
+            let s = crate::db::get_secrets(&conn_b).unwrap();
+            crate::db::update_secret(&conn_b, s[0].id, "Renamed-by-B", "Cat", "user", "", "same-password", None, &key_b).unwrap();
+        }
+        drop(conn_b);
+
+        // B fetches and must see exactly one conflict -- a pure rename, no
+        // password/notes/url difference involved.
+        let fetch = Command::new("git").args(["fetch", "origin", "main"]).current_dir(&device_b.dir).status().unwrap();
+        assert!(fetch.success());
+        let conflicts = super::detect_sync_conflicts(&device_b.vault_path, &key_b).unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "a concurrent rename must surface as a conflict, got: {:?}",
+            conflicts.iter().map(|c| &c.title).collect::<Vec<_>>()
+        );
+        assert_eq!(conflicts[0].local_secret.title, "Renamed-by-B");
+        assert_eq!(conflicts[0].remote_secret.title, "Renamed-by-A");
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Resolve keep-remote exactly like the TUI's 'r' handler: remote's
+        // triple applied, fresh "now" stamp.
+        let resolved = &conflicts[0];
+        let b_sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key_b);
+        {
+            let conn_b = crate::db::open_keyed_connection(&device_b.vault_path, &b_sqlcipher_key).unwrap();
+            let now = crate::db::now_timestamp(&conn_b).unwrap();
+            crate::db::update_secret_raw(
+                &conn_b,
+                resolved.local_secret.id,
+                &resolved.remote_secret.title,
+                &resolved.remote_secret.category,
+                &resolved.remote_secret.username,
+                &resolved.remote_secret.url,
+                &resolved.remote_secret.encrypted_password,
+                resolved.remote_secret.encrypted_notes.as_deref(),
+                &now,
+            )
+            .unwrap();
+        }
+        let final_sync = super::git_sync_vault(&device_b.vault_path, &key_b);
+        assert!(final_sync.is_ok(), "post-resolution sync failed: {:?}", final_sync);
+
+        // Both the local vault and (via A's next merge) the shared repo
+        // agree on the chosen name.
+        let conn_b_final = crate::db::open_keyed_connection(&device_b.vault_path, &b_sqlcipher_key).unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_b_final).unwrap()[0].title, "Renamed-by-A");
+        drop(conn_b_final);
+        let sync_a = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(sync_a.is_ok());
+        let conn_a_final = crate::db::open_keyed_connection(&device_a.vault_path, &a_sqlcipher_key).unwrap();
+        assert_eq!(crate::db::get_secrets(&conn_a_final).unwrap()[0].title, "Renamed-by-A");
 
         let _ = std::fs::remove_dir_all(&root);
     }

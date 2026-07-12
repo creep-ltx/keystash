@@ -1,4 +1,4 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.4.0" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.4.1" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
@@ -20,14 +20,14 @@ Bypass all Git synchronization processes (startup pull, database updates thread,
 .B init
 Initialize a new local password vault database and configure your Master Password.
 .TP
-.B add \fItitle\fR \fIcategory\fR \fIusername\fR [\fIurl\fR]
-Insert a new credential. The CLI will securely prompt you for your password. Double quotes are required for arguments containing spaces (e.g. keystash add "My Google Account" "Email" "user@gmail.com").
+.B add \fItitle\fR \fItags\fR \fIusername\fR [\fIurl\fR]
+Insert a new credential. Tags are comma-separated (e.g. "work,email") and are normalized before storing (trimmed, deduplicated). The CLI will securely prompt you for your password. Double quotes are required for arguments containing spaces or commas (e.g. keystash add "My Google Account" "email, personal" "user@gmail.com").
 .TP
 .B list [\-r|\-\-reveal]
 List all stored credentials in the vault. Passwords are masked by default unless \-r or \-\-reveal is supplied. WARNING: Revealing all passwords dumps them in plaintext into the terminal scrollback buffer. Use with caution.
 .TP
 .B search \fIquery\fR [\-r|\-\-reveal]
-Search for matching credentials across titles, categories, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied. A query starting with a dash is matched literally as long as it isn't \-r/\-\-reveal itself; use "keystash search \-\- \-yourquery" if it collides with a flag name.
+Search for matching credentials across titles, tags, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied. A query starting with a dash is matched literally as long as it isn't \-r/\-\-reveal itself; use "keystash search \-\- \-yourquery" if it collides with a flag name.
 .TP
 .B show \fIid\fR [\-r|\-\-reveal]
 Show a detailed view of a secret (including notes). Passwords and notes are masked by default unless \-r or \-\-reveal is supplied.
@@ -62,7 +62,7 @@ Show the standard command-line help block.
 Within the interactive dashboard, use the following keys:
 .TP
 .B Tab / Shift+Tab
-Cycle focus forward/backward between the Categories list, Credentials list, and Details pane.
+Cycle focus forward/backward between the Tags list, Credentials list, and Details pane.
 .TP
 .B Arrow Up / Down
 Scroll through lists item-by-item.
@@ -129,8 +129,12 @@ Cancel dialogs, close forms, or exit the application.
 .TP
 .B q
 Same as Esc, except in text-entry fields (Add/Edit form, Change Password, Settings), where it types the letter instead.
+.SH TAGS
+Each credential carries one or more comma-separated tags (e.g. "work, email"). The TUI sidebar lists every tag individually and filters on any of them; tags are normalized on save (trimmed, deduplicated). Tags are stored in the same database field older KeyStash versions treat as the single category, so vaults, CSV exports, and shared Git remotes remain fully compatible in both directions.
 .SH SYNCHRONIZATION & MULTI-MACHINE SETUP
 If the config folder (~/.config/keystash) is initialized as a Git repository, keystash will automatically synchronize and merge database updates across your machines.
+.PP
+The settings screen's Auto Sync toggle controls only the automatic sync actions (startup fetch, post-unlock/post-import merge, exit-time push); with it off, the manual [s] key and "keystash sync" still work on demand. The \-\-no\-sync flag is stronger and disables all sync, manual included, for that session. The outcome of every background sync is reported in the TUI: success in the status bar, failures (including a refused push after a master-password rotation performed elsewhere) in a dialog with recovery instructions.
 .PP
 .B First-time Setup (Device A):
 .nf
@@ -162,7 +166,7 @@ DO NOT run "keystash init" on a secondary device. This will generate a different
 .SH SECURITY CONSIDERATIONS
 .B Layered Encryption (Full Database + Sensitive Fields)
 .IP
-The entire vault.db file is encrypted with SQLCipher: schema, indexes, and every column, including title, category, username, url, and timestamps. Nothing in the file is readable without the master password—including by anyone with read access to your private Git backup repository. As defense in depth, the password and notes fields are additionally encrypted with XChaCha20-Poly1305 under an independently derived key, so a compromise of the SQLCipher layer alone does not expose them. The Argon2id salt is embedded in the first 16 bytes of vault.db (it is not secret on its own); vaults created before v0.3.6 kept it in a vault.salt sidecar file and are converted automatically on first unlock.
+The entire vault.db file is encrypted with SQLCipher: schema, indexes, and every column, including title, category (the column tags are stored in), username, url, and timestamps. Nothing in the file is readable without the master password—including by anyone with read access to your private Git backup repository. As defense in depth, the password and notes fields are additionally encrypted with XChaCha20-Poly1305 under an independently derived key, so a compromise of the SQLCipher layer alone does not expose them. The Argon2id salt is embedded in the first 16 bytes of vault.db (it is not secret on its own); vaults created before v0.3.6 kept it in a vault.salt sidecar file and are converted automatically on first unlock.
 .PP
 .B Clipboard Security
 .IP

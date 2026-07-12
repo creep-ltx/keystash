@@ -212,7 +212,15 @@ pub(crate) fn draw_error_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         .title("Error")
         .border_style(Style::default().fg(Color::Red));
 
-    let area = centered_rect(50, 30, size);
+    // Long or multi-line errors -- most importantly the sync rotation
+    // refusal, whose value is its step-by-step recovery instructions --
+    // need more than the compact one-liner box, or the steps get clipped.
+    let is_long = app.error_message.len() > 160 || app.error_message.contains('\n');
+    let area = if is_long {
+        centered_rect(78, 80, size)
+    } else {
+        centered_rect(50, 30, size)
+    };
     f.render_widget(Clear, area);
 
     let error_p = Paragraph::new(app.error_message.as_str())
@@ -264,7 +272,7 @@ pub(crate) fn draw_help_dialog(f: &mut ratatui::Frame, app: &TuiApp) {
         Line::from(Span::styled("Navigation & Selection:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(vec![
             Span::styled("  [Tab]         ", Style::default().fg(Color::Yellow)),
-            Span::styled("Cycle panels forward (Categories -> Secrets -> Details)", Style::default().fg(Color::White)),
+            Span::styled("Cycle panels forward (Tags -> Secrets -> Details)", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  [Shift+Tab]   ", Style::default().fg(Color::Yellow)),
@@ -596,6 +604,9 @@ fn restamp_record(conn: &rusqlite::Connection, id: i64) {
             let _ = crate::db::update_secret_raw(
                 conn,
                 id,
+                &r.title,
+                &r.category,
+                &r.username,
                 &r.url,
                 &r.encrypted_password,
                 r.encrypted_notes.as_deref(),
@@ -827,7 +838,7 @@ pub(crate) fn draw_deduplicate_screen(f: &mut ratatui::Frame, app: &TuiApp) {
                 Span::styled(r.title.clone(), Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
-                Span::styled("  Category:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Tags:       ", Style::default().fg(Color::DarkGray)),
                 Span::styled(r.category.clone(), Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
@@ -955,6 +966,9 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
                 let _ = crate::db::update_secret_raw(
                     &app.conn,
                     resolved.local_secret.id,
+                    &resolved.local_secret.title,
+                    &resolved.local_secret.category,
+                    &resolved.local_secret.username,
                     &resolved.local_secret.url,
                     &resolved.local_secret.encrypted_password,
                     resolved.local_secret.encrypted_notes.as_deref(),
@@ -973,11 +987,16 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         KeyCode::Char('r') | KeyCode::Right => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
             // Stamp with "now", not remote's original updated_at -- see the
-            // comment in the 'l' branch above for why.
+            // comment in the 'l' branch above for why. Remote's title/
+            // category/username are applied too: a conflict can now *be* a
+            // rename, and "keep remote" must keep remote's name.
             if let Ok(now) = crate::db::now_timestamp(&app.conn) {
                 let _ = crate::db::update_secret_raw(
                     &app.conn,
                     resolved.local_secret.id,
+                    &resolved.remote_secret.title,
+                    &resolved.remote_secret.category,
+                    &resolved.remote_secret.username,
                     &resolved.remote_secret.url,
                     &resolved.remote_secret.encrypted_password,
                     resolved.remote_secret.encrypted_notes.as_deref(),
@@ -1018,11 +1037,16 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
                 };
 
                 // Stamp with "now", not remote's original updated_at -- see the
-                // comment in the 'l' branch above for why.
+                // comment in the 'l' branch above for why. Merge-notes keeps
+                // local's title/category/username (it's a notes merge, not a
+                // field-by-field one).
                 if let Ok(now) = crate::db::now_timestamp(&app.conn) {
                     let _ = crate::db::update_secret_raw(
                         &app.conn,
                         resolved.local_secret.id,
+                        &resolved.local_secret.title,
+                        &resolved.local_secret.category,
+                        &resolved.local_secret.username,
                         &resolved.local_secret.url,
                         &resolved.local_secret.encrypted_password,
                         enc_notes.as_deref(),
@@ -1127,6 +1151,9 @@ pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
     let mut base_pw: Zeroizing<String> = Zeroizing::new(String::new());
     let mut base_notes: Zeroizing<String> = Zeroizing::new(String::new());
     let mut base_url = String::new();
+    let mut base_title = String::new();
+    let mut base_category = String::new();
+    let mut base_username = String::new();
     if let Some(base_sec) = &current_conflict.base_secret {
         base_pw = crate::crypto::decrypt(&base_sec.encrypted_password, key)
             .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
@@ -1135,7 +1162,17 @@ pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
             .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
             .unwrap_or_default();
         base_url = base_sec.url.clone();
+        base_title = base_sec.title.clone();
+        base_category = base_sec.category.clone();
+        base_username = base_sec.username.clone();
     }
+
+    // Same highlight rule as url/password/notes: yellow if changed vs base.
+    // Renames are conflicts now (see detect_sync_conflicts), so the panes
+    // must show the fields a rename actually changed.
+    let diff_style = |changed: bool| {
+        if changed { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }
+    };
 
     let local_block = Block::default()
         .borders(Borders::ALL)
@@ -1144,16 +1181,28 @@ pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 
     let local_text = vec![
         Line::from(vec![
+            Span::styled("  Title:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.local_secret.title, diff_style(current_conflict.local_secret.title != base_title)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tags:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.local_secret.category, diff_style(current_conflict.local_secret.category != base_category)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Username: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.local_secret.username, diff_style(current_conflict.local_secret.username != base_username)),
+        ]),
+        Line::from(vec![
             Span::styled("  URL:      ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&current_conflict.local_secret.url, if current_conflict.local_secret.url != base_url { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(&current_conflict.local_secret.url, diff_style(current_conflict.local_secret.url != base_url)),
         ]),
         Line::from(vec![
             Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(local_pw.as_str(), if local_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(local_pw.as_str(), diff_style(local_pw != base_pw)),
         ]),
         Line::from(vec![
             Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(local_notes.as_str(), if local_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(local_notes.as_str(), diff_style(local_notes != base_notes)),
         ]),
     ];
     let local_p = Paragraph::new(local_text).block(local_block);
@@ -1166,16 +1215,28 @@ pub(crate) fn draw_sync_conflict_screen(f: &mut ratatui::Frame, app: &TuiApp) {
 
     let remote_text = vec![
         Line::from(vec![
+            Span::styled("  Title:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.remote_secret.title, diff_style(current_conflict.remote_secret.title != base_title)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tags:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.remote_secret.category, diff_style(current_conflict.remote_secret.category != base_category)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Username: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_conflict.remote_secret.username, diff_style(current_conflict.remote_secret.username != base_username)),
+        ]),
+        Line::from(vec![
             Span::styled("  URL:      ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&current_conflict.remote_secret.url, if current_conflict.remote_secret.url != base_url { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(&current_conflict.remote_secret.url, diff_style(current_conflict.remote_secret.url != base_url)),
         ]),
         Line::from(vec![
             Span::styled("  Password: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(remote_pw.as_str(), if remote_pw != base_pw { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(remote_pw.as_str(), diff_style(remote_pw != base_pw)),
         ]),
         Line::from(vec![
             Span::styled("  Notes:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(remote_notes.as_str(), if remote_notes != base_notes { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) }),
+            Span::styled(remote_notes.as_str(), diff_style(remote_notes != base_notes)),
         ]),
         Line::from(""),
         Line::from(vec![

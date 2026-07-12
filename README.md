@@ -9,7 +9,8 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 ## 🛠️ Features
 
 ### 🖥️ Interactive TUI Dashboard
-- **Split-Pane Layout:** Sidebar for category filtering, text-based query search, and a rich credential detail panel.
+- **Split-Pane Layout:** Sidebar for tag filtering, text-based query search, and a rich credential detail panel.
+- **Tags:** Every credential can carry multiple comma-separated tags (e.g. `work, email`); the sidebar lists each tag individually and filters on any of them. Tags live in the same field older versions treat as the single category, so vaults, exports, and shared Git remotes stay fully compatible in both directions — no migration, no minimum-version bump.
 - **Stateful Viewports:** Full list scrolling support (automatically keeps selected rows in view) with support for PageUp / PageDown.
 - **Secure Copy Shortcuts:** Copy username, password, or website URLs directly to your clipboard.
 - **Auto-Clearing Clipboard:** Clipboard data is automatically cleared after a configurable delay (default 5 seconds) to mitigate memory leakage and snooping.
@@ -60,9 +61,9 @@ Your credentials database is stored offline inside your user config folder:
 
 | Key | Action |
 | :--- | :--- |
-| **`[Tab]`** / **`[Shift+Tab]`** | Toggle focus between panels (Categories ➔ Credentials ➔ Details) forward/backward |
+| **`[Tab]`** / **`[Shift+Tab]`** | Toggle focus between panels (Tags ➔ Credentials ➔ Details) forward/backward |
 | **`[↑]` / `[↓]`** | Scroll up/down through lists |
-| **`[PgUp]` / `[PgDn]`** | Page up/down (moves selection by 10 items in secrets, 5 items in categories) |
+| **`[PgUp]` / `[PgDn]`** | Page up/down (moves selection by 10 items in secrets, 5 items in tags) |
 | **`[Space]`** | Mark / Unmark selected credential |
 | **`[/]`** | Activate search bar (Type query ➔ Press `[Enter]` or `[Esc]` to exit search input) |
 | **`[v]`** | Toggle password visibility in detail pane |
@@ -128,9 +129,9 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   *(Copies target field to system clipboard and automatically clears it after the configured delay (default 5 seconds). Defaults to password)*
 * **Insert a Secret:**
   ```bash
-  keystash add <Title> <Category> <Username> [URL]
+  keystash add <Title> <Tags> <Username> [URL]
   ```
-  *Note: Double quotes are mandatory for arguments containing spaces (e.g. `keystash add "My Google Account" "Email" "user@gmail.com"`)*
+  *Note: Tags are comma-separated (e.g. `"work,email"`). Double quotes are mandatory for arguments containing spaces or commas (e.g. `keystash add "My Google Account" "email, personal" "user@gmail.com"`)*
 * **Import Credentials:**
   ```bash
   keystash import <path/to/backup_file>
@@ -167,7 +168,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 
 This section describes the mechanisms. For "given a specific compromise, what does an attacker actually get" — SQLCipher-only, field-layer, git-remote (read and write access), and HIBP network exposure — see [THREAT_MODEL.md](THREAT_MODEL.md).
 
-1. **Full-Database Encryption (SQLCipher):** The entire `vault.db` file is encrypted via SQLCipher — schema, indexes, and every column, including `title`, `category`, `username`, and `url`. Without the correct master password, the file is an opaque blob, not a readable SQLite database; there is no plaintext metadata for anyone with read access to your Git backup repository (or the raw file) to see.
+1. **Full-Database Encryption (SQLCipher):** The entire `vault.db` file is encrypted via SQLCipher — schema, indexes, and every column, including `title`, `category` (the column your tags are stored in), `username`, and `url`. Without the correct master password, the file is an opaque blob, not a readable SQLite database; there is no plaintext metadata for anyone with read access to your Git backup repository (or the raw file) to see.
 2. **Independent Column-Level Layer:** As defense in depth on top of full-database encryption, `password` and `notes` are *additionally* encrypted individually with XChaCha20-Poly1305, using a key derived independently (via HKDF-SHA256, with domain separation) from the same Argon2id master key. A compromise of the SQLCipher layer alone does not, by itself, expose these fields.
 3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and embedded in the first 16 bytes of `vault.db` itself (the SQLCipher header's salt slot, which is deliberately plaintext) — nothing inside the encrypted database can be read until the key derived from that salt is already known, so the salt must live somewhere readable up front, and keeping it in the file makes the vault a single self-contained unit. Vaults created before v0.3.6 kept the salt in a `vault.salt` sidecar file; they are converted automatically on their first unlock.
 4. **XChaCha20-Poly1305 AEAD:** The column-level sensitive fields are encrypted individually before being stored. Every encryption generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
@@ -245,9 +246,10 @@ If a stale device ever syncs before you get to it, nothing is lost: the rotated 
 
 ### 2. How it operates
 * **TUI Startup Sync:** When you run `keystash` in TUI mode, it starts a non-blocking background thread to fetch (but not yet merge) remote changes concurrent with displaying the Master Password lock screen. The database itself is encrypted, so the actual logical merge needs the key and runs immediately after you unlock, before the dashboard appears.
-* **Background Change Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote. Runs automatically after bulk CSV imports. Single changes inside the TUI are queued locally until exit to avoid redundant network calls.
+* **Background Change Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote. Runs automatically after bulk CSV imports. Single changes inside the TUI are queued locally until exit to avoid redundant network calls. The outcome of every background sync is reported in the TUI — success in the status bar, failures (including a refused push after a master-password rotation elsewhere, which comes with step-by-step recovery instructions) in a dialog.
+* **Auto Sync setting:** The Settings screen's *Auto Sync* toggle controls the **automatic** sync actions only — the startup fetch, the post-unlock/post-import merge, and the exit-time push. With it off, KeyStash never touches the network on its own; the manual `[s]` key and `keystash sync` still work whenever you ask. (The `--no-sync` flag is stronger: it disables all sync, manual included, for that session.)
 * **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
-* **Logical Database Merge:** Every record carries a stable, randomly generated sync ID (independent of its title/category/username, which can otherwise coincidentally repeat between records) that merges, updates, and tombstones are all matched on. If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept.
+* **Logical Database Merge:** Every record carries a stable, randomly generated sync ID (independent of its title/tags/username, which are freely editable and can coincidentally repeat between records) that merges, updates, and tombstones are all matched on. Every field — title, tags, username, URL, password, notes — is carried through the merge, so renames and re-taggings propagate like any other edit. If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept; if *both* sides changed it since their last common state, the interactive conflict resolver opens instead.
 > [!NOTE]
 > Syncing requires every device to be on a KeyStash version that supports this sync ID. If one device is still on an older version, syncing from an updated device produces a clear "update KeyStash on the other device first" message rather than merging incorrectly — update the older device and sync it at least once, then sync resumes normally everywhere.
 

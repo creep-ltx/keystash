@@ -737,7 +737,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
         .collect();
 
     let categories_list = List::new(category_items)
-        .block(Block::default().borders(Borders::ALL).title("Categories").border_style(
+        .block(Block::default().borders(Borders::ALL).title("Tags").border_style(
             if app.active_block == ActiveBlock::Categories { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) }
         ));
     app.category_list_state.borrow_mut().select(Some(app.selected_category_idx));
@@ -814,7 +814,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
                 Span::styled(&record.title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled("Category: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tags:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(&record.category, Style::default().fg(Color::White)),
             ]),
             Line::from(vec![

@@ -80,6 +80,50 @@ pub struct SecretRecord {
     pub sync_uuid: String,
 }
 
+// ─────────────────────────────────────────────
+//  Tags
+//
+//  Tags are stored in the existing `category` column as one comma-separated
+//  string ("work, email") rather than a normalized side table, deliberately:
+//  - the sync merge stays row-based -- tags ride the same last-write-wins
+//    column copy as every other field, with no second table needing its own
+//    merge/tombstone semantics;
+//  - it is not a schema or format change, so there is no
+//    MIN_COMPATIBLE_APP_VERSION bump: an older KeyStash simply displays the
+//    raw "work, email" string as that record's category, which degrades
+//    readably instead of breaking.
+//  The column keeps its `category` name in the schema and in SecretRecord
+//  for the same compatibility reason (the CSV export header depends on it
+//  too -- see export_vault_csv); everything user-facing says "Tags".
+// ─────────────────────────────────────────────
+
+/// Splits a stored tags string into individual tags: comma-separated,
+/// trimmed, empties dropped, exact duplicates removed (first occurrence
+/// wins). A pre-tags single category value comes back as one tag.
+pub fn parse_tags(stored: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stored
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter(|t| seen.insert(t.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Canonical storage form for a user-typed tags string: parsed, then
+/// re-joined as "a, b, c". Empty if no actual tags survive parsing.
+pub fn normalize_tags(input: &str) -> String {
+    parse_tags(input).join(", ")
+}
+
+/// True if the record's stored tags string contains `tag` as one of its
+/// tags (exact match after splitting -- not a substring match, so the tag
+/// "work" does not match a record tagged only "workshop").
+pub fn record_has_tag(stored: &str, tag: &str) -> bool {
+    parse_tags(stored).iter().any(|t| t == tag)
+}
+
 /// Generates a random v4 UUID used as a record's stable sync/merge identity.
 /// Not derived from any secret and not itself sensitive -- it exists purely
 /// so `sync.rs`'s merge logic and tombstones have something unique to key on,
@@ -1089,19 +1133,28 @@ pub fn now_timestamp(conn: &Connection) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Writes a record's fields without re-encrypting anything -- used by sync
+/// conflict resolution (applying the chosen side's already-encrypted blobs)
+/// and by dedup's re-stamping. Carries title/category/username too: under
+/// the sync_uuid identity those are mutable payload like url/notes, so
+/// resolving "keep remote" must be able to apply a remote-side rename, not
+/// just remote's password/notes.
 pub fn update_secret_raw(
     conn: &Connection,
     id: i64,
+    title: &str,
+    category: &str,
+    username: &str,
     url: &str,
     encrypted_password: &[u8],
     encrypted_notes: Option<&[u8]>,
     updated_at: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE secrets 
-         SET url = ?1, encrypted_password = ?2, encrypted_notes = ?3, updated_at = ?4
-         WHERE id = ?5",
-        rusqlite::params![url, encrypted_password, encrypted_notes, updated_at, id],
+        "UPDATE secrets
+         SET title = ?1, category = ?2, username = ?3, url = ?4, encrypted_password = ?5, encrypted_notes = ?6, updated_at = ?7
+         WHERE id = ?8",
+        rusqlite::params![title, category, username, url, encrypted_password, encrypted_notes, updated_at, id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1454,6 +1507,43 @@ pub fn get_all_hibp_checks(conn: &Connection) -> Result<std::collections::HashMa
         }
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn parse_tags_splits_trims_and_dedupes() {
+        assert_eq!(parse_tags("work, email"), vec!["work", "email"]);
+        assert_eq!(parse_tags("  work ,email,, work ,"), vec!["work", "email"]);
+        // A pre-tags single category value is simply one tag.
+        assert_eq!(parse_tags("Banking"), vec!["Banking"]);
+        assert!(parse_tags("").is_empty());
+        assert!(parse_tags(" , ,,").is_empty());
+        // Case is preserved and distinct -- "Work" and "work" are different
+        // tags, same as categories always were.
+        assert_eq!(parse_tags("Work, work"), vec!["Work", "work"]);
+    }
+
+    #[test]
+    fn normalize_tags_produces_the_canonical_storage_form() {
+        assert_eq!(normalize_tags("work,email"), "work, email");
+        assert_eq!(normalize_tags("  a ,, b , a "), "a, b");
+        assert_eq!(normalize_tags(",,,"), "");
+        assert_eq!(normalize_tags("solo"), "solo");
+        // Normalizing an already-canonical string is a no-op.
+        assert_eq!(normalize_tags("a, b"), "a, b");
+    }
+
+    #[test]
+    fn record_has_tag_matches_whole_tags_not_substrings() {
+        assert!(record_has_tag("work, email", "work"));
+        assert!(record_has_tag("work, email", "email"));
+        assert!(!record_has_tag("workshop", "work"));
+        assert!(!record_has_tag("work, email", "mail"));
+        assert!(!record_has_tag("", "work"));
+    }
 }
 
 #[cfg(test)]

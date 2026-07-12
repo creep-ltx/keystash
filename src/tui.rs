@@ -214,6 +214,18 @@ pub struct TuiApp {
     pub selected_conflict_idx: usize,
     pub sync_conflicts_detected: Arc<Mutex<Option<Vec<crate::sync::ConflictGroup>>>>,
 
+    /// Outcome of the most recent background sync (post-unlock, post-import,
+    /// post-conflict, or the manual [s] key), written by the worker thread
+    /// and consumed by run_loop. Without this, background sync results --
+    /// including the rotation-refusal message, whose entire value is its
+    /// step-by-step recovery instructions -- were silently discarded
+    /// (`let _ = git_sync_vault(...)`): a stale device's user could unlock,
+    /// have sync refuse, and keep working for a whole session believing
+    /// they were synced. Same mailbox shape as sync_conflicts_detected.
+    /// Only consumed while on the Dashboard, so a failure dialog can't
+    /// hijack the screen out from under a half-typed form.
+    pub sync_result: Arc<Mutex<Option<Result<String, String>>>>,
+
     // Whether the vault at db_path predates SQLCipher and needs one-time migration
     // on next successful password entry (see `handle_lock_input`).
     pub(crate) needs_migration: bool,
@@ -312,6 +324,7 @@ impl TuiApp {
             sync_conflicts: Vec::new(),
             selected_conflict_idx: 0,
             sync_conflicts_detected: Arc::new(Mutex::new(None)),
+            sync_result: Arc::new(Mutex::new(None)),
             pending_sync_thread: Arc::new(Mutex::new(None)),
         };
         app.trigger_prelock_fetch();
@@ -459,14 +472,18 @@ impl TuiApp {
             if let Ok(records) = db::get_secrets(&self.conn) {
                 self.secrets = records;
                 
-                // Get unique categories
+                // Build the sidebar tag list: each record's stored tags
+                // string is split into individual tags, so a record tagged
+                // "work, email" appears under both.
                 let mut cats = std::collections::HashSet::new();
                 for r in &self.secrets {
-                    cats.insert(r.category.clone());
+                    for tag in db::parse_tags(&r.category) {
+                        cats.insert(tag);
+                    }
                 }
                 let mut sorted_cats: Vec<String> = cats.into_iter().collect();
                 sorted_cats.sort();
-                
+
                 self.categories = vec!["All".to_string()];
                 self.categories.extend(sorted_cats);
                 
@@ -571,13 +588,13 @@ impl TuiApp {
         if query.is_empty() {
             self.filtered_secrets = self.secrets
                 .iter()
-                .filter(|r| current_cat == "All" || r.category == current_cat)
+                .filter(|r| current_cat == "All" || db::record_has_tag(&r.category, &current_cat))
                 .cloned()
                 .collect();
         } else {
             let mut scored_secrets = Vec::new();
             for r in &self.secrets {
-                if current_cat != "All" && r.category != current_cat {
+                if current_cat != "All" && !db::record_has_tag(&r.category, &current_cat) {
                     continue;
                 }
 
@@ -693,7 +710,14 @@ impl TuiApp {
     /// itself is fast and local, and runs immediately after a successful unlock
     /// in `trigger_postunlock_sync`, reusing the ref this fetch just updated.
     pub(crate) fn trigger_prelock_fetch(&self) {
-        if self.no_sync {
+        // config.auto_sync gates every *automatic* sync action (this fetch,
+        // the post-unlock/post-import sync, and the exit-time sync) but not
+        // the manual [s] key or `keystash sync` -- that's the distinction
+        // from --no-sync, which disables everything. The setting existed in
+        // the Settings screen before this check did; it was saved and
+        // displayed but read by nothing, so toggling it changed no behavior
+        // at all.
+        if self.no_sync || !self.config.auto_sync {
             return;
         }
         let db_path = crate::get_db_path();
@@ -725,7 +749,8 @@ impl TuiApp {
     /// Detects conflicts against the ref `trigger_prelock_fetch` already updated;
     /// if none are found, performs the normal full logical merge + push.
     pub(crate) fn trigger_postunlock_sync(&self) {
-        if self.no_sync {
+        // Automatic trigger -- gated on Auto Sync, see trigger_prelock_fetch.
+        if self.no_sync || !self.config.auto_sync {
             return;
         }
         let key = match &self.key {
@@ -734,6 +759,7 @@ impl TuiApp {
         };
         let db_path = crate::get_db_path();
         let detected_clone = Arc::clone(&self.sync_conflicts_detected);
+        let result_clone = Arc::clone(&self.sync_result);
         // Take the previous handle out and hand it to the new thread so the
         // join happens *before* this sync touches any files, rather than
         // racing against it: spawning first and joining after (the previous
@@ -748,13 +774,18 @@ impl TuiApp {
             match crate::sync::detect_sync_conflicts(&db_path, &key) {
                 Ok(conflicts) => {
                     if !conflicts.is_empty() {
+                        // The conflict screen is the outcome here; no
+                        // separate status message needed.
                         *detected_clone.lock().unwrap() = Some(conflicts);
                         return;
                     }
                 }
                 Err(_) => {}
             }
-            let _ = crate::sync::git_sync_vault(&db_path, &key);
+            let result = crate::sync::git_sync_vault(&db_path, &key);
+            if let Ok(mut slot) = result_clone.lock() {
+                *slot = Some(result);
+            }
         });
         if let Ok(mut slot) = self.pending_sync_thread.lock() {
             *slot = Some(handle);
@@ -778,6 +809,7 @@ impl TuiApp {
             None => return,
         };
         let db_path = crate::get_db_path();
+        let result_clone = Arc::clone(&self.sync_result);
         // See trigger_postunlock_sync: join the previous handle inside the
         // new thread, before it touches any files, rather than after spawning.
         let previous = self.pending_sync_thread.lock().ok().and_then(|mut s| s.take());
@@ -785,7 +817,10 @@ impl TuiApp {
             if let Some(prev) = previous {
                 let _ = prev.join();
             }
-            let _ = crate::sync::git_sync_vault(&db_path, &key);
+            let result = crate::sync::git_sync_vault(&db_path, &key);
+            if let Ok(mut slot) = result_clone.lock() {
+                *slot = Some(result);
+            }
         });
         if let Ok(mut slot) = self.pending_sync_thread.lock() {
             *slot = Some(handle);
@@ -840,7 +875,9 @@ pub fn run_tui(mut app: TuiApp) -> Result<(), io::Error> {
     // Only possible if the vault was actually unlocked at some point during this
     // session -- git_sync_vault needs the key to open/attach the now
     // SQLCipher-encrypted database, and there's nothing to merge otherwise.
-    if !app.no_sync {
+    // Gated on Auto Sync like every automatic trigger (a manual [s] sync
+    // that's still in flight was already joined above regardless).
+    if !app.no_sync && app.config.auto_sync {
         if let Some(key) = app.key.clone() {
             let db_path = crate::get_db_path();
             if crate::sync::is_git_configured(&db_path) {
@@ -867,6 +904,31 @@ fn run_loop<B: ratatui::backend::Backend>(
                 app.sync_conflicts = conflicts;
                 app.selected_conflict_idx = 0;
                 app.screen = Screen::SyncConflictScreen;
+            }
+        }
+
+        // Surface the outcome of a finished background sync. Consumed only
+        // on the Dashboard: an error dialog popping over a half-typed form
+        // (or the Lock screen, whose dismissal path leads to the Dashboard)
+        // would be worse than the message waiting a few ticks -- the slot
+        // holds it until the user is back somewhere it can safely show.
+        if app.screen == Screen::Dashboard {
+            let finished_sync = app.sync_result.lock().ok().and_then(|mut slot| slot.take());
+            match finished_sync {
+                Some(Ok(msg)) => {
+                    app.copied_message = Some((msg, Instant::now(), StatusType::Normal));
+                    // A successful sync may have merged remote changes into
+                    // the vault this session is currently showing.
+                    app.refresh_secrets();
+                }
+                Some(Err(err)) => {
+                    // The error dialog, not the one-line status bar: sync
+                    // failures include the multi-line rotation refusal whose
+                    // recovery steps must actually be readable.
+                    app.error_message = format!("Sync failed: {}", err);
+                    app.screen = Screen::ErrorDialog;
+                }
+                None => {}
             }
         }
 
