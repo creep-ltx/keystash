@@ -2157,7 +2157,12 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
     };
 
     let status_bar = Paragraph::new(status_text)
-        .block(Block::default().borders(Borders::ALL).title("Actions"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Actions")
+                .title_bottom(Line::from(concat!("v", env!("CARGO_PKG_VERSION"))).right_aligned()),
+        );
     f.render_widget(status_bar, main_layout[1]);
 }
 
@@ -3386,9 +3391,38 @@ fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
     }
 }
 
+/// Number of on-screen grid rows the 8 settings fields occupy at 2 fields
+/// per row. Kept as a named constant since draw_settings_screen and
+/// settings_grid_scroll both need to agree on it.
+const SETTINGS_GRID_ROWS: usize = 4;
+
+/// How many of the 4 field-grid rows actually fit in a settings box this
+/// tall, and which row to start drawing from so `active_settings_field`'s
+/// row is always among the visible ones. Pure function of height and the
+/// active field, not app state, so there's nothing to keep in sync -- the
+/// scroll position just falls out of "what's focused" on every frame.
+fn settings_grid_scroll(area_height: u16, active_settings_field: usize) -> (usize, usize) {
+    const ROW_HEIGHT: u16 = 3;
+    const RESERVED_FOR_HINTS: u16 = 3;
+
+    // Mirrors the margin(2) applied to `area` below.
+    let usable_height = area_height.saturating_sub(4);
+    let rows_that_fit = ((usable_height.saturating_sub(RESERVED_FOR_HINTS)) / ROW_HEIGHT)
+        .max(1)
+        .min(SETTINGS_GRID_ROWS as u16) as usize;
+
+    let active_row = active_settings_field / 2;
+    let max_scroll = SETTINGS_GRID_ROWS.saturating_sub(rows_that_fit);
+    let scroll_offset = active_row
+        .saturating_sub(rows_that_fit.saturating_sub(1))
+        .min(max_scroll);
+
+    (rows_that_fit, scroll_offset)
+}
+
 fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
     let size = f.size();
-    let area = centered_rect(70, 90, size);
+    let area = centered_rect(85, 90, size);
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -3397,23 +3431,39 @@ fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         .border_style(Style::default().fg(Color::Yellow));
     f.render_widget(block, area);
 
+    // Laid out 2 fields per grid row (4 rows for 8 fields) rather than the
+    // old 1-per-row stack: a single column of 8 individually-bordered
+    // fields needed 24+ rows just for the boxes, which silently lost
+    // content rows -- ratatui's constraint solver shrinks Length(3) boxes
+    // to fit when there isn't room, and a box shrunk to 2 rows has nowhere
+    // left to draw its value line -- on anything close to a standard
+    // 80x24 terminal. Even the 2-column grid additionally scrolls (see
+    // settings_grid_scroll) so no terminal size, however small, can hide
+    // a field's value entirely; it'll just take more Tab presses to reach.
+    let fields: [(&str, String, bool); 8] = [
+        ("1. Idle Timeout (s)", app.settings_idle_timeout.clone(), app.active_settings_field == 0),
+        ("2. Clipboard Delay (s)", app.settings_clipboard_clear.clone(), app.active_settings_field == 1),
+        ("3. Auto Sync (Y/N)", if app.settings_auto_sync { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 2),
+        ("4. Gen Length", app.settings_gen_length.clone(), app.active_settings_field == 3),
+        ("5. Gen Lowercase (Y/N)", if app.settings_gen_lowercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 4),
+        ("6. Gen Uppercase (Y/N)", if app.settings_gen_uppercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 5),
+        ("7. Gen Numbers (Y/N)", if app.settings_gen_numbers { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 6),
+        ("8. Gen Symbols (Y/N)", if app.settings_gen_symbols { "Yes [Space to toggle]" } else { "No [Space to toggle]" }.to_string(), app.active_settings_field == 7),
+    ];
+
+    let (rows_that_fit, scroll_offset) = settings_grid_scroll(area.height, app.active_settings_field);
+    let max_scroll = SETTINGS_GRID_ROWS.saturating_sub(rows_that_fit);
+
+    let mut constraints: Vec<Constraint> = (0..rows_that_fit).map(|_| Constraint::Length(3)).collect();
+    constraints.push(Constraint::Min(2)); // hints (+ scroll indicator)
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([
-            Constraint::Length(3), // Idle Timeout
-            Constraint::Length(3), // Clipboard delay
-            Constraint::Length(3), // Auto sync
-            Constraint::Length(3), // Default Generator Length
-            Constraint::Length(3), // Generator lowercase
-            Constraint::Length(3), // Generator uppercase
-            Constraint::Length(3), // Generator numbers
-            Constraint::Length(3), // Generator symbols
-            Constraint::Min(2),    // Hints
-        ])
+        .constraints(constraints)
         .split(area);
 
-    let render_field = |_f_idx: usize, label: &str, value: &str, active: bool, frame: &mut ratatui::Frame, rect: ratatui::layout::Rect| {
+    let render_field = |label: &str, value: &str, active: bool, frame: &mut ratatui::Frame, rect: Rect| {
         let border_color = if active { Color::Green } else { Color::DarkGray };
         let text_style = if active { Style::default().fg(Color::Green) } else { Style::default().fg(Color::White) };
         let p = Paragraph::new(Span::styled(value, text_style))
@@ -3421,87 +3471,111 @@ fn draw_settings_screen(f: &mut ratatui::Frame, app: &TuiApp) {
         frame.render_widget(p, rect);
     };
 
-    render_field(
-        0,
-        "1. Idle Timeout (seconds)",
-        &app.settings_idle_timeout,
-        app.active_settings_field == 0,
-        f,
-        chunks[0],
-    );
+    for visible_idx in 0..rows_that_fit {
+        let row_idx = scroll_offset + visible_idx;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[visible_idx]);
 
-    render_field(
-        1,
-        "2. Clipboard Clear Delay (seconds)",
-        &app.settings_clipboard_clear,
-        app.active_settings_field == 1,
-        f,
-        chunks[1],
-    );
+        if let Some((label, value, active)) = fields.get(row_idx * 2) {
+            render_field(label, value, *active, f, cols[0]);
+        }
+        if let Some((label, value, active)) = fields.get(row_idx * 2 + 1) {
+            render_field(label, value, *active, f, cols[1]);
+        }
+    }
 
-    render_field(
-        2,
-        "3. Auto Sync with Git Remote (Yes/No)",
-        if app.settings_auto_sync { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
-        app.active_settings_field == 2,
-        f,
-        chunks[2],
-    );
-
-    render_field(
-        3,
-        "4. Default Generator Password Length",
-        &app.settings_gen_length,
-        app.active_settings_field == 3,
-        f,
-        chunks[3],
-    );
-
-    render_field(
-        4,
-        "5. Password Gen: Use Lowercase (Yes/No)",
-        if app.settings_gen_lowercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
-        app.active_settings_field == 4,
-        f,
-        chunks[4],
-    );
-
-    render_field(
-        5,
-        "6. Password Gen: Use Uppercase (Yes/No)",
-        if app.settings_gen_uppercase { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
-        app.active_settings_field == 5,
-        f,
-        chunks[5],
-    );
-
-    render_field(
-        6,
-        "7. Password Gen: Use Numbers (Yes/No)",
-        if app.settings_gen_numbers { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
-        app.active_settings_field == 6,
-        f,
-        chunks[6],
-    );
-
-    render_field(
-        7,
-        "8. Password Gen: Use Symbols (Yes/No)",
-        if app.settings_gen_symbols { "Yes [Space to toggle]" } else { "No [Space to toggle]" },
-        app.active_settings_field == 7,
-        f,
-        chunks[7],
-    );
-
-    let hints = Paragraph::new(Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" Tab/Arrows ", Style::default().fg(Color::Cyan)),
         Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
         Span::styled(" Enter ", Style::default().fg(Color::Green)),
         Span::styled("Save & Exit  ", Style::default().fg(Color::DarkGray)),
         Span::styled(" Esc ", Style::default().fg(Color::Red)),
         Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
-    ]));
-    f.render_widget(hints, chunks[8]);
+    ];
+    if max_scroll > 0 {
+        hint_spans.push(Span::styled(
+            format!("  (row {}/{}, scroll with Tab/Arrows)", scroll_offset + 1, SETTINGS_GRID_ROWS),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[rows_that_fit]);
+}
+
+#[cfg(test)]
+mod settings_layout_tests {
+    use super::*;
+
+    // The original bug (some settings fields rendered with no value
+    // visible at all) came from a single-column layout needing 32
+    // rows minimum while a standard terminal offers 24 -- ratatui's
+    // constraint solver silently shrinks some Length(3) boxes down to 2
+    // rows, which have no room left for the value line. These tests pin
+    // down the 2-column, scrolling replacement so that regression can't
+    // come back quietly: whatever the terminal height, every field must
+    // eventually be reachable and, once reachable, fully visible.
+
+    #[test]
+    fn all_four_rows_fit_on_a_generously_sized_terminal() {
+        let (rows_that_fit, scroll_offset) = settings_grid_scroll(40, 0);
+        assert_eq!(rows_that_fit, SETTINGS_GRID_ROWS);
+        assert_eq!(scroll_offset, 0);
+    }
+
+    #[test]
+    fn a_standard_80x24_terminal_shows_at_least_one_full_row() {
+        // area.height here is centered_rect(85, 90, 24)'s output, but the
+        // function only needs the resulting height -- exercise it directly
+        // at the kind of height a 24-row terminal actually yields.
+        let (rows_that_fit, _) = settings_grid_scroll(21, 0);
+        assert!(rows_that_fit >= 1, "must always show at least one full row, never a half-visible one");
+    }
+
+    #[test]
+    fn scroll_never_leaves_less_than_a_full_row_visible() {
+        // Across every plausible height and every field a user could have
+        // focused, rows_that_fit must never be 0 (a 0-height row shows
+        // nothing, same failure mode as the original bug) and the active
+        // field's row must always fall inside the visible window.
+        for height in 0..=60u16 {
+            for active_field in 0..8usize {
+                let (rows_that_fit, scroll_offset) = settings_grid_scroll(height, active_field);
+                assert!(rows_that_fit >= 1, "height={height}: rows_that_fit must never be 0");
+
+                let active_row = active_field / 2;
+                assert!(
+                    active_row >= scroll_offset && active_row < scroll_offset + rows_that_fit,
+                    "height={height} active_field={active_field}: active row {active_row} not in visible window [{scroll_offset}, {})",
+                    scroll_offset + rows_that_fit
+                );
+                assert!(
+                    scroll_offset + rows_that_fit <= SETTINGS_GRID_ROWS,
+                    "height={height} active_field={active_field}: visible window runs past the last row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tabbing_through_every_field_on_a_tiny_terminal_eventually_shows_each_one() {
+        // Simulates a terminal too short to show all 4 rows at once (only
+        // 1 fits) and confirms Tab-ing through every field (0..8, matching
+        // handle_settings_input's linear navigation) brings each field's
+        // row into view at some point -- nothing is permanently unreachable.
+        let tiny_height = 10; // rows_that_fit == 1 at this height
+        let (rows_that_fit, _) = settings_grid_scroll(tiny_height, 0);
+        assert_eq!(rows_that_fit, 1, "test assumes a height that only fits one row -- adjust tiny_height if settings_grid_scroll's constants change");
+
+        let mut rows_seen = std::collections::HashSet::new();
+        for active_field in 0..8usize {
+            let (fit, offset) = settings_grid_scroll(tiny_height, active_field);
+            for r in offset..offset + fit {
+                rows_seen.insert(r);
+            }
+        }
+        assert_eq!(rows_seen, (0..SETTINGS_GRID_ROWS).collect(), "every grid row must be reachable by tabbing through all 8 fields");
+    }
 }
 
 fn draw_hibp_progress_dialog(f: &mut ratatui::Frame, checked: usize, total: usize) {
