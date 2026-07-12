@@ -831,12 +831,7 @@ fn embed_sidecar_salt(
             .map_err(|e| e.to_string())?;
     }
     for (hash, count) in &hibp_checks {
-        new_conn
-            .execute(
-                "INSERT OR REPLACE INTO hibp_checks (password_hash, hibp_count) VALUES (?1, ?2)",
-                params![hash, count.map(|c| c as i64)],
-            )
-            .map_err(|e| e.to_string())?;
+        save_hibp_check(&new_conn, hash, *count)?;
     }
     // Same WAL discipline as change_master_password: force everything into
     // the main file, since only tmp_path itself gets renamed below.

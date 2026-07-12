@@ -169,7 +169,7 @@ fn run_full_audit(records: &mut Vec<(i64, String, String, String, String)>, mast
 /// "Aa1!" that happened to touch all four classes scored higher. Entropy is
 /// what actually determines how hard a password is to brute-force, so it's
 /// what determines severity here instead.
-fn check_strength(password: &str) -> (Severity, Vec<String>, u8) {
+pub(crate) fn check_strength(password: &str) -> (Severity, Vec<String>, u8) {
     let mut issues = Vec::new();
 
     let n_chars = password.chars().count();

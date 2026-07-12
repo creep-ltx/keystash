@@ -26,6 +26,85 @@ use std::{
 
 use crate::db::{self, SecretRecord};
 
+#[cfg(test)]
+mod form_integration_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn render_text(app: &TuiApp) -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_form(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer.get(x, y).symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // Excluded from the normal `cargo test` run and run explicitly with
+    // `cargo test -- --ignored`: it overrides the process-wide HOME env var
+    // (via TuiApp::new, which reads it internally with no way to inject a
+    // test path), which would race against any other test reading it if run
+    // concurrently as part of the default parallel suite. Isolated to a
+    // throwaway temp dir, so it never touches a real vault.
+    #[test]
+    #[ignore]
+    fn form_reuse_and_strength_reflect_the_cache_not_live_decrypt() {
+        let tmp = std::env::temp_dir().join(format!("keystash_form_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        let db_path = tmp.join(".config/keystash/vault.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let (conn, key) = db::create_vault(&db_path, "master-pw").unwrap();
+        db::add_secret(&conn, "One", "Cat", "u1", "", "hunter2", None, &key).unwrap();
+        db::add_secret(&conn, "Two", "Cat", "u2", "", "hunter2", None, &key).unwrap();
+        db::add_secret(&conn, "Three", "Cat", "u3", "", "SoloPassword1!", None, &key).unwrap();
+        drop(conn);
+
+        let mut app = TuiApp::new(true);
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        app.conn = db::open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+        app.key = Some(key);
+        app.refresh_secrets();
+
+        // Open the Add form exactly like pressing 'a' does, then type the
+        // password two existing entries already share.
+        handle_dashboard_input(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        app.active_form_field = FormField::Password;
+        for c in "hunter2".chars() {
+            handle_form_input(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let rendered = render_text(&app);
+        println!("{rendered}");
+        assert!(
+            rendered.contains("Reused in 2 other entry(ies)"),
+            "expected reuse warning against the two pre-existing 'hunter2' entries (via the cache computed on form-open), got:\n{rendered}"
+        );
+
+        // Switch to a password no seeded entry uses at all -- the warning
+        // must disappear (and the strength bar must reflect *that* password).
+        app.form_password.clear();
+        for c in "NeverUsedElsewhere99$".chars() {
+            handle_form_input(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let rendered2 = render_text(&app);
+        assert!(
+            !rendered2.contains("Reused in"),
+            "a password used by no other entry must not show a reuse warning, got:\n{rendered2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveBlock {
     Categories,
@@ -147,6 +226,22 @@ pub struct TuiApp {
     // Audit screen state
     pub audit_report: Option<crate::audit::AuditReport>,
 
+    // Add/Edit form audit cache: computed once when the form opens (see
+    // refresh_form_audit_cache), not re-decrypted from every secret in the
+    // vault on every single render frame. form_reuse_fingerprints maps each
+    // *other* secret's password fingerprint to how many entries share it;
+    // form_hibp_cache is a snapshot of the local HIBP cache table, looked up
+    // by the same fingerprint. Both keyed on crypto::hibp_cache_fingerprint,
+    // so checking the live form_password against either is just a cheap
+    // single-hash-plus-hashmap-lookup per frame instead of a full-vault
+    // decrypt or a database round trip. Trade-off, accepted deliberately: if
+    // a background sync lands new/changed secrets while the form is still
+    // open, these snapshots go stale until the form is reopened -- narrow
+    // window, and reuse/HIBP warnings are advisory, not something save
+    // blocks on.
+    form_reuse_fingerprints: std::collections::HashMap<String, usize>,
+    form_hibp_cache: std::collections::HashMap<String, Option<u64>>,
+
     pub last_activity: Instant,
     pub config: crate::config::AppConfig,
 
@@ -255,6 +350,8 @@ impl TuiApp {
             gen_password: String::new(),
             help_scroll: 0,
             audit_report: None,
+            form_reuse_fingerprints: std::collections::HashMap::new(),
+            form_hibp_cache: std::collections::HashMap::new(),
             last_activity: Instant::now(),
             config: crate::config::AppConfig::load(),
             duplicate_groups: Vec::new(),
@@ -464,6 +561,31 @@ impl TuiApp {
             }
         }
     }
+
+    /// Populates form_reuse_fingerprints and form_hibp_cache once, when the
+    /// Add/Edit form opens -- see those fields' own doc comment for why.
+    /// Must be called after self.edit_id is set (it excludes that record's
+    /// own password from the reuse count, same exclusion draw_form's old
+    /// per-frame loop already applied).
+    fn refresh_form_audit_cache(&mut self) {
+        self.form_reuse_fingerprints.clear();
+        self.form_hibp_cache = db::get_all_hibp_checks(&self.conn).unwrap_or_default();
+
+        let Some(key) = self.key.clone() else { return };
+        for r in &self.secrets {
+            if Some(r.id) == self.edit_id {
+                continue;
+            }
+            if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, &key) {
+                if let Ok(mut pw) = String::from_utf8(dec.to_vec()) {
+                    let fp = crate::crypto::hibp_cache_fingerprint(pw.as_bytes(), &key);
+                    pw.zeroize();
+                    *self.form_reuse_fingerprints.entry(fp).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     fn fuzzy_score(target: &str, query: &str) -> Option<isize> {
         if query.is_empty() {
             return Some(0);
@@ -1113,6 +1235,7 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
             app.form_notes.zeroize();
             app.form_notes.clear();
             app.edit_id = None;
+            app.refresh_form_audit_cache();
         }
         KeyCode::Char('e') => {
             if let Some(record) = app.filtered_secrets.get(app.selected_secret_idx) {
@@ -1141,6 +1264,7 @@ fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifie
                         }
                     }
                 }
+                app.refresh_form_audit_cache();
             }
         }
         KeyCode::Char('d') => {
@@ -2179,6 +2303,16 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(status_bar, main_layout[1]);
 }
 
+/// Delegates scoring to audit::check_strength -- the same entropy-based
+/// scorer the CLI `audit` command and the dashboard's Security Audit panel
+/// use -- instead of an independent, older additive-points scheme that used
+/// to live here. The two used to disagree: a long random lowercase
+/// passphrase could show up "Weak" while being typed into this form and
+/// "Good" moments later in the audit report for that exact same password --
+/// precisely the mis-scoring entropy-based scoring was introduced to fix in
+/// the first place (see check_strength's own doc comment); this indicator
+/// just hadn't been switched over when that fix landed. Bar/color/label now
+/// match the Detail View pane's Security Audit summary exactly.
 fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
     if password.is_empty() {
         return (
@@ -2186,49 +2320,21 @@ fn get_strength_bar(password: &str) -> (Span<'static>, Span<'static>) {
             Span::styled(" Empty", Style::default().fg(Color::DarkGray))
         );
     }
-    
-    let mut score = 0;
-    let len = password.len();
-    
-    if len >= 8 { score += 1; }
-    if len >= 12 { score += 1; }
-    if len >= 16 { score += 1; }
-    
-    let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
-    let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
-    let has_digit = password.chars().any(|c| c.is_ascii_digit());
-    let has_special = password.chars().any(|c| !c.is_ascii_alphanumeric());
-    
-    if has_lower { score += 1; }
-    if has_upper { score += 1; }
-    if has_digit { score += 1; }
-    if has_special { score += 1; }
-    
-    let (bar, label, color) = match score {
-        0..=2 => (" [██░░░░░░░░]", " Weak", Color::Red),
-        3 => (" [████░░░░░░]", " Weak", Color::Red),
-        4 => (" [██████░░░░]", " Medium", Color::Yellow),
-        5 => (" [████████░░]", " Medium", Color::Yellow),
-        6 => (" [█████████░]", " Strong", Color::Green),
-        _ => (" [██████████]", " Very Strong", Color::Green),
+
+    let (severity, _issues, score) = crate::audit::check_strength(password);
+    let color = match severity {
+        crate::audit::Severity::Critical => Color::Red,
+        crate::audit::Severity::Weak => Color::Yellow,
+        crate::audit::Severity::Good => Color::Green,
     };
-    
+    let filled = (score as usize) * 2; // score is 0..=5, bar is 10 chars wide
+    let empty = 10usize.saturating_sub(filled);
+    let bar = format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty));
+
     (
         Span::styled(bar, Style::default().fg(color)),
-        Span::styled(label, Style::default().fg(color))
+        Span::styled(format!(" {}", severity.label()), Style::default().fg(color))
     )
-}
-
-fn check_local_hibp(conn: &rusqlite::Connection, password: &str, master_key: &[u8; 32]) -> Option<u64> {
-    if password.is_empty() {
-        return None;
-    }
-    let hash_hex = crate::crypto::hibp_cache_fingerprint(password.as_bytes(), master_key);
-    conn.query_row(
-        "SELECT hibp_count FROM hibp_checks WHERE password_hash = ?1",
-        [hash_hex],
-        |row| row.get::<_, Option<u64>>(0)
-    ).ok().flatten()
 }
 
 fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
@@ -2317,27 +2423,24 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
     ])).wrap(Wrap { trim: true });
     f.render_widget(strength_paragraph, form_layout[5]);
 
-    // Check reuse
-    let mut reuse_count = 0;
-    if !app.form_password.is_empty() {
-        if let Some(ref key) = app.key {
-            for r in &app.secrets {
-                if let Some(edit_id) = app.edit_id {
-                    if r.id == edit_id {
-                        continue;
-                    }
-                }
-                if let Ok(dec) = crate::crypto::decrypt(&r.encrypted_password, key) {
-                    if let Ok(pw) = String::from_utf8(dec.to_vec()) {
-                        let pw = Zeroizing::new(pw);
-                        if *pw == app.form_password {
-                            reuse_count += 1;
-                        }
-                    }
-                }
-            }
+    // Check reuse against the fingerprints refresh_form_audit_cache computed
+    // once when the form opened, instead of decrypting every other secret
+    // in the vault again on every single render frame (every keystroke,
+    // every 250ms idle-timeout poll tick). The current form password is the
+    // only thing that changes frame to frame, and hashing just that one
+    // value is cheap.
+    let current_fingerprint = app.key.as_ref().and_then(|key| {
+        if app.form_password.is_empty() {
+            None
+        } else {
+            Some(crate::crypto::hibp_cache_fingerprint(app.form_password.as_bytes(), key))
         }
-    }
+    });
+    let reuse_count = current_fingerprint
+        .as_ref()
+        .and_then(|fp| app.form_reuse_fingerprints.get(fp))
+        .copied()
+        .unwrap_or(0);
 
     // Build Audit Warnings line
     let mut warning_spans = vec![
@@ -2353,7 +2456,12 @@ fn draw_form(f: &mut ratatui::Frame, app: &TuiApp) {
         has_warnings = true;
     }
 
-    if let Some(hibp_count) = app.key.as_ref().and_then(|key| check_local_hibp(&app.conn, &app.form_password, key)) {
+    let hibp_lookup = current_fingerprint
+        .as_ref()
+        .and_then(|fp| app.form_hibp_cache.get(fp))
+        .copied()
+        .flatten();
+    if let Some(hibp_count) = hibp_lookup {
         if hibp_count > 0 {
             if has_warnings {
                 warning_spans.push(Span::raw(" | "));
