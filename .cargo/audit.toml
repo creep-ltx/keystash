@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml DoS: build-time-only via wayland-scanner, see deny.toml
+    "RUSTSEC-2026-0195", # same as above
+    "RUSTSEC-2024-0436", # paste unmaintained, transitive via ratatui 0.26
+]
