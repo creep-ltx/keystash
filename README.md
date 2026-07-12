@@ -51,6 +51,8 @@ cp keystash.1 ~/.local/share/man/man1/
 ### 📂 Vault Database Storage Path
 Your credentials database is stored offline inside your user config folder:
 * **Linux/macOS:** `~/.config/keystash/vault.db`
+* If `XDG_CONFIG_HOME` is set, KeyStash uses `$XDG_CONFIG_HOME/keystash/vault.db` instead.
+* If neither `HOME` nor `XDG_CONFIG_HOME` is set, KeyStash falls back to `./.config/keystash/vault.db` relative to the current directory, and prints a warning — the vault will only be found again if run from that same directory every time.
 
 ---
 
@@ -80,6 +82,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[x]`** | Export credentials (all or selected) to CSV |
 | **`[?]`** | Open Help dialog |
 | **`[Esc]`** | Cancel form, exit modal, or close the application |
+| **`[q]`** | Same as `[Esc]`, except in text-entry fields (Add/Edit form, Change Password, Settings), where it types the letter instead |
 
 ---
 
@@ -107,7 +110,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash search <query> [--reveal]
   ```
-  *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext)*
+  *(Passwords are masked by default. Pass `--reveal` or `-r` to show them in plaintext. A query starting with `-` is matched literally as long as it isn't `--reveal`/`-r` themselves; use `keystash search -- -yourquery` to search for a query that collides with a flag name)*
 * **Show Detailed Secret:**
   ```bash
   keystash show <ID> [--reveal]
@@ -162,6 +165,8 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 
 ## 🔒 Security & Cryptographic Model
 
+This section describes the mechanisms. For "given a specific compromise, what does an attacker actually get" — SQLCipher-only, field-layer, git-remote (read and write access), and HIBP network exposure — see [THREAT_MODEL.md](THREAT_MODEL.md).
+
 1. **Full-Database Encryption (SQLCipher):** The entire `vault.db` file is encrypted via SQLCipher — schema, indexes, and every column, including `title`, `category`, `username`, and `url`. Without the correct master password, the file is an opaque blob, not a readable SQLite database; there is no plaintext metadata for anyone with read access to your Git backup repository (or the raw file) to see.
 2. **Independent Column-Level Layer:** As defense in depth on top of full-database encryption, `password` and `notes` are *additionally* encrypted individually with XChaCha20-Poly1305, using a key derived independently (via HKDF-SHA256, with domain separation) from the same Argon2id master key. A compromise of the SQLCipher layer alone does not, by itself, expose these fields.
 3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and embedded in the first 16 bytes of `vault.db` itself (the SQLCipher header's salt slot, which is deliberately plaintext) — nothing inside the encrypted database can be read until the key derived from that salt is already known, so the salt must live somewhere readable up front, and keeping it in the file makes the vault a single self-contained unit. Vaults created before v0.3.6 kept the salt in a `vault.salt` sidecar file; they are converted automatically on their first unlock.
@@ -170,6 +175,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants. Locking the vault (idle timeout or manual lock) also drops the open, keyed SQLCipher connection itself, not just the in-memory key — so the whole-database-encrypted contents aren't left readable through a lingering connection handle while the app sits on the Lock screen.
 7. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after the configured delay (default 5 seconds). Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
 8. **Schema Migrations & Crash Safety:** Database schema integrity checks and upgrades are performed automatically on startup. Both the one-time move to the encrypted database format and a master-password change build the new vault file at a temporary path and swap it into place atomically, rather than modifying the live file in place — if the process is interrupted partway through (crash, power loss), KeyStash detects the leftover backup/temp files on next launch and shows exact recovery instructions instead of mistaking your vault for a fresh install.
+9. **Deletion Tombstone Pruning:** Deleting a credential leaves a "tombstone" record behind so the deletion can propagate correctly to your other devices on their next sync, instead of the credential silently reappearing. Tombstones older than 90 days are pruned automatically during sync, so a deleted credential's title and username don't live on in the vault forever. The 90-day window is intentionally generous — it exists to give any device that syncs infrequently enough time to see the deletion before its tombstone disappears.
 
 ---
 

@@ -27,7 +27,7 @@ Insert a new credential. The CLI will securely prompt you for your password. Dou
 List all stored credentials in the vault. Passwords are masked by default unless \-r or \-\-reveal is supplied. WARNING: Revealing all passwords dumps them in plaintext into the terminal scrollback buffer. Use with caution.
 .TP
 .B search \fIquery\fR [\-r|\-\-reveal]
-Search for matching credentials across titles, categories, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied.
+Search for matching credentials across titles, categories, usernames, or URLs. Passwords are masked by default unless \-r or \-\-reveal is supplied. A query starting with a dash is matched literally as long as it isn't \-r/\-\-reveal itself; use "keystash search \-\- \-yourquery" if it collides with a flag name.
 .TP
 .B show \fIid\fR [\-r|\-\-reveal]
 Show a detailed view of a secret (including notes). Passwords and notes are masked by default unless \-r or \-\-reveal is supplied.
@@ -126,6 +126,9 @@ Toggle the Help & Keybindings modal popup.
 .TP
 .B Esc
 Cancel dialogs, close forms, or exit the application.
+.TP
+.B q
+Same as Esc, except in text-entry fields (Add/Edit form, Change Password, Settings), where it types the letter instead.
 .SH SYNCHRONIZATION & MULTI-MACHINE SETUP
 If the config folder (~/.config/keystash) is initialized as a Git repository, keystash will automatically synchronize and merge database updates across your machines.
 .PP
@@ -172,14 +175,21 @@ Master passwords and decryption keys are securely zeroized from RAM after use. T
 .B Schema Migrations
 .IP
 Database schema integrity checks and upgrades are performed automatically on startup using a custom embedded migrations mechanism.
+.PP
+.B Deletion Tombstone Pruning
+.IP
+Deleting a credential leaves a tombstone record behind so the deletion propagates correctly to other devices on their next sync. Tombstones older than 90 days are pruned automatically during sync, so a deleted credential's title and username don't live on in the vault forever; the 90-day window is intentionally generous, giving an infrequently-synced device time to see the deletion before its tombstone disappears.
 .SH FILES
 .TP
 .I ~/.config/keystash/vault.db
 The local SQLite database storing metadata, validation tokens, and your encrypted secrets.
 .SH ENVIRONMENT
 .TP
+.B XDG_CONFIG_HOME
+If set, used to locate the config directory as $XDG_CONFIG_HOME/keystash/ instead of the default. Checked before HOME.
+.TP
 .B HOME
-Used to locate the user's config directory (~/.config/keystash/).
+Used to locate the user's config directory (~/.config/keystash/) when XDG_CONFIG_HOME is not set. If neither is set, KeyStash falls back to ./.config/keystash/ relative to the current directory and prints a warning.
 .SH AUTHORS
 Written by Tobias Karlsson <tobias@bytebandit.xyz>.
 .SH REPORTING BUGS
