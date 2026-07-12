@@ -1,4 +1,4 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.3.7" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.3.8" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
@@ -100,6 +100,9 @@ Copy website URL to clipboard (clears automatically in configured delay, default
 .B m
 Open the Change Master Password form overlay.
 .TP
+.B s
+Force a manual sync with the configured Git remote.
+.TP
 .B i
 Open the Import modal popup to import credentials from unencrypted backups.
 .TP
@@ -164,7 +167,7 @@ KeyStash automatically clears copied credentials from the system clipboard after
 .PP
 .B Memory Cleansing
 .IP
-Master passwords and decryption keys are securely zeroized from RAM after use. TUI buffers are pre-allocated and cleared/zeroized in-place to prevent heap reallocation remnants.
+Master passwords and decryption keys are securely zeroized from RAM after use. TUI buffers are pre-allocated and cleared/zeroized in-place to prevent heap reallocation remnants. Locking the vault also drops the open, keyed SQLCipher connection itself, not just the in-memory key, so the vault's encrypted contents aren't left readable through a lingering connection while on the Lock screen.
 .PP
 .B Schema Migrations
 .IP

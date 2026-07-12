@@ -75,6 +75,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[D]`** | Open duplicate credential detector and interactive resolver |
 | **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
 | **`[m]`** | Change master password (key rotation) |
+| **`[s]`** | Force a manual sync with the Git remote |
 | **`[i]`** | Import unencrypted credentials from backups |
 | **`[x]`** | Export credentials (all or selected) to CSV |
 | **`[?]`** | Open Help dialog |
@@ -166,7 +167,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
 3. **Argon2id Key Derivation:** When you supply your Master Password, a 256-bit master key is derived using Argon2id. The unique salt is generated via the OS's cryptographically secure pseudo-random number generator (CSPRNG) and embedded in the first 16 bytes of `vault.db` itself (the SQLCipher header's salt slot, which is deliberately plaintext) — nothing inside the encrypted database can be read until the key derived from that salt is already known, so the salt must live somewhere readable up front, and keeping it in the file makes the vault a single self-contained unit. Vaults created before v0.3.6 kept the salt in a `vault.salt` sidecar file; they are converted automatically on their first unlock.
 4. **XChaCha20-Poly1305 AEAD:** The column-level sensitive fields are encrypted individually before being stored. Every encryption generates a unique 192-bit nonce to protect against patterns or dictionary attacks.
 5. **Password Verification Token:** On setup, a static validation string is encrypted. KeyStash attempts to decrypt this string during unlock; if it fails, access is denied without exposing or keeping the master password in memory.
-6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants.
+6. **Memory Cleansing:** Raw buffers, master password strings, and derived keys are zeroized immediately after use. TUI password inputs are pre-allocated at a fixed capacity and cleared/zeroized in-place to prevent heap reallocation remnants. Locking the vault (idle timeout or manual lock) also drops the open, keyed SQLCipher connection itself, not just the in-memory key — so the whole-database-encrypted contents aren't left readable through a lingering connection handle while the app sits on the Lock screen.
 7. **Clipboard Security:** KeyStash automatically clears copied credentials from the clipboard after 10 seconds. Note that some clipboard history managers (like CopyQ, Greenclip, or desktop environment utilities) may intercept copied text immediately. For absolute security, configure your clipboard manager to ignore or blacklist the `keystash` binary.
 8. **Schema Migrations & Crash Safety:** Database schema integrity checks and upgrades are performed automatically on startup. Both the one-time move to the encrypted database format and a master-password change build the new vault file at a temporary path and swap it into place atomically, rather than modifying the live file in place — if the process is interrupted partway through (crash, power loss), KeyStash detects the leftover backup/temp files on next launch and shows exact recovery instructions instead of mistaking your vault for a fresh install.
 
@@ -255,4 +256,4 @@ KeyStash relies exclusively on safe and audited Rust libraries:
 - `arboard` for native Wayland and X11 clipboard integration.
 - `rpassword` for secure CLI console prompt input masking.
 - `serde` & `serde_json` for parsing JSON vault imports.
-- `ureq` for the HaveIBeenPwned breach-check HTTP requests.
+- `ureq` for the HaveIBeenPwned breach-check HTTP requests, via `native-tls` so its HTTPS connection reuses the same vendored OpenSSL as SQLCipher above instead of statically linking a second, independent TLS stack.
