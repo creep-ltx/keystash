@@ -92,6 +92,17 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
         return Err("Sync not configured. Set up git in ~/.config/keystash to enable syncing.".to_string());
     }
 
+    // The README's setup steps write a two-line .gitignore (ignore
+    // everything, track only vault.db), but nothing ever created or
+    // verified it -- and without it, the untracked -wal/-shm sidecars and
+    // any backup/export files in the config dir made `git status` dirty on
+    // every sync. Write it if absent so sync is self-sufficient; never
+    // touch an existing one (a user's customized version wins).
+    let gitignore_path = dir.join(".gitignore");
+    if !gitignore_path.exists() {
+        let _ = fs::write(&gitignore_path, "*\n!vault.db\n");
+    }
+
     // 1. Run git fetch to see if remote changes exist
     let fetch_status = git_command(dir)
         .arg("fetch")
@@ -507,18 +518,43 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
     // device's *next* sync, since the (unpruned) remote copy would still
     // have them and the merge logic copies missing remote tombstones in.
     // Best-effort: a pruning failure shouldn't block the sync itself.
+    //
+    // The checkpoint after it matters for what `git add vault.db` below
+    // actually stages: committed frames -- this sync's own merge/prune
+    // writes, and anything the caller's still-open connection (the TUI
+    // holds one) wrote earlier -- can otherwise still be sitting in
+    // vault.db-wal, which is never staged. Relying on close-time passive
+    // checkpointing here is exactly the hazard change_master_password's
+    // comments document and defend against explicitly; sync gets the same
+    // explicit discipline. Best-effort like the prune: if a concurrent
+    // reader blocks the checkpoint, the pre-existing close-time behavior
+    // still applies.
     if let Ok(prune_conn) = crate::db::open_keyed_connection(db_ref, &sqlcipher_key) {
         let _ = crate::db::prune_old_tombstones(&prune_conn);
+        let _ = prune_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
-    // 3. Stage changes, commit, and push local updates to remote repository
+    // 3. Stage changes, commit, and push local updates to remote repository.
+    // The status check is scoped to the files sync actually manages:
+    // without the scope, stray untracked files in the config dir (the
+    // -wal/-shm sidecars whenever a connection is open, unmerged-remote
+    // backups, exports) made every sync look dirty -- which, combined with
+    // the commit exit-status check, turned a plain no-op sync into a
+    // misleading "git commit failed" error whenever no .gitignore existed.
+    // vault.salt is included so dropping a legacy sidecar (the tracked-file
+    // deletion staged by the `git rm --cached` below) still counts as a
+    // change worth committing.
     let status_output = git_command(dir)
         .arg("status")
         .arg("--porcelain")
+        .arg("--")
+        .arg("vault.db")
+        .arg("vault.salt")
         .output()
         .map_err(|e| format!("git status failed: {}", e))?;
 
     let is_dirty = !status_output.stdout.is_empty();
+    let mut committed = false;
 
     if is_dirty {
         // Stage vault.db
@@ -549,21 +585,37 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             .stderr(Stdio::null())
             .status();
 
-        // Create commit. Checking success here matters: previously an
-        // unnoticed failure (e.g. missing git identity config) left nothing
-        // committed while the code fell straight through to push and
-        // reported "Sync complete: ... merged and updated!" -- a merge that
-        // never actually landed, with no error shown.
-        let commit_status = git_command(dir)
-            .arg("commit")
-            .arg("-m")
-            .arg("sync: auto-merge vault updates")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        // The working tree looked dirty, but after staging, the index can
+        // still be empty (e.g. a touched-but-byte-identical file). `git
+        // commit` on an empty index exits nonzero with "nothing to commit",
+        // which the exit-status check below would misreport as a failed
+        // merge -- an empty index is the up-to-date case, not an error.
+        let index_empty = git_command(dir)
+            .arg("diff")
+            .arg("--cached")
+            .arg("--quiet")
             .status()
-            .map_err(|e| format!("git commit failed: {}", e))?;
-        if !commit_status.success() {
-            return Err("git commit failed while finalizing the merge -- local changes are staged but not committed, and nothing was pushed. Check `git commit` manually in the vault directory (a missing user.name/user.email is a common cause) and re-run sync.".to_string());
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !index_empty {
+            // Create commit. Checking success here matters: previously an
+            // unnoticed failure (e.g. missing git identity config) left nothing
+            // committed while the code fell straight through to push and
+            // reported "Sync complete: ... merged and updated!" -- a merge that
+            // never actually landed, with no error shown.
+            let commit_status = git_command(dir)
+                .arg("commit")
+                .arg("-m")
+                .arg("sync: auto-merge vault updates")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("git commit failed: {}", e))?;
+            if !commit_status.success() {
+                return Err("git commit failed while finalizing the merge -- local changes are staged but not committed, and nothing was pushed. Check `git commit` manually in the vault directory (a missing user.name/user.email is a common cause) and re-run sync.".to_string());
+            }
+            committed = true;
         }
     }
 
@@ -591,7 +643,7 @@ pub fn git_sync_vault<P: AsRef<Path>>(db_path: P, key: &[u8; 32]) -> Result<Stri
             "Sync complete: the remote vault was {} and could not be merged. Your local vault was pushed as the new source of truth; the old remote copy was saved to {:?} in case you need anything from it.",
             reason, backup_path
         ))
-    } else if is_dirty {
+    } else if committed {
         Ok("Sync complete: Local and remote vaults merged and updated!".to_string())
     } else {
         Ok("Sync complete: Vault is already up-to-date with remote.".to_string())
@@ -1442,6 +1494,121 @@ mod tests {
         assert!(sync_result.is_err(), "syncing against a remote requiring a newer version should refuse, not merge");
         let err = sync_result.unwrap_err();
         assert!(err.contains("99.0.0"), "error should name the required version, got: {}", err);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression test for the no-op-sync failure: with a connection still
+    /// open against the vault (exactly what the TUI always has), the
+    /// untracked -wal/-shm sidecars used to make `git status --porcelain`
+    /// dirty on every sync when no .gitignore existed -- and the commit
+    /// exit-status check then turned a plain nothing-changed sync into a
+    /// misleading "git commit failed" error ("nothing to commit" exits
+    /// nonzero). Also pins the new self-sufficiency behavior: sync writes
+    /// the two-line .gitignore itself when absent.
+    #[test]
+    fn noop_sync_with_open_connection_and_no_gitignore_reports_up_to_date() {
+        let root = scratch_root("noop_open_conn");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "Alpha", "Cat", "user", "", "alpha-v1", None, &key_a).unwrap();
+        drop(conn_a);
+        // Deliberately NO .gitignore here -- simulating a setup that skipped
+        // that README step.
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // Hold a connection open across the sync, like the TUI does, and
+        // touch it so the -wal/-shm sidecars exist on disk.
+        let held_conn = crate::db::open_keyed_connection(
+            &device_a.vault_path,
+            &crate::crypto::derive_sqlcipher_key(&key_a),
+        )
+        .unwrap();
+        let _: i64 = held_conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0)).unwrap();
+
+        // Nothing has changed since the push: this must be a clean
+        // "up-to-date", not a commit failure.
+        let result = super::git_sync_vault(&device_a.vault_path, &key_a);
+        let msg = result.expect("a no-op sync with an open connection and no .gitignore must succeed");
+        assert!(
+            msg.contains("up-to-date"),
+            "expected the up-to-date message, got: {}",
+            msg
+        );
+
+        // Sync made itself self-sufficient: the .gitignore now exists with
+        // the README's exact two lines.
+        let gitignore = std::fs::read_to_string(device_a.dir.join(".gitignore"))
+            .expect("sync should have written a .gitignore");
+        assert_eq!(gitignore, "*\n!vault.db\n");
+
+        // And it stays clean on repeat, connection still open.
+        let again = super::git_sync_vault(&device_a.vault_path, &key_a).unwrap();
+        assert!(again.contains("up-to-date"), "second no-op sync: {}", again);
+        drop(held_conn);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The staged vault.db must contain changes that were still WAL-resident
+    /// when sync ran: a record added through a connection that stays open
+    /// across the sync (the TUI's situation) has its frames in vault.db-wal,
+    /// which is never staged -- the explicit pre-`git add` checkpoint is
+    /// what guarantees the main file is complete. Verified from the outside:
+    /// a second device pulling the pushed commit must see the record.
+    #[test]
+    fn wal_resident_changes_reach_the_remote() {
+        let root = scratch_root("wal_staging");
+        let origin = init_bare_origin(&root);
+
+        let device_a = init_device(&root, "device_a", &origin);
+        let (conn_a, key_a) = crate::db::create_vault(&device_a.vault_path, "shared-master-password").unwrap();
+        crate::db::add_secret(&conn_a, "First", "Cat", "user", "", "first-v1", None, &key_a).unwrap();
+        drop(conn_a);
+        for args in [
+            vec!["add", "-f", "vault.db"],
+            vec!["commit", "-m", "Initial vault backup"],
+            vec!["push", "-u", "origin", "main"],
+        ] {
+            let status = Command::new("git").args(&args).current_dir(&device_a.dir).status().unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        }
+
+        // Write through a connection that stays open across the sync, so the
+        // new record's pages sit in the WAL at staging time.
+        let held_conn = crate::db::open_keyed_connection(
+            &device_a.vault_path,
+            &crate::crypto::derive_sqlcipher_key(&key_a),
+        )
+        .unwrap();
+        crate::db::add_secret(&held_conn, "Second", "Cat", "user", "", "second-v1", None, &key_a).unwrap();
+
+        let push = super::git_sync_vault(&device_a.vault_path, &key_a);
+        assert!(push.is_ok(), "sync with WAL-resident changes failed: {:?}", push);
+        drop(held_conn);
+
+        // Device B clones what was actually pushed -- both records must be
+        // there, including the one that was WAL-resident during staging.
+        let device_b = init_device(&root, "device_b", &origin);
+        pull(&device_b);
+        let (conn_b, key_b) = crate::db::open_vault(&device_b.vault_path, "shared-master-password").unwrap();
+        let secrets = crate::db::get_secrets(&conn_b).unwrap();
+        let titles: Vec<&str> = secrets.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(secrets.len(), 2, "expected First and Second on the remote, got: {:?}", titles);
+        assert!(titles.contains(&"Second"), "the WAL-resident record must have been staged and pushed, got: {:?}", titles);
+        assert_eq!(
+            &*crate::crypto::decrypt(&secrets.iter().find(|s| s.title == "Second").unwrap().encrypted_password, &key_b).unwrap(),
+            b"second-v1"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
