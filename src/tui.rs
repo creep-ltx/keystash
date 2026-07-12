@@ -3304,19 +3304,8 @@ fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
         KeyCode::Esc => {
             app.screen = Screen::Dashboard;
         }
-        KeyCode::Up | KeyCode::BackTab => {
-            if app.active_settings_field > 0 {
-                app.active_settings_field -= 1;
-            } else {
-                app.active_settings_field = 7;
-            }
-        }
-        KeyCode::Down | KeyCode::Tab => {
-            if app.active_settings_field < 7 {
-                app.active_settings_field += 1;
-            } else {
-                app.active_settings_field = 0;
-            }
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            app.active_settings_field = settings_field_step(app.active_settings_field, key);
         }
         KeyCode::Char(c) => {
             match app.active_settings_field {
@@ -3381,6 +3370,24 @@ fn handle_settings_input(app: &mut TuiApp, key: KeyCode) {
             app.screen = Screen::Dashboard;
         }
         _ => {}
+    }
+}
+
+/// Where a settings-screen key press moves the active field, given the
+/// 2-column grid layout (fields 0..7, laid out row-major 2-per-row -- see
+/// draw_settings_screen). Up/Down move by a full grid row (index +/- 2,
+/// wrapping); Left/Right move within the row by toggling the low bit
+/// (0<->1, 2<->3, ...); Tab/Shift+Tab are unchanged from before the grid
+/// existed -- a plain linear cycle through all 8, independent of the grid
+/// shape, since that's the "just cycle through" behavior already relied on.
+fn settings_field_step(field: usize, key: KeyCode) -> usize {
+    match key {
+        KeyCode::Up => (field + 6) % 8,
+        KeyCode::Down => (field + 2) % 8,
+        KeyCode::Left | KeyCode::Right => field ^ 1,
+        KeyCode::Tab => if field < 7 { field + 1 } else { 0 },
+        KeyCode::BackTab => if field > 0 { field - 1 } else { 7 },
+        _ => field,
     }
 }
 
@@ -3568,6 +3575,51 @@ mod settings_layout_tests {
             }
         }
         assert_eq!(rows_seen, (0..SETTINGS_GRID_ROWS).collect(), "every grid row must be reachable by tabbing through all 8 fields");
+    }
+
+    #[test]
+    fn settings_field_step_matches_the_grid_layout() {
+        // Fields are laid out row-major, 2 per row:
+        //   row 0: 0 1      row 1: 2 3      row 2: 4 5      row 3: 6 7
+        // (field, key, expected_next)
+        let cases = [
+            // Down moves one full row, wrapping within the same column.
+            (1usize, KeyCode::Down, 3usize),
+            (3, KeyCode::Down, 5),
+            (7, KeyCode::Down, 1),
+            (6, KeyCode::Down, 0),
+            // Up is the mirror image.
+            (3, KeyCode::Up, 1),
+            (0, KeyCode::Up, 6),
+            (1, KeyCode::Up, 7),
+            // Left/Right toggle within the row (both directions do the same
+            // thing on a 2-column grid -- there's only one other cell to go to).
+            (2, KeyCode::Left, 3),
+            (1, KeyCode::Left, 0),
+            (7, KeyCode::Right, 6),
+            // Tab/Shift+Tab: unchanged linear cycle, independent of the grid.
+            (7, KeyCode::Tab, 0),
+            (0, KeyCode::BackTab, 7),
+            (3, KeyCode::Tab, 4),
+            (4, KeyCode::BackTab, 3),
+        ];
+
+        for (field, key, expected) in cases {
+            let actual = settings_field_step(field, key);
+            assert_eq!(
+                actual, expected,
+                "field {field} + {key:?} should move to {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_field_step_never_leaves_the_valid_range() {
+        for field in 0..8usize {
+            for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right, KeyCode::Tab, KeyCode::BackTab] {
+                assert!(settings_field_step(field, key) < 8);
+            }
+        }
     }
 }
 
