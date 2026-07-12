@@ -1,4 +1,4 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.4.3" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.4.4" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
@@ -200,6 +200,9 @@ Deleting a credential leaves a tombstone record behind so the deletion propagate
 .TP
 .I ~/.config/keystash/vault.db
 The local SQLite database storing metadata, validation tokens, and your encrypted secrets.
+.TP
+.I ~/.config/keystash/profiles/<name>/vault.db
+The vault of profile <name> when \-\-profile is used; each profile directory also holds its own config.json and git repository.
 .SH ENVIRONMENT
 .TP
 .B KEYSTASH_CONFIG_DIR

@@ -58,7 +58,9 @@ The SQLCipher key cannot be used to derive the field-layer key or vice
 versa — HKDF is one-way in both directions between sibling keys derived
 from the same input.
 
-**What they don't get:** The passwords and notes themselves. This is the
+**What they don't get:** The passwords and notes themselves — including
+password-history entries, which are the original password ciphertexts and
+carry the same field-level encryption as live passwords. This is the
 entire point of the two-layer design, and the reason it's worth stating
 explicitly: *"defense in depth"* in the README's Security Model section
 means exactly this scenario, not a vaguer promise.

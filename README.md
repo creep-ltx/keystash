@@ -14,6 +14,9 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 - **Stateful Viewports:** Full list scrolling support (automatically keeps selected rows in view) with support for PageUp / PageDown.
 - **Secure Copy Shortcuts:** Copy username, password, or website URLs directly to your clipboard.
 - **Auto-Clearing Clipboard:** Clipboard data is automatically cleared after a configurable delay (default 5 seconds) to mitigate memory leakage and snooping.
+- **Password History:** Every password change keeps the previous value (last 5 per entry, encrypted like live passwords, synced between devices, carried through master-password rotation) — view with `[P]`, copy one back with `c`.
+- **Passphrase Generator:** Alongside random characters, a diceware mode (`[w]` in the generator, `--words` on the CLI) draws from the embedded EFF large wordlist — ~77 bits at the 6-word default, and actually typeable.
+- **Vault Profiles:** `--profile work` keeps fully separate vaults (own database, config, and git remote) for e.g. work/personal splits.
 - **Multi-Select Mass Deletion:** Mark multiple secrets using the Spacebar and batch-delete them all at once.
 - **Delete Confirmations:** Warning prompts on single or mass deletions to prevent accidental loss of data.
 - **First-Time Setup Wizard:** Guides you through setting up a master password on your initial run.
