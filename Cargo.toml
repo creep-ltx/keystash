@@ -1,6 +1,6 @@
 [package]
 name = "keystash"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 description = "A secure offline TUI and CLI password manager featuring logical Git sync"
 license = "MIT"
