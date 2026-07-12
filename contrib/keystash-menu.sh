@@ -31,6 +31,9 @@
 set -euo pipefail
 
 KEYSTASH=${KEYSTASH:-keystash}
+# Compositor-spawned processes often have a minimal PATH without
+# ~/.cargo/bin -- fall back to cargo's default install location.
+command -v "$KEYSTASH" >/dev/null 2>&1 || KEYSTASH="$HOME/.cargo/bin/keystash"
 # shellcheck disable=SC2086 # KEYSTASH_ARGS is deliberately word-split
 ks() { $KEYSTASH ${KEYSTASH_ARGS:-} --no-sync --password-stdin "$@"; }
 
