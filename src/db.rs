@@ -365,7 +365,11 @@ fn open_keyed_connection_impl<P: AsRef<Path>>(
     }
 
     let pragma_hex = crypto::pragma_key_hex(sqlcipher_key);
-    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", *pragma_hex))
+    // pragma_key_hex already returns a Zeroizing<String> for exactly this
+    // reason -- build the SQL statement itself as one too instead of
+    // letting format! hand back a plain String that drops unwiped.
+    let pragma_sql: Zeroizing<String> = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", *pragma_hex));
+    conn.execute_batch(&pragma_sql)
         .map_err(|e| e.to_string())?;
 
     if let Some(salt) = creation_salt {

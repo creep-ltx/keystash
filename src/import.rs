@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use rusqlite::Connection;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::db;
 
@@ -12,9 +12,9 @@ use crate::db;
 /// transaction, so a failure partway through an import rolls back everything
 /// inserted so far instead of leaving a partial, silently-inconsistent import
 /// while still reporting the whole operation as failed.
-fn with_import_transaction<F>(conn: &Connection, body: F) -> Result<usize, String>
+fn with_import_transaction<T, F>(conn: &Connection, body: F) -> Result<T, String>
 where
-    F: FnOnce() -> Result<usize, String>,
+    F: FnOnce() -> Result<T, String>,
 {
     conn.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
     match body() {
@@ -112,6 +112,17 @@ fn read_csv_records(file_path: &str) -> Result<(Vec<String>, Vec<Vec<String>>), 
     Ok((headers, records))
 }
 
+/// Zeroizes every field of a parsed CSV row -- particularly the plaintext
+/// password one of them holds -- instead of letting the whole row drop with
+/// its contents intact in already-freed heap memory. Every field gets wiped
+/// rather than just the password one: which index is the password varies
+/// per format, and there's no downside to also wiping title/username/url/etc.
+fn wipe_row(fields: &mut [String]) {
+    for field in fields {
+        field.zeroize();
+    }
+}
+
 /// Extracts a clean domain or host name from a URL string.
 fn extract_domain(url: &str) -> String {
     if url.is_empty() {
@@ -186,12 +197,18 @@ pub fn detect_format(file_path: &str) -> Result<ImportFormat, String> {
     Err("Unknown or unsupported export file format.".to_string())
 }
 
-/// Parses a Bitwarden unencrypted JSON export and inserts the entries into KeyStash database.
+/// Parses a Bitwarden unencrypted JSON export and inserts the entries into
+/// KeyStash database. Bitwarden items carry a type (1 = Login, 2 = Secure
+/// Note, 3 = Card, 4 = Identity) -- KeyStash only has a `password`/`notes`
+/// shape to put them in, so non-login items are skipped rather than
+/// imported with a fabricated `[Secure Note]` password (which previously
+/// mislabeled cards and identities too, and created a credential-shaped
+/// record holding no actual credential). Returns `(imported, skipped)`.
 pub fn import_bitwarden_json(
     conn: &Connection,
     file_path: &str,
     key: &[u8; 32],
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let file = File::open(file_path).map_err(|e| format!("Could not open file: {}", e))?;
     let reader = BufReader::new(file);
 
@@ -209,9 +226,17 @@ pub fn import_bitwarden_json(
 
     with_import_transaction(conn, || {
         let mut import_count = 0;
+        let mut skipped_count = 0;
 
         if let Some(items) = export.items {
             for item in items {
+                // item_type 1 is Login; everything else (Secure Note, Card,
+                // Identity) has no password field to speak of.
+                if item.item_type != 1 {
+                    skipped_count += 1;
+                    continue;
+                }
+
                 let category = item
                     .folder_id
                     .and_then(|fid| folders_map.get(&fid).cloned())
@@ -237,10 +262,6 @@ pub fn import_bitwarden_json(
                     }
                 }
 
-                if password.is_empty() && item.item_type != 1 {
-                    password = "[Secure Note]".to_string();
-                }
-
                 db::add_secret(
                     conn,
                     &item.name,
@@ -251,11 +272,12 @@ pub fn import_bitwarden_json(
                     item.notes.as_deref(),
                     key,
                 )?;
+                password.zeroize();
                 import_count += 1;
             }
         }
 
-        Ok(import_count)
+        Ok((import_count, skipped_count))
     })
 }
 
@@ -275,7 +297,7 @@ pub fn import_brave_chrome_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             if fields.len() <= std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx))) {
                 continue;
             }
@@ -301,6 +323,7 @@ pub fn import_brave_chrome_csv(
                 None,
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -323,7 +346,7 @@ pub fn import_firefox_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             if fields.len() <= std::cmp::max(url_idx, std::cmp::max(user_idx, pass_idx)) {
                 continue;
             }
@@ -348,6 +371,7 @@ pub fn import_firefox_csv(
                 None,
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -373,7 +397,7 @@ pub fn import_lastpass_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             let max_idx = std::cmp::max(name_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(extra_idx, group_idx)))));
             if fields.len() <= max_idx {
                 continue;
@@ -403,6 +427,7 @@ pub fn import_lastpass_csv(
                 if notes.is_empty() { None } else { Some(notes) },
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -428,7 +453,7 @@ pub fn import_keepassxc_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             let max_idx = std::cmp::max(group_idx, std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(url_idx, notes_idx)))));
             if fields.len() <= max_idx {
                 continue;
@@ -458,6 +483,7 @@ pub fn import_keepassxc_csv(
                 if notes.is_empty() { None } else { Some(notes) },
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -490,7 +516,7 @@ pub fn import_onepassword_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             let mut max_idx = std::cmp::max(title_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, url_idx)));
             if let Some(idx) = notes_idx {
                 max_idx = std::cmp::max(max_idx, idx);
@@ -521,6 +547,7 @@ pub fn import_onepassword_csv(
                 if notes.is_empty() { None } else { Some(notes) },
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -549,7 +576,7 @@ pub fn import_keystash_csv(
 
     with_import_transaction(conn, || {
         let mut count = 0;
-        for fields in records {
+        for mut fields in records {
             let max_idx = std::cmp::max(title_idx, std::cmp::max(url_idx, std::cmp::max(user_idx, std::cmp::max(pass_idx, std::cmp::max(notes_idx, cat_idx)))));
             if fields.len() <= max_idx {
                 continue;
@@ -579,6 +606,7 @@ pub fn import_keystash_csv(
                 if notes.is_empty() { None } else { Some(notes) },
                 key,
             )?;
+            wipe_row(&mut fields);
             count += 1;
         }
 
@@ -617,8 +645,8 @@ fn escape_csv_cell(val: &str) -> String {
 /// common leading character for generated passwords, so this isn't exotic).
 /// title/username/notes/url/category keep the guard via `escape_csv_cell`
 /// since those routinely do get opened in spreadsheet tools.
-fn escape_csv_cell_password(val: &str) -> String {
-    escape_csv_quoting(val)
+fn escape_csv_cell_password(val: &str) -> Zeroizing<String> {
+    Zeroizing::new(escape_csv_quoting(val))
 }
 
 fn escape_csv_quoting(val: &str) -> String {
@@ -670,17 +698,22 @@ pub fn export_vault_csv(
             None => Zeroizing::new(String::new()),
         };
         
-        let row = format!(
+        // Built as Zeroizing<String> rather than a plain format! temporary --
+        // it embeds the plaintext password, so it shouldn't drop unwiped any
+        // more than decrypted_pass itself should (the destination file is
+        // plaintext CSV either way, but the in-memory copy still shouldn't
+        // linger past this point).
+        let row: Zeroizing<String> = Zeroizing::new(format!(
             "{},{},{},{},{},{}",
             escape_csv_cell(&r.title),
             escape_csv_cell(&r.url),
             escape_csv_cell(&r.username),
-            escape_csv_cell_password(&decrypted_pass),
+            escape_csv_cell_password(&decrypted_pass).as_str(),
             escape_csv_cell(&decrypted_notes),
             escape_csv_cell(&r.category)
-        );
-        
-        writeln!(file, "{}", row).map_err(|e| e.to_string())?;
+        ));
+
+        writeln!(file, "{}", row.as_str()).map_err(|e| e.to_string())?;
         count += 1;
     }
     
@@ -767,6 +800,47 @@ url,username,password,httprealm
     }
 
     #[test]
+    fn bitwarden_import_skips_non_login_items_instead_of_faking_a_password() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_bitwarden_{}.json", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        // type 1 = Login, 2 = Secure Note, 3 = Card, 4 = Identity.
+        let json = r#"{
+            "folders": [],
+            "items": [
+                {"type": 1, "name": "GitHub", "folderId": null, "notes": null,
+                 "login": {"username": "alice", "password": "hunter2", "uris": []}},
+                {"type": 2, "name": "Wifi recovery codes", "folderId": null, "notes": "some secret text"},
+                {"type": 3, "name": "Visa", "folderId": null, "notes": null},
+                {"type": 4, "name": "Passport", "folderId": null, "notes": null}
+            ]
+        }"#;
+        std::fs::write(&file_path, json).unwrap();
+
+        let (imported, skipped) = import_bitwarden_json(&conn, file_path_str, &key).unwrap();
+        assert_eq!(imported, 1, "only the Login item should be imported");
+        assert_eq!(skipped, 3, "the note/card/identity items should be counted as skipped");
+
+        let secrets = crate::db::get_secrets(&conn).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].title, "GitHub");
+        let dec = crate::crypto::decrypt(&secrets[0].encrypted_password, &key).unwrap();
+        assert_eq!(
+            String::from_utf8(dec.to_vec()).unwrap(),
+            "hunter2",
+            "the imported login's real password must round-trip, not a fabricated placeholder"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
     fn import_transaction_rolls_back_all_rows_on_failure() {
         let key = [0u8; 32];
         let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
@@ -776,7 +850,7 @@ url,username,password,httprealm
         // Simulates a real importer that successfully inserts a couple of rows
         // before hitting a failure on a later one -- the whole batch should be
         // undone, not left half-committed while being reported as failed.
-        let result = with_import_transaction(&conn, || {
+        let result: Result<usize, String> = with_import_transaction(&conn, || {
             db::add_secret(&conn, "One", "Cat", "user", "", "pw1", None, &key)?;
             db::add_secret(&conn, "Two", "Cat", "user", "", "pw2", None, &key)?;
             Err("simulated failure partway through the import".to_string())

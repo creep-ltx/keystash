@@ -231,19 +231,25 @@ fn main() {
         let secs: u64 = raw_args[2].parse().unwrap_or(10);
         let mut password = String::new();
         if std::io::stdin().read_to_string(&mut password).is_ok() {
-            let mut password_trimmed = password.trim_end().to_string();
+            let password_trimmed: Zeroizing<String> = Zeroizing::new(password.trim_end().to_string());
             password.zeroize();
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if clipboard.set_text(password_trimmed.clone()).is_ok() {
+                // set_text takes `impl Into<Cow<str>>`, which a &str satisfies
+                // directly -- no need to hand it an extra owned clone just to
+                // meet its signature. Whatever copy the OS clipboard/X11
+                // selection mechanism itself retains after that is outside
+                // what Rust-side zeroizing can reach either way; that's true
+                // of any clipboard manager, not specific to this call.
+                if clipboard.set_text(password_trimmed.as_str()).is_ok() {
                     std::thread::sleep(std::time::Duration::from_secs(secs));
-                    if let Ok(current_text) = clipboard.get_text() {
-                        if current_text == password_trimmed {
+                    if let Ok(mut current_text) = clipboard.get_text() {
+                        if current_text == *password_trimmed {
                             let _ = clipboard.set_text("");
                         }
+                        current_text.zeroize();
                     }
                 }
             }
-            password_trimmed.zeroize();
         }
         return;
     }
@@ -315,7 +321,7 @@ fn main() {
             let pass = prompt_password("Enter Secret Password: ");
             print!("Enter Notes (optional): ");
             let _ = io::stdout().flush();
-            let mut notes = String::new();
+            let mut notes: Zeroizing<String> = Zeroizing::new(String::new());
             let _ = io::stdin().read_line(&mut notes);
             let notes_clean = notes.trim();
 
@@ -463,19 +469,25 @@ fn main() {
                 None => return,
             };
 
+            // Bitwarden JSON items carry a type, so it reports a skipped
+            // count (non-login items) alongside the imported one; every
+            // other format is a flat login-only CSV with nothing to skip.
             let import_result = match detected_format {
                 import::ImportFormat::BitwardenJson => import::import_bitwarden_json(&conn, file_path, &key),
-                import::ImportFormat::BraveChromeCsv => import::import_brave_chrome_csv(&conn, file_path, &key),
-                import::ImportFormat::FirefoxCsv => import::import_firefox_csv(&conn, file_path, &key),
-                import::ImportFormat::LastPassCsv => import::import_lastpass_csv(&conn, file_path, &key),
-                import::ImportFormat::KeePassXcCsv => import::import_keepassxc_csv(&conn, file_path, &key),
-                import::ImportFormat::OnePasswordCsv => import::import_onepassword_csv(&conn, file_path, &key),
-                import::ImportFormat::KeyStashCsv => import::import_keystash_csv(&conn, file_path, &key),
+                import::ImportFormat::BraveChromeCsv => import::import_brave_chrome_csv(&conn, file_path, &key).map(|c| (c, 0)),
+                import::ImportFormat::FirefoxCsv => import::import_firefox_csv(&conn, file_path, &key).map(|c| (c, 0)),
+                import::ImportFormat::LastPassCsv => import::import_lastpass_csv(&conn, file_path, &key).map(|c| (c, 0)),
+                import::ImportFormat::KeePassXcCsv => import::import_keepassxc_csv(&conn, file_path, &key).map(|c| (c, 0)),
+                import::ImportFormat::OnePasswordCsv => import::import_onepassword_csv(&conn, file_path, &key).map(|c| (c, 0)),
+                import::ImportFormat::KeyStashCsv => import::import_keystash_csv(&conn, file_path, &key).map(|c| (c, 0)),
             };
 
             match import_result {
-                Ok(count) => {
+                Ok((count, skipped)) => {
                     println!("Success: Imported {} items from {}!", count, detected_format.name());
+                    if skipped > 0 {
+                        println!("Skipped {} non-login item(s) (secure notes, cards, or identities have no password field to import).", skipped);
+                    }
                     if sync::is_git_configured(&db_path) {
                         println!("Syncing updates to Git remote...");
                         let _ = sync::git_sync_vault(&db_path, &key);
