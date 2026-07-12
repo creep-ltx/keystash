@@ -586,7 +586,10 @@ pub fn import_keystash_csv(
     })
 }
 
-/// Escapes fields containing commas, quotes, or newlines according to standard RFC 4180 CSV specifications.
+/// Escapes fields containing commas, quotes, or newlines according to standard
+/// RFC 4180 CSV specifications. Applies the formula-injection guard below --
+/// use `escape_csv_cell_password` instead for the password column, which must
+/// not be silently mutated.
 fn escape_csv_cell(val: &str) -> String {
     // A cell starting with =, +, -, or @ is interpreted as a formula by Excel/
     // LibreOffice/Google Sheets when the CSV is opened -- so a synced vault
@@ -602,11 +605,28 @@ fn escape_csv_cell(val: &str) -> String {
     } else {
         val.to_string()
     };
+    escape_csv_quoting(&val)
+}
+
+/// Same RFC 4180 quoting as `escape_csv_cell`, but deliberately *without* the
+/// formula-injection guard. Applying that guard to the password column
+/// silently prepends a `'` to any password starting with =, +, -, or @ --
+/// KeyStash never opens exported CSVs in a spreadsheet app itself, so the
+/// guard buys nothing here, but it does mean a restore from that backup
+/// restores a permanently wrong password with no warning (and `-` is a
+/// common leading character for generated passwords, so this isn't exotic).
+/// title/username/notes/url/category keep the guard via `escape_csv_cell`
+/// since those routinely do get opened in spreadsheet tools.
+fn escape_csv_cell_password(val: &str) -> String {
+    escape_csv_quoting(val)
+}
+
+fn escape_csv_quoting(val: &str) -> String {
     if val.contains(',') || val.contains('"') || val.contains('\n') || val.contains('\r') {
         let escaped = val.replace('"', "\"\"");
         format!("\"{}\"", escaped)
     } else {
-        val
+        val.to_string()
     }
 }
 
@@ -655,7 +675,7 @@ pub fn export_vault_csv(
             escape_csv_cell(&r.title),
             escape_csv_cell(&r.url),
             escape_csv_cell(&r.username),
-            escape_csv_cell(&decrypted_pass),
+            escape_csv_cell_password(&decrypted_pass),
             escape_csv_cell(&decrypted_notes),
             escape_csv_cell(&r.category)
         );
@@ -703,6 +723,45 @@ url,username,password,httprealm
         let s2 = secrets.iter().find(|s| s.username == "user2").unwrap();
         let dec2 = crate::crypto::decrypt(&s2.encrypted_password, &key).unwrap();
         assert_eq!(String::from_utf8(dec2.to_vec()).unwrap(), "pass\nwith\nnewlines");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn export_import_round_trip_preserves_formula_leading_password_and_category() {
+        let key = [0u8; 32];
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        let conn = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn).unwrap();
+
+        // "=1+1" starts with '=' -- exactly what the formula-injection guard
+        // used to (wrongly) prefix with a literal quote on export.
+        db::add_secret(&conn, "Bank", "Finance", "alice", "https://bank.example", "=1+1", None, &key).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_export_roundtrip_{}.csv", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        export_vault_csv(&conn, file_path_str, &key, None).unwrap();
+
+        let conn2 = crate::db::open_keyed_connection(":memory:", &sqlcipher_key).unwrap();
+        crate::db::ensure_schema(&conn2).unwrap();
+        assert_eq!(detect_format(file_path_str).unwrap(), ImportFormat::KeyStashCsv);
+        let count = import_keystash_csv(&conn2, file_path_str, &key).unwrap();
+        assert_eq!(count, 1);
+
+        let secrets = crate::db::get_secrets(&conn2).unwrap();
+        assert_eq!(secrets.len(), 1);
+        let dec = crate::crypto::decrypt(&secrets[0].encrypted_password, &key).unwrap();
+        assert_eq!(
+            String::from_utf8(dec.to_vec()).unwrap(),
+            "=1+1",
+            "an =-leading password must round-trip byte-equal, not pick up a formula-guard prefix"
+        );
+        assert_eq!(
+            secrets[0].category, "Finance",
+            "custom category must be preserved, not routed through the 1Password 'Imported' fallback"
+        );
 
         let _ = std::fs::remove_file(&file_path);
     }
