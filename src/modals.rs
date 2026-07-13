@@ -1059,6 +1059,22 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         }
         KeyCode::Char('l') | KeyCode::Left => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            // The remote's current password is about to be discarded
+            // *vault-wide* -- the post-resolution push overwrites it on
+            // every device, and its own device only has the values it
+            // replaced in history, never itself. Record it as history here
+            // so "keep local" can't silently destroy a password the user
+            // may still need. No-op when both sides hold the same password
+            // (the conflict was about other fields).
+            if let Some(key) = &app.key {
+                let _ = crate::db::record_conflict_loser_history(
+                    &app.conn,
+                    &resolved.local_secret.sync_uuid,
+                    &resolved.remote_secret.encrypted_password,
+                    &resolved.local_secret.encrypted_password,
+                    key,
+                );
+            }
             // Re-stamp local's own data with a fresh "now" timestamp rather than
             // leaving it untouched. Otherwise the subsequent full merge (which
             // uses ordinary last-write-wins semantics) has no way to know this
@@ -1089,6 +1105,17 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         }
         KeyCode::Char('r') | KeyCode::Right => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
+            // Mirror image of the 'l' branch: local's current password is
+            // the one being discarded everywhere, so it goes to history.
+            if let Some(key) = &app.key {
+                let _ = crate::db::record_conflict_loser_history(
+                    &app.conn,
+                    &resolved.local_secret.sync_uuid,
+                    &resolved.local_secret.encrypted_password,
+                    &resolved.remote_secret.encrypted_password,
+                    key,
+                );
+            }
             // Stamp with "now", not remote's original updated_at -- see the
             // comment in the 'l' branch above for why. Remote's title/
             // category/username are applied too: a conflict can now *be* a
@@ -1118,6 +1145,15 @@ pub(crate) fn handle_sync_conflict_input(app: &mut TuiApp, code: KeyCode) {
         KeyCode::Char('m') => {
             let resolved = app.sync_conflicts.remove(app.selected_conflict_idx);
             if let Some(key) = &app.key {
+                // Merge-notes keeps local's password, so remote's is the
+                // discarded side -- same rationale as the 'l' branch.
+                let _ = crate::db::record_conflict_loser_history(
+                    &app.conn,
+                    &resolved.local_secret.sync_uuid,
+                    &resolved.remote_secret.encrypted_password,
+                    &resolved.local_secret.encrypted_password,
+                    key,
+                );
                 let local_notes: Zeroizing<String> = crate::crypto::decrypt(&resolved.local_secret.encrypted_notes.clone().unwrap_or_default(), key)
                     .map(|d| Zeroizing::new(String::from_utf8_lossy(&d).into_owned()))
                     .unwrap_or_default();

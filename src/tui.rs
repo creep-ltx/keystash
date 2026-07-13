@@ -838,6 +838,17 @@ impl TuiApp {
         if self.no_sync || !self.config.auto_sync {
             return;
         }
+        // No git repo means "not configured", which for an automatic trigger
+        // is a state, not a failure: without this gate the worker's
+        // Err("Sync not configured...") lands in the sync_result mailbox and
+        // run_loop pops it as a modal error dialog on every unlock, first-run
+        // setup, and import -- for exactly the offline no-git user the README
+        // leads with. The manual [s] key deliberately keeps reporting the
+        // same state as a status message instead: pressing the key is a
+        // request, so there silence would be the lie.
+        if !crate::sync::is_git_configured(crate::get_db_path()) {
+            return;
+        }
         self.spawn_detect_then_sync();
     }
 

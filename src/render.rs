@@ -385,7 +385,7 @@ pub(crate) fn handle_dashboard_input(app: &mut TuiApp, code: KeyCode, modifiers:
             if app.no_sync {
                 app.copied_message = Some(("Sync is disabled (--no-sync).".to_string(), Instant::now(), StatusType::Normal));
             } else if !crate::sync::is_git_configured(crate::get_db_path()) {
-                app.copied_message = Some(("Sync not configured -- no git remote set up in ~/.config/keystash.".to_string(), Instant::now(), StatusType::Normal));
+                app.copied_message = Some(("Sync not configured -- run `keystash sync setup` to add a git remote.".to_string(), Instant::now(), StatusType::Normal));
             } else {
                 app.spawn_detect_then_sync();
                 app.copied_message = Some(("Syncing with git remote...".to_string(), Instant::now(), StatusType::Normal));

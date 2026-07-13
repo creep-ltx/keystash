@@ -157,6 +157,122 @@ mod form_integration_tests {
 
         drop(guard);
     }
+
+    /// B9 regression: a vault with no git repo must not spawn the automatic
+    /// post-unlock sync at all. Before the gate, the worker's "Sync not
+    /// configured" Err landed in the sync_result mailbox and run_loop popped
+    /// it as a modal error dialog on every unlock, first-run setup, and
+    /// import -- for exactly the offline no-git user the README leads with.
+    /// (The manual [s] key still reports that state as a status message;
+    /// pressing the key is a request, so there silence would be the lie.)
+    #[test]
+    fn postunlock_sync_never_spawns_without_a_git_repo() {
+        let guard = isolated_config_dir("no_git_sync");
+
+        let db_path = crate::get_db_path();
+        let (conn, key) = db::create_vault(&db_path, "master-pw").unwrap();
+        drop(conn);
+
+        // no_sync = false and auto_sync defaulting on: the exact state a
+        // fresh offline install unlocks in.
+        let mut app = TuiApp::new(false);
+        assert!(app.config.auto_sync, "test premise: Auto Sync defaults on");
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        app.conn = db::open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+        app.key = Some(key);
+
+        app.trigger_postunlock_sync();
+
+        // No worker may have been spawned to write the mailbox...
+        assert!(
+            app.pending_sync_thread.lock().unwrap().is_none(),
+            "no sync thread may spawn for a vault without a git repo"
+        );
+        // ...and the mailbox itself must stay empty -- an Err here is what
+        // run_loop would turn into the spurious error dialog.
+        assert!(app.sync_result.lock().unwrap().is_none());
+
+        drop(guard);
+    }
+
+    /// M19 regression: the generator dialog's toggles and length keys are
+    /// session-local. They used to call gen_options.save() on every
+    /// keypress, silently rewriting the user's saved defaults -- the same
+    /// silent-persistence bug the CLI's opt-in --save fix removed.
+    #[test]
+    fn generator_dialog_changes_do_not_rewrite_saved_defaults() {
+        let guard = isolated_config_dir("gen_dialog");
+
+        let mut app = TuiApp::new(true);
+        let before = crate::generator::GeneratorOptions::load();
+        assert!(before.use_symbols, "test premise: symbols default on");
+
+        handle_generator_input(&mut app, KeyCode::Char('3')); // symbols off
+        handle_generator_input(&mut app, KeyCode::Left); // length down
+        assert!(!app.gen_options.use_symbols, "the dialog's own state must change");
+        assert_eq!(app.gen_options.length, before.length - 1);
+
+        let after = crate::generator::GeneratorOptions::load();
+        assert!(after.use_symbols, "saved defaults must survive dialog toggles");
+        assert_eq!(after.length, before.length, "saved length must survive the dialog's arrow keys");
+
+        drop(guard);
+    }
+
+    /// M21 regression: resolving a conflict must record the losing side's
+    /// current password into history. It is being discarded vault-wide by
+    /// the post-resolution push, and no device's history holds it otherwise
+    /// -- the editing device only recorded the values *it* replaced, never
+    /// its own final one.
+    #[test]
+    fn conflict_resolution_records_the_losing_password_into_history() {
+        let guard = isolated_config_dir("conflict_history");
+
+        let db_path = crate::get_db_path();
+        let (conn, key) = db::create_vault(&db_path, "master-pw").unwrap();
+        db::add_secret(&conn, "Site", "tag", "user", "", "local-pw", None, &key).unwrap();
+        let local = db::get_secrets(&conn).unwrap().remove(0);
+        drop(conn);
+
+        let mut app = TuiApp::new(true);
+        let sqlcipher_key = crate::crypto::derive_sqlcipher_key(&key);
+        app.conn = db::open_keyed_connection(&db_path, &sqlcipher_key).unwrap();
+        app.key = Some(key.clone());
+        app.refresh_secrets();
+
+        // Fabricate the remote side of a concurrent edit: same record
+        // identity, different password, encrypted under the same master key
+        // -- the only state a conflict screen can be reached in (a different
+        // key would have hit the rotation refusal long before).
+        let mut remote = local.clone();
+        remote.encrypted_password = crate::crypto::encrypt(b"remote-pw", &key).unwrap();
+        app.sync_conflicts = vec![crate::sync::ConflictGroup {
+            title: local.title.clone(),
+            category: local.category.clone(),
+            username: local.username.clone(),
+            local_secret: local.clone(),
+            remote_secret: remote,
+            base_secret: None,
+        }];
+
+        // Keep remote: local's current password is the vault-wide loser.
+        crate::modals::handle_sync_conflict_input(&mut app, KeyCode::Char('r'));
+
+        let history = db::get_password_history(&app.conn, &local.sync_uuid).unwrap();
+        assert_eq!(history.len(), 1, "the losing local password must land in history");
+        assert_eq!(
+            &*crate::crypto::decrypt(&history[0].0, &key).unwrap(),
+            b"local-pw"
+        );
+        // And the live password is remote's.
+        let now = db::get_secrets(&app.conn).unwrap().remove(0);
+        assert_eq!(
+            &*crate::crypto::decrypt(&now.encrypted_password, &key).unwrap(),
+            b"remote-pw"
+        );
+
+        drop(guard);
+    }
 }
 
 
@@ -673,20 +789,23 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
             app.gen_password.zeroize();
             app.screen = Screen::Dashboard;
         }
-        // Toggle options
+        // Toggle options. Session-local, same as the [w] passphrase toggle
+        // below: the dialog starts from the saved defaults on open, but a
+        // one-off tweak for one site's password rules must not silently
+        // rewrite those defaults -- the Settings screen (and the CLI's
+        // explicit --save) are the deliberate editors. These used to call
+        // gen_options.save() on every keypress, the same silent-persistence
+        // bug the CLI's opt-in --save fix removed.
         KeyCode::Char('1') => {
             app.gen_options.use_uppercase = !app.gen_options.use_uppercase;
-            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         KeyCode::Char('2') => {
             app.gen_options.use_numbers = !app.gen_options.use_numbers;
-            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         KeyCode::Char('3') => {
             app.gen_options.use_symbols = !app.gen_options.use_symbols;
-            let _ = app.gen_options.save();
             regenerate_in_place(app);
         }
         // Flip between random characters and diceware passphrases (drawn
@@ -706,7 +825,6 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
                 }
             } else if app.gen_options.length > crate::generator::MIN_LENGTH {
                 app.gen_options.length -= 1;
-                let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }
@@ -718,7 +836,6 @@ pub(crate) fn handle_generator_input(app: &mut TuiApp, key: KeyCode) {
                 }
             } else if app.gen_options.length < crate::generator::MAX_LENGTH {
                 app.gen_options.length += 1;
-                let _ = app.gen_options.save();
                 regenerate_in_place(app);
             }
         }

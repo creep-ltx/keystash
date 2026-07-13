@@ -450,7 +450,7 @@ fn main() {
     // --profile must be resolved before the first get_db_path() call below
     // -- every path in the process (vault, config, sync repo) derives from
     // it, and it can only be set once.
-    if let Some(pos) = args.iter().position(|a| a == "--profile" || a == "-P") {
+    if let Some(pos) = find_profile_flag(&args) {
         let Some(name) = args.get(pos + 1).cloned() else {
             eprintln!("Usage: keystash --profile <name> [command]");
             return;
@@ -1178,6 +1178,31 @@ fn main() {
     }
 }
 
+/// Position of a `--profile`/`-P` flag among the global flags *preceding*
+/// the subcommand, or None. Scanning the whole argv (the previous behavior)
+/// consumed positionals that merely happened to be the literal string
+/// "--profile" -- `keystash search -- --profile` errored with the profile
+/// usage message instead of searching -- the same argument-position bug
+/// class `parse_search_args` was already fixed for. The documented usage is
+/// `keystash [--profile <name>] [command]`, so scanning stops at the first
+/// arg that isn't a flag.
+fn find_profile_flag(args: &[String]) -> Option<usize> {
+    let subcommand_pos = args
+        .iter()
+        .enumerate()
+        .skip(1) // args[0] is the binary path
+        .find(|(_, a)| !a.starts_with('-'))
+        .map(|(i, _)| i)
+        .unwrap_or(args.len());
+    // Note: when the flag is found, its *value* sits at pos + 1, which is
+    // exactly the first non-flag arg -- the caller reads it with get(pos+1),
+    // outside this scanned prefix, which is correct: the value is an operand
+    // of the flag, not a subcommand.
+    args[..subcommand_pos]
+        .iter()
+        .position(|a| a == "--profile" || a == "-P")
+}
+
 fn start_tui(no_sync: bool) {
     // TuiApp no longer needs (or can use) a pre-opened Connection: opening the
     // now SQLCipher-encrypted vault.db requires the key, which isn't known until
@@ -1269,6 +1294,22 @@ mod tests {
         let a = args(&[]);
         let (query, _) = parse_search_args(&a);
         assert!(query.is_none());
+    }
+
+    #[test]
+    fn profile_flag_is_only_recognized_before_the_subcommand() {
+        // Normal forms, flag among the leading globals.
+        assert_eq!(find_profile_flag(&args(&["keystash", "--profile", "work", "list"])), Some(1));
+        assert_eq!(find_profile_flag(&args(&["keystash", "-P", "work"])), Some(1));
+
+        // The regression: a positional that IS the literal string
+        // "--profile" (a search query, a title) must not be consumed.
+        assert_eq!(find_profile_flag(&args(&["keystash", "search", "--", "--profile"])), None);
+        assert_eq!(find_profile_flag(&args(&["keystash", "add", "--profile", "tag", "user"])), None);
+
+        // No flag at all.
+        assert_eq!(find_profile_flag(&args(&["keystash", "list"])), None);
+        assert_eq!(find_profile_flag(&args(&["keystash"])), None);
     }
 
     #[test]

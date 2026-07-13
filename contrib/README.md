@@ -62,12 +62,16 @@ For a separate profile: `KEYSTASH_ARGS="--profile work" keystash-menu.sh`
   variable inside the script. Shell variables can't be zeroized the way
   KeyStash wipes its own memory — this is inherently a small step down
   from typing into KeyStash directly. The script `unset`s everything it
-  can, uses `--no-sync` (no network from a popup), and never puts secrets
-  in argv.
-- In `--type` mode the selected password is additionally held in a script
-  variable and handed to the typing tool. Copy mode avoids that entirely:
-  KeyStash's own `copy` command moves the secret process-to-clipboard
-  without the script ever seeing it — prefer copy mode when you can.
+  can, uses `--no-sync` (no network from a popup), and never puts the
+  *master password* in argv.
+- **Known limitation (`--type` mode only):** the selected password is held
+  in a script variable and currently passed to the typing tool
+  (wtype/ydotool/xdotool) **as a command-line argument**, which is briefly
+  visible in `/proc/<pid>/cmdline` to other local processes while the tool
+  runs. A fix (feeding the tool via stdin) is planned; until then, prefer
+  copy mode, which avoids all of this entirely: KeyStash's own `copy`
+  command moves the secret process-to-clipboard without the script ever
+  seeing it.
 - Passwords containing newlines can't be typed correctly (`show`'s output
   is line-based); copy mode handles them fine.
 - `KEYSTASH_PASSWORD` exists for testing/automation only — exported

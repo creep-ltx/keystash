@@ -14,7 +14,7 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 - **Stateful Viewports:** Full list scrolling support (automatically keeps selected rows in view) with support for PageUp / PageDown.
 - **Secure Copy Shortcuts:** Copy username, password, or website URLs directly to your clipboard.
 - **Auto-Clearing Clipboard:** Clipboard data is automatically cleared after a configurable delay (default 5 seconds) to mitigate memory leakage and snooping.
-- **Password History:** Every password change keeps the previous value (last 5 per entry, encrypted like live passwords, synced between devices, carried through master-password rotation) — view with `[P]`, copy one back with `c`.
+- **Password History:** Every password change keeps the previous value (last 5 per entry, encrypted like live passwords, synced between devices, carried through master-password rotation), and resolving a sync conflict keeps the losing side's password too — view with `[P]`, copy one back with `c`.
 - **Passphrase Generator:** Alongside random characters, a diceware mode (`[w]` in the generator, `--words` on the CLI) draws from the embedded EFF large wordlist — ~77 bits at the 6-word default, and actually typeable.
 - **Vault Profiles:** `--profile work` keeps fully separate vaults (own database, config, and git remote) for e.g. work/personal splits.
 - **Multi-Select Mass Deletion:** Mark multiple secrets using the Spacebar and batch-delete them all at once.
@@ -24,8 +24,8 @@ Built with AI-assisted development, I handle the auditing, testing, and editoria
 ### ⌨️ CLI Subcommands
 For rapid scripts, pipeline automations, or terminal shortcuts, `KeyStash` exposes a full CLI module — including `--password-stdin` for safe non-interactive use (password via pipe, never argv or env).
 
-### 🚀 Desktop Quick Access (`contrib/`)
-[`contrib/keystash-menu.sh`](contrib/keystash-menu.sh): bind a key, type your master password into a rofi/fuzzel popup, pick an entry, and the password is copied (with the usual timed auto-clear) or typed into the focused window. See [`contrib/README.md`](contrib/README.md) for setup and the honest security notes.
+### 🚀 Desktop Quick Access (`contrib/`) — experimental
+[`contrib/keystash-menu.sh`](contrib/keystash-menu.sh): bind a key, type your master password into a rofi/fuzzel popup, pick an entry, and the password is copied (with the usual timed auto-clear) or typed into the focused window. **Status: experimental, parked for rework** — copy mode is solid (the script never touches the secret), but `--type` mode currently passes the password to the typing tool via argv; see the known-limitation note in [`contrib/README.md`](contrib/README.md) before using it.
 
 ---
 
@@ -84,7 +84,7 @@ Your credentials database is stored offline inside your user config folder:
 | **`[h]`** | Check selected (or marked) password on HaveIBeenPwned |
 | **`[H]`** | Check all credentials in vault on HaveIBeenPwned (runs in background) |
 | **`[D]`** | Open duplicate credential detector and interactive resolver |
-| **`[P]`** | View the selected entry's previous passwords (kept automatically on every password change, last 5 per entry; copy one back with `c`) |
+| **`[P]`** | View the selected entry's previous passwords (kept automatically on every password change and for the losing side of a resolved sync conflict, last 5 per entry; copy one back with `c`) |
 | **`[,]`** | Open KeyStash settings screen (edit timeouts, delays, presets, etc.) |
 | **`[m]`** | Change master password (key rotation) |
 | **`[s]`** | Force a manual sync with the Git remote (runs the same conflict detection as the automatic post-unlock sync; works even with Auto Sync off) |
@@ -130,7 +130,7 @@ By default, executing `keystash` with no arguments starts the TUI. The following
   ```bash
   keystash generate [-l <length>] [--words [n]] [--no-uppercase] [--no-numbers] [--no-symbols] [--save]
   ```
-  *(Generates a random secure password, avoiding visually ambiguous characters; length clamped to 4–256, the one rule shared by CLI, dialog, and Settings. `--words [n]` switches to a **diceware passphrase**: n words (3–12, default 6) from the embedded EFF large wordlist, hyphen-joined — the better choice for anything you have to type or memorize; 6 words ≈ 77 bits of entropy. The TUI generator has the same via the `[w]` mode toggle. Charset options apply to this run only unless `--save` is passed)*
+  *(Generates a random secure password, avoiding visually ambiguous characters; length clamped to 4–256, the one rule shared by CLI, dialog, and Settings. `--words [n]` switches to a **diceware passphrase**: n words (3–12, default 6) from the embedded EFF large wordlist, hyphen-joined — the better choice for anything you have to type or memorize; 6 words ≈ 77 bits of entropy. The TUI generator has the same via the `[w]` mode toggle. Charset options apply to this run only unless `--save` is passed; the TUI dialog's toggles are likewise session-only — saved defaults are edited in Settings)*
 * **Copy Secret Field to Clipboard:**
   ```bash
   keystash copy <ID> [username|password|url]
@@ -274,7 +274,7 @@ If a stale device ever syncs before you get to it, nothing is lost: the rotated 
 * **Background Change Sync:** Syncs updates on exit so your latest changes are immediately pushed to remote. Runs automatically after bulk CSV imports. Single changes inside the TUI are queued locally until exit to avoid redundant network calls — and a session that changed nothing skips the exit sync entirely.
 * **Cheap no-op syncs:** Every sync starts with a fetch and compares the remote's commit against the local one — if nothing moved on either side, the sync ends right there (one small network round trip; no merge work, no push). The remote-moved and local-changed cases run the full logical merge as always.
 * **History retention (opt-in):** Encrypted vaults don't delta-compress, so every pushed change stores a full copy and the remote grows forever by default. Settings field *9. History Keep* caps that: set it to N (minimum 10) and, after each push, history older than the newest N snapshots is squashed into a single base commit and force-pushed (`--force-with-lease`, so a concurrent push from another device always wins and retention just retries next time). `0` keeps everything — the default, since older snapshots are also your rollback archive. A device that hasn't synced since before a squash still merges fine; it just gets more conservative conflict prompts on its next sync (its 3-way merge base is gone), never data loss. Note: protected branches block force-pushes — leave branch protection off the vault repo if you enable this. Self-hosted bare repos reclaim disk on `git gc`; GitHub does it on its own schedule. The outcome of every background sync is reported in the TUI — success in the status bar, failures (including a refused push after a master-password rotation elsewhere, which comes with step-by-step recovery instructions) in a dialog.
-* **Auto Sync setting:** The Settings screen's *Auto Sync* toggle controls the **automatic** sync actions only — the startup fetch, the post-unlock/post-import merge, and the exit-time push. With it off, KeyStash never touches the network on its own; the manual `[s]` key and `keystash sync` still work whenever you ask. (The `--no-sync` flag is stronger: it disables all sync, manual included, for that session.)
+* **Auto Sync setting:** The Settings screen's *Auto Sync* toggle controls the **automatic** sync actions only — the startup fetch, the post-unlock/post-import merge, and the exit-time push. With it off, KeyStash never touches the network on its own; the manual `[s]` key and `keystash sync` still work whenever you ask. (With no git repository configured at all, the automatic actions are skipped entirely — nothing runs and nothing is reported; only the manual `[s]` key mentions the missing setup.) (The `--no-sync` flag is stronger: it disables all sync, manual included, for that session.)
 * **Tombstones:** Deleted credentials write to a `deleted_secrets` database table, allowing deletions to sync across machines without restoring themselves as phantom items.
 * **Logical Database Merge:** Every record carries a stable, randomly generated sync ID (independent of its title/tags/username, which are freely editable and can coincidentally repeat between records) that merges, updates, and tombstones are all matched on. Every field — title, tags, username, URL, password, notes — is carried through the merge, so renames and re-taggings propagate like any other edit. If a record has changed on both sides, the version with the newer `updated_at` timestamp is kept; if *both* sides changed it since their last common state, the interactive conflict resolver opens instead.
 > [!NOTE]

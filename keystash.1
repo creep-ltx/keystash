@@ -1,4 +1,4 @@
-.TH KEYSTASH 1 "July 2026" "keystash 0.4.4" "keystash User Manual"
+.TH KEYSTASH 1 "July 2026" "keystash 0.4.5" "keystash User Manual"
 .SH NAME
 keystash \- Secure offline TUI and CLI password manager written in Rust
 .SH SYNOPSIS
@@ -42,7 +42,7 @@ Show a detailed view of a secret (including notes). Passwords and notes are mask
 Copy the target secret field to the system clipboard (automatically clearing it after the configured delay, default 5 seconds). Defaults to copying the password.
 .TP
 .B generate [\-l \fIlength\fR] [\-\-words [\fIn\fR]] [\-\-no\-uppercase] [\-\-no\-numbers] [\-\-no\-symbols] [\-\-save]
-Generate a random secure password (excluding ambiguous characters) and copy it to the clipboard for the configured delay. Length is clamped to 4\-256. With \-\-words [n], generates a diceware passphrase instead: n words (3\-12, default 6) drawn from the embedded EFF large wordlist, hyphen-joined -- the better choice for anything typed or memorized (6 words is about 77 bits of entropy). Charset options apply to this run only unless \-\-save is passed.
+Generate a random secure password (excluding ambiguous characters) and copy it to the clipboard for the configured delay. Length is clamped to 4\-256. With \-\-words [n], generates a diceware passphrase instead: n words (3\-12, default 6) drawn from the embedded EFF large wordlist, hyphen-joined -- the better choice for anything typed or memorized (6 words is about 77 bits of entropy). Charset options apply to this run only unless \-\-save is passed; the TUI generator dialog's toggles are likewise per-session, and saved defaults are edited in the Settings screen.
 .TP
 .B import \fIpath/to/backup_file\fR
 Import login credentials from unencrypted files (supports Bitwarden JSON, KeyStash CSV, Brave/Chrome CSV, Firefox CSV, LastPass CSV, KeePassXC CSV, and 1Password CSV).
@@ -128,7 +128,7 @@ Check all passwords in the vault on HaveIBeenPwned asynchronously in a backgroun
 Open the duplicate credential detector and interactive resolver.
 .TP
 .B P
-View the selected entry's password history: the last 5 prior passwords, recorded automatically whenever a password is actually changed (encrypted like live passwords, carried through master-password rotation, synced between devices, deleted with the record). Select with arrows, [v] to reveal, [c] to copy one back. "keystash show <id> \-\-reveal" prints the same history on the CLI.
+View the selected entry's password history: the last 5 prior passwords, recorded automatically whenever a password is actually changed (encrypted like live passwords, carried through master-password rotation, synced between devices, deleted with the record). Resolving a sync conflict records the losing side's password too -- it is about to be overwritten on every device and would otherwise survive in no history at all. Select with arrows, [v] to reveal, [c] to copy one back. "keystash show <id> \-\-reveal" prints the same history on the CLI.
 .TP
 .B ,
 Open the KeyStash settings screen modal.
@@ -146,7 +146,7 @@ Each credential carries one or more comma-separated tags (e.g. "work, email"). T
 .SH SYNCHRONIZATION & MULTI-MACHINE SETUP
 If the config folder (~/.config/keystash) is initialized as a Git repository, keystash will automatically synchronize and merge database updates across your machines.
 .PP
-The settings screen's Auto Sync toggle controls only the automatic sync actions (startup fetch, post-unlock/post-import merge, exit-time push); with it off, the manual [s] key and "keystash sync" still work on demand. The \-\-no\-sync flag is stronger and disables all sync, manual included, for that session. The outcome of every background sync is reported in the TUI: success in the status bar, failures (including a refused push after a master-password rotation performed elsewhere) in a dialog with recovery instructions.
+The settings screen's Auto Sync toggle controls only the automatic sync actions (startup fetch, post-unlock/post-import merge, exit-time push); with it off, the manual [s] key and "keystash sync" still work on demand. The \-\-no\-sync flag is stronger and disables all sync, manual included, for that session. When no git repository is configured at all, the automatic actions are skipped entirely -- nothing runs and nothing is reported; only the manual [s] key mentions the missing setup. The outcome of every background sync is reported in the TUI: success in the status bar, failures (including a refused push after a master-password rotation performed elsewhere) in a dialog with recovery instructions.
 .PP
 Syncs are cheap when nothing changed: after the fetch, if the remote's commit equals the local one and the vault file is untouched, the sync ends there -- no merge work, no push -- and quitting a session that modified nothing skips the exit-time sync entirely. The .gitignore written in the setup steps below is created automatically on the first sync if missing (an existing customized one is never touched).
 .PP

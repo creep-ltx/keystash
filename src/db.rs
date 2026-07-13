@@ -507,10 +507,12 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
     // ignore an unknown table (their merges don't propagate it, so history
     // may lag through an old-version device; documented -- and a rotation
     // performed on a pre-history version drops it, since that rebuild only
-    // copies tables it knows about). Rows are written only by the
-    // user-facing edit path (update_secret) when the password actually
-    // changed -- never by update_secret_raw: every edit re-encrypts with a
-    // fresh nonce, so blob inequality there would record phantom "changes".
+    // copies tables it knows about). Rows are written only where a real
+    // plaintext change is known: the user-facing edit path (update_secret)
+    // and conflict resolution (record_conflict_loser_history), both
+    // plaintext-compared -- never by update_secret_raw itself: every edit
+    // re-encrypts with a fresh nonce, so blob inequality there would record
+    // phantom "changes".
     conn.execute(
         "CREATE TABLE IF NOT EXISTS password_history (
             sync_uuid TEXT NOT NULL,
@@ -1266,6 +1268,63 @@ pub fn get_history_counts(conn: &Connection) -> Result<std::collections::HashMap
     Ok(map)
 }
 
+/// Records `losing_blob` as a password_history entry for `sync_uuid`, but
+/// only when its plaintext actually differs from `surviving_blob`'s -- the
+/// conflict-resolution companion to `update_secret`'s history write.
+/// Resolution applies already-encrypted blobs via `update_secret_raw`, which
+/// deliberately never writes history (dedup restamps and merge writes pass
+/// nonce-fresh blobs of *unchanged* passwords through it, which would log
+/// phantom entries) -- but a resolved conflict is the one flow guaranteed to
+/// discard a password the user may still need: the losing side's current
+/// value would otherwise end up in no device's history at all, while the
+/// values replaced by deliberate edits (which the user knowingly typed over)
+/// all would. The blob is stored verbatim -- both sides of a merge are
+/// always under the same master key, or the salt/rotation checks would have
+/// refused long before a conflict screen existed -- and the cap is enforced
+/// with the same rowid-tiebroken rule as `update_secret`.
+pub fn record_conflict_loser_history(
+    conn: &Connection,
+    sync_uuid: &str,
+    losing_blob: &[u8],
+    surviving_blob: &[u8],
+    key: &[u8; KEY_LEN],
+) -> Result<(), String> {
+    let losing_plain = crypto::decrypt(losing_blob, key)?;
+    let surviving_plain = crypto::decrypt(surviving_blob, key)?;
+    if *losing_plain == *surviving_plain {
+        // Same password on both sides (the conflict was about other fields):
+        // nothing is being lost, so recording would be a phantom entry.
+        return Ok(());
+    }
+    conn.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO password_history (sync_uuid, encrypted_password, replaced_at)
+             VALUES (?1, ?2, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))",
+            params![sync_uuid, losing_blob],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM password_history
+             WHERE sync_uuid = ?1
+               AND rowid NOT IN (
+                   SELECT rowid FROM password_history
+                   WHERE sync_uuid = ?1 ORDER BY replaced_at DESC, rowid DESC LIMIT ?2
+               )",
+            params![sync_uuid, PASSWORD_HISTORY_CAP as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute("COMMIT", []).map(|_| ()).map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
 /// Removes history rows whose record no longer exists -- deletions arriving
 /// via sync merge remove the secret but don't know about its history.
 /// Best-effort companion to prune_old_tombstones at the same call sites.
@@ -1923,6 +1982,42 @@ mod sqlcipher_tests {
         // Deleting the record deletes its history with it.
         delete_secret(&conn, id).unwrap();
         assert!(get_password_history(&conn, &uuid).unwrap().is_empty());
+
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn conflict_loser_history_records_only_real_losses() {
+        let db_path = temp_db_path("pw-history-conflict");
+        let (conn, key) = create_vault(&db_path, "pw").unwrap();
+        add_secret(&conn, "Site", "Cat", "user", "", "local-pw", None, &key).unwrap();
+        let s = get_secrets(&conn).unwrap();
+        let (uuid, local_blob) = (s[0].sync_uuid.clone(), s[0].encrypted_password.clone());
+
+        // Same plaintext under a fresh nonce (blobs differ byte-wise): no
+        // entry -- the phantom case that keeps update_secret_raw history-free.
+        let same_reencrypted = crypto::encrypt(b"local-pw", &key).unwrap();
+        assert_ne!(same_reencrypted, local_blob, "fresh nonce must produce a different blob");
+        record_conflict_loser_history(&conn, &uuid, &same_reencrypted, &local_blob, &key).unwrap();
+        assert!(get_password_history(&conn, &uuid).unwrap().is_empty());
+
+        // A real divergence records the losing blob verbatim.
+        let remote_blob = crypto::encrypt(b"remote-pw", &key).unwrap();
+        record_conflict_loser_history(&conn, &uuid, &remote_blob, &local_blob, &key).unwrap();
+        let history = get_password_history(&conn, &uuid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            &*crypto::decrypt(&history[0].0, &key).unwrap(),
+            b"remote-pw",
+            "the losing blob must be stored verbatim and decrypt under the shared key"
+        );
+
+        // The cap holds across repeated conflict losses too.
+        for i in 0..7 {
+            let blob = crypto::encrypt(format!("lost-{i}").as_bytes(), &key).unwrap();
+            record_conflict_loser_history(&conn, &uuid, &blob, &local_blob, &key).unwrap();
+        }
+        assert_eq!(get_password_history(&conn, &uuid).unwrap().len(), PASSWORD_HISTORY_CAP);
 
         cleanup(&db_path);
     }

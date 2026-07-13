@@ -366,7 +366,14 @@ pub fn git_sync_vault_with_retention<P: AsRef<Path>>(db_path: P, key: &[u8; 32],
     let pragma_hex = crate::crypto::pragma_key_hex(&sqlcipher_key);
 
     if !dir.join(".git").exists() {
-        return Err("Sync not configured. Set up git in ~/.config/keystash to enable syncing.".to_string());
+        // Name the vault's actual directory -- under --profile or
+        // KEYSTASH_CONFIG_DIR it isn't ~/.config/keystash, and telling the
+        // user to set up git in the wrong place would send them to create a
+        // repo the app will never look at.
+        return Err(format!(
+            "Sync not configured. Run `keystash sync setup` (or set up git in {}) to enable syncing.",
+            dir.display()
+        ));
     }
 
     // The README's setup steps write a two-line .gitignore (ignore
@@ -759,14 +766,21 @@ pub fn git_sync_vault_with_retention<P: AsRef<Path>>(db_path: P, key: &[u8; 32],
                     [],
                 );
                 // Keep only the newest CAP entries per record: a row is
-                // dropped when CAP-or-more newer siblings exist.
+                // dropped when CAP-or-more newer siblings exist. rowid
+                // tiebreaks equal timestamps, same as the local cap in
+                // update_secret -- two devices contributing entries with
+                // colliding millisecond timestamps would otherwise each
+                // count zero "strictly newer" siblings and all survive,
+                // quietly overshooting the cap.
                 let cap = union.and_then(|_| {
                     conn.execute(
                         "DELETE FROM main.password_history
                          WHERE (
                              SELECT COUNT(*) FROM main.password_history newer
                              WHERE newer.sync_uuid = main.password_history.sync_uuid
-                               AND newer.replaced_at > main.password_history.replaced_at
+                               AND (newer.replaced_at > main.password_history.replaced_at
+                                    OR (newer.replaced_at = main.password_history.replaced_at
+                                        AND newer.rowid > main.password_history.rowid))
                          ) >= ?1",
                         rusqlite::params![crate::db::PASSWORD_HISTORY_CAP as i64],
                     )
