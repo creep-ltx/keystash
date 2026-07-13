@@ -1,6 +1,6 @@
 [package]
 name = "keystash"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 # MSRV: edition 2024 alone needs 1.85, but the let-chains used throughout
 # stabilized in 1.88. Declaring it gives older toolchains a clear "requires
