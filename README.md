@@ -202,7 +202,7 @@ This section describes the mechanisms. For "given a specific compromise, what do
 If you configure your local config folder `~/.config/keystash` as a Git repository linked to a private remote, `keystash` will automatically synchronize your credentials database across all your devices using high-performance two-way logical database merging.
 
 > [!TIP]
-> **You don't need GitHub.** Any git remote works, because it only ever stores the encrypted vault file: a private GitHub/GitLab repo, any machine you can SSH into (`you@server:vault.git`), or a plain folder on a NAS mount or USB stick (`/mnt/nas/vault.git`) — create the last two with `git init --bare vault.git` at the destination.
+> **You don't need GitHub.** Any git remote works, because it only ever stores the encrypted vault file: a private GitHub/GitLab repo, any machine you can SSH into (`you@server:vault.git`), or a plain folder on a NAS mount or USB stick (`/mnt/backup/vault.git`) — create the last two with `git init --bare vault.git` at the destination.
 
 ### 1. One-time Setup
 

@@ -89,7 +89,7 @@ pub fn is_git_configured<P: AsRef<Path>>(db_path: P) -> bool {
 ///
 /// Works with any git remote -- a GitHub/GitLab private repo, any
 /// SSH-reachable machine (`user@server:vault.git`), or a plain filesystem
-/// path like a NAS mount or USB stick (`/mnt/nas/vault.git`).
+/// path like a NAS mount or USB stick (`/mnt/backup/vault.git`).
 pub fn setup_sync_repo(db_path: &Path, remote_url: &str, first_device: bool) -> Result<String, String> {
     let dir = db_path.parent().ok_or("Invalid database directory")?;
 

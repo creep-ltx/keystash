@@ -343,7 +343,7 @@ fn run_sync_setup_wizard(db_path: &Path) {
     println!("Any git remote works (it only ever stores the encrypted vault file):");
     println!("  - a private GitHub/GitLab repo:  git@github.com:you/my-vault.git");
     println!("  - any machine you can SSH into:  you@server:vault.git   (create with `git init --bare vault.git` there)");
-    println!("  - a NAS mount or USB stick:      /mnt/nas/vault.git     (same, `git init --bare`)");
+    println!("  - a NAS mount or USB stick:      /mnt/backup/vault.git  (same, `git init --bare`)");
     println!();
     print!("Remote URL: ");
     let _ = io::stdout().flush();
